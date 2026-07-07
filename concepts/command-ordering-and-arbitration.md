@@ -1,60 +1,197 @@
-# Command Ordering and Arbitration
+# 命令排序与仲裁
 
-NVMe normally treats commands as independent: Submission Queue order does not impose processing, completion, or media ordering. Host software must impose application-required dependencies, except where the protocol defines a fused or command-set-specific atomic operation. [PDF pp. 120-121](../_source/pages/page-120.md)
+## 概述
 
-## Mental model
+NVMe 协议在处理命令时采用了一种相对灵活的设计理念：命令之间通常被视为相互独立的。这意味着提交队列（Submission Queue, SQ）中命令的排列顺序**不会强制决定**它们的处理顺序、完成顺序或在存储介质上的执行顺序。
 
-```text
-submitted commands in each SQ
-          |
-          v
- controller chooses candidate commands
-          |
-          +-- arbitration selects an SQ
-          +-- Arbitration Burst limits starts before reselection
-          v
- processing may overlap and complete out of submission order
-          |
-          `-- completion makes command state changes globally visible
-```
+这种设计给控制器（Controller）提供了优化性能的空间，但也意味着主机软件（Host Software）需要自行管理命令之间的依赖关系。只有在以下特殊情况下，协议才会保证命令之间的原子性（Atomic）执行：
 
-This explanatory pipeline distinguishes selection from completion; selection order does not imply completion order. [PDF p. 121](../_source/pages/page-121.md)
+- **融合操作**（Fused Operation）：协议定义的原子命令对
+- **命令集特定的原子操作**：由特定 I/O 命令集规范定义的操作
 
-## Fused and atomic operations
+> 📚 规范参考：[PDF pp. 120-121](../_source/pages/page-120.md)
 
-A fused operation is an optional two-command atomic unit. Both commands occupy adjacent entries in one Submission Queue, may wrap from its last slot to its first, execute in sequence without an intervening operation, and each receives its own completion. In a memory-based queue one Tail Doorbell update exposes both; a message-based transport delivers them in order with no intervening same-SQ capsule. [PDF pp. 119-121](../_source/pages/page-119.md)
+---
 
-| Failure or control action | Required result |
-|---|---|
-| Requested fused operation unsupported | Abort with Invalid Field in Command |
-| Adjacent partner missing or malformed | Abort non-zero-`FUSE` command with Command Aborted due to Missing Fused Command |
-| First command fails | Abort the second command |
-| Second command fails | First completion status is defined by that fused operation |
-| Host aborts pair | Submit an Abort separately for each command |
+## 命令处理的心智模型
 
-Atomic-operation definitions and further fused-operation applicability belong to the applicable I/O Command Set specification. [PDF pp. 120-121](../_source/pages/page-120.md)
-
-## Arbitration mechanisms
+为了更好地理解命令从提交到完成的整个流程，我们可以将其抽象为以下几个阶段：
 
 ```text
-Round robin:       ASQ --+
-                  I/O SQ +--> equal-priority RR --> processing
-                  I/O SQ +
-
-Weighted + urgent: Admin ----------------------- strict priority 1 --+
-                   Urgent SQs -- RR ------------ strict priority 2 --+--> processing
-                   High/Medium/Low -- RR -- WRR - strict priority 3 --+
+第一阶段：命令提交
+    主机将命令提交到各个 SQ 中
+              ↓
+第二阶段：命令选择
+    控制器从各个 SQ 中选择候选命令（Candidate Commands）
+              ↓
+第三阶段：仲裁机制
+    ├─ 仲裁器根据优先级选择一个 SQ
+    └─ 仲裁突发（Arbitration Burst）限制重新选择前的启动次数
+              ↓
+第四阶段：并行处理
+    命令可能并行处理，完成顺序可能与提交顺序不同
+              ↓
+第五阶段：完成通知
+    完成队列（Completion Queue）使命令状态变更对全局可见
 ```
 
-This compact reconstruction of Figures 80-81 was checked against rendered PDF pages 122-123. Every controller supports round robin. Weighted round robin with urgent priority and vendor-specific arbitration are optional. Under weighted arbitration, Admin outranks Urgent, which outranks the weighted High/Medium/Low pool; excessive Urgent work may starve that pool. Round robin operates among queues at the same level, and the smaller of remaining weight credits and Arbitration Burst limits starts per queue visit. [PDF pp. 121-123](../_source/pages/page-121.md)
+### 关键理解要点
 
-## Outstanding-command boundary
+这个处理流程有两个重要特征：
 
-A command is outstanding after submission until the host receives its completion or obtains another protocol-defined proof that processing can no longer continue. Such proofs include a successful effective Abort or Cancel, controller-not-ready/shutdown-complete observations for non-Fabrics commands, deletion of the carrying memory-based SQ, successful Fabrics Disconnect of that I/O queue, or restored communication to the same controller after loss. [PDF pp. 123-124](../_source/pages/page-123.md)
+1. **选择顺序 ≠ 完成顺序**：仲裁器选择命令的顺序不代表它们会按此顺序完成
+2. **并行处理能力**：控制器可以同时处理多个命令，充分发挥硬件性能
 
-## Evidence
+> 📚 规范参考：[PDF p. 121](../_source/pages/page-121.md)
 
-- [Ordering and fused-operation contract, PDF pp. 120-121](../_source/pages/page-120.md)
-- [Candidate selection, completion visibility, and arbitration, PDF p. 121](../_source/pages/page-121.md)
-- [Figures 80-81 and arbitration classes, PDF pp. 122-123](../_source/pages/page-122.md)
-- [Outstanding-command termination conditions, PDF pp. 123-124](../_source/pages/page-123.md)
+---
+
+## 融合操作与原子性
+
+### 什么是融合操作
+
+**融合操作**（Fused Operation）是一种可选的协议特性，它将两个命令绑定为一个原子执行单元。这意味着这两个命令要么都成功执行，要么都不执行，中间不会插入其他操作。
+
+### 融合操作的技术要求
+
+融合操作必须满足以下所有条件：
+
+| 要求项 | 具体规则 |
+|--------|----------|
+| **队列位置** | 两个命令必须占用同一个 SQ 中的相邻条目（Entry） |
+| **环绕支持** | 允许从队列的最后一个槽位环绕到第一个槽位 |
+| **执行保证** | 按顺序执行，中间不会插入其他操作 |
+| **完成方式** | 每个命令各自产生一个完成条目（Completion Entry） |
+| **提交方式** | 必须通过单次提交操作暴露给控制器 |
+
+#### 不同传输方式的提交规则
+
+- **基于内存的队列**（Memory-based Queue）：通过一次尾门铃（Tail Doorbell）寄存器更新提交两个命令
+- **基于消息的传输**（Message-based Transport）：按顺序交付两个命令，且同一 SQ 中没有其他消息（Capsule）插入
+
+> 📚 规范参考：[PDF pp. 119-121](../_source/pages/page-119.md)
+
+### 融合操作的错误处理
+
+| 错误场景 | 控制器行为 |
+|----------|------------|
+| 请求的融合操作不受支持 | 以"命令字段无效"（Invalid Field in Command）状态中止 |
+| 相邻命令缺失或格式错误 | 以"由于缺少融合命令而中止"（Command Aborted due to Missing Fused Command）状态中止非零 `FUSE` 字段的命令 |
+| 第一个命令执行失败 | 中止第二个命令 |
+| 第二个命令执行失败 | 第一个命令的完成状态由该融合操作定义 |
+| 主机需要中止融合操作 | 必须分别为每个命令提交一个 Abort 命令 |
+
+### 融合操作的规范定义
+
+具体支持哪些原子操作以及融合操作的适用范围，由相应的 **I/O 命令集规范**（I/O Command Set Specification）定义。
+
+> 📚 规范参考：[PDF pp. 120-121](../_source/pages/page-120.md)
+
+---
+
+## 仲裁机制详解
+
+仲裁机制（Arbitration Mechanism）决定了控制器如何从多个提交队列中选择命令进行处理。NVMe 支持多种仲裁策略，以满足不同的性能和优先级需求。
+
+### 轮询仲裁（Round Robin）
+
+这是**所有控制器都必须支持**的基本仲裁机制：
+
+```text
+轮询仲裁模式
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   管理队列（ASQ）────┐
+   I/O 提交队列 1 ────┤
+   I/O 提交队列 2 ────┼──► 轮流调度 ──► 处理引擎
+   I/O 提交队列 3 ────┤   （相同优先级）
+         ⋮            ┘
+```
+
+**特点**：所有队列拥有相同的优先级，控制器依次从各队列中选择命令。
+
+### 加权轮询与紧急优先级（Weighted Round Robin + Urgent Priority）
+
+这是**可选的高级仲裁机制**：
+
+```text
+加权轮询 + 紧急优先级模式
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   管理队列（Admin）─────────────────► 严格优先级 1 ────┐
+                                                        │
+   紧急队列（Urgent SQs）── 轮询 ────► 严格优先级 2 ────┤
+                                                        ├──► 处理引擎
+   高优先级（High）    ┐                                │
+   中优先级（Medium）  ├─ 加权轮询 ──► 严格优先级 3 ────┘
+   低优先级（Low）     ┘
+```
+
+### 优先级层次结构
+
+| 优先级等级 | 队列类型 | 仲裁方式 | 说明 |
+|-----------|---------|---------|------|
+| **最高** | 管理队列 | 严格优先级 | 总是优先处理管理命令 |
+| **次高** | 紧急队列 | 轮询 + 严格优先级 | 紧急 I/O 操作，优先于普通 I/O |
+| **普通** | 高/中/低优先级队列 | 加权轮询 + 严格优先级 | 根据权重分配处理时间 |
+
+### 仲裁机制的关键参数
+
+1. **权重积分**（Weight Credits）：为每个优先级队列分配的处理配额
+2. **仲裁突发**（Arbitration Burst）：单次访问某个队列时，最多启动的命令数量
+   - 实际启动数 = min(剩余权重积分, 仲裁突发限制)
+
+### 潜在的饥饿问题
+
+⚠️ **注意**：在加权仲裁模式下，如果紧急队列持续有大量命令，可能导致低优先级队列陷入**饥饿状态**（Starvation），长时间得不到处理机会。设计系统时需要合理规划各队列的负载。
+
+### 可选的供应商特定仲裁
+
+除了轮询仲裁和加权轮询，控制器还可以选择支持**供应商特定的仲裁机制**（Vendor-specific Arbitration），以满足特殊应用场景的需求。
+
+> 📚 规范参考：
+> - [仲裁机制概述，PDF pp. 121-123](../_source/pages/page-121.md)
+> - [仲裁机制图示（Figures 80-81），PDF pp. 122-123](../_source/pages/page-122.md)
+
+---
+
+## 未完成命令的边界定义
+
+### 什么是未完成命令
+
+一个命令从**提交到控制器**开始，直到满足以下任一条件之前，都处于**未完成状态**（Outstanding）：
+
+1. **正常完成**：主机收到该命令的完成条目
+2. **协议定义的证明**：通过其他协议机制证明该命令的处理已经终止
+
+### 命令终止的协议证明
+
+以下情况可以作为命令处理终止的有效证明：
+
+| 终止方式 | 适用场景 | 说明 |
+|---------|---------|------|
+| **中止成功** | 所有命令 | 通过 Abort 命令成功中止目标命令 |
+| **取消成功** | 支持取消的命令 | 通过 Cancel 操作成功取消目标命令 |
+| **控制器状态变更** | 非 Fabrics 命令 | 观察到控制器进入"未就绪"或"关机完成"状态 |
+| **队列删除** | 基于内存的 SQ | 删除命令所在的提交队列 |
+| **连接断开** | Fabrics 传输 | Fabrics Disconnect 成功断开承载该 I/O 队列的连接 |
+| **通信恢复** | 通信丢失后 | 在通信丢失后重新与同一控制器建立通信 |
+
+### 实践意义
+
+理解未完成命令的边界对以下场景非常重要：
+
+- **资源管理**：主机需要追踪有多少命令处于未完成状态
+- **错误恢复**：确定哪些命令需要重试或清理
+- **系统关机**：确保所有命令得到妥善处理后再关闭
+
+> 📚 规范参考：[PDF pp. 123-124](../_source/pages/page-123.md)
+
+---
+
+## 规范依据
+
+本文档内容基于 NVMe 规范的以下章节：
+
+- [命令排序与融合操作契约，PDF pp. 120-121](../_source/pages/page-120.md)
+- [候选命令选择、完成可见性与仲裁机制，PDF p. 121](../_source/pages/page-121.md)
+- [仲裁机制图示（Figures 80-81）与仲裁类别，PDF pp. 122-123](../_source/pages/page-122.md)
+- [未完成命令的终止条件，PDF pp. 123-124](../_source/pages/page-123.md)

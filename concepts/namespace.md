@@ -1,20 +1,43 @@
-# Namespace
+# 命名空间（Namespace）
 
-A namespace is a quantity of non-volatile memory formatted into logical blocks and presented as a storage abstraction that a host accesses through one or more controllers. Namespace allocation, attachment, and sharing are distinct relationships. [PDF pp. 33, 46-57](../_source/pages/page-033.md)
+命名空间是一段被格式化为逻辑块的非易失性存储空间，它以存储抽象的形式呈现给主机，主机可以通过一个或多个控制器来访问它。
 
-## Mental model
+需要注意的是，命名空间的**分配**、**挂载**和**共享**是三个相互独立的关系。[规范 PDF 第 33、46-57 页](../_source/pages/page-033.md)
+
+## 理解命名空间的三个关键问题
+
+要理解命名空间的状态，需要回答三个独立的问题：
 
 ```text
-Allocated?     NVM resources ---- allocation ----> Namespace
-Attached?      Controller    ---- attachment ----> Namespace
-Accessible?    Host path     ---- visibility ----> Namespace
+是否已分配？   NVM 资源 ──── 分配 ───→ 命名空间
+是否已挂载？   控制器   ──── 挂载 ───→ 命名空间  
+是否可访问？   主机路径 ──── 可见性 ───→ 命名空间
 ```
 
-These questions must not be collapsed: a namespace may exist without being attached to a given controller, and shared access may involve multiple controllers or paths. [PDF pp. 52-57](../_source/pages/page-052.md)
+**这三个问题不能混为一谈：**
+- 命名空间可以已分配但未挂载到特定控制器
+- 命名空间可以挂载但主机路径不可达
+- 共享访问场景下，可能涉及多个控制器或多条路径
 
-## Evidence
+[规范 PDF 第 52-57 页](../_source/pages/page-052.md)
 
-Namespace Write Protection Config (`84h`) selects no protection, write protection, protection until power cycle, or permanent protection. The latter two states cannot be changed by Set; until-power-cycle also requires capability support and is prohibited in multi-Domain subsystems. Transitioning into protection flushes that namespace's volatile data and metadata to non-volatile media. [PDF pp. 425-426](../_source/pages/page-425.md)
+## 命名空间写保护机制
 
-- [Normative definition area, PDF p. 33](../_source/pages/page-033.md)
-- [Storage model and sharing, PDF pp. 46-57](../_source/pages/page-046.md)
+命名空间支持写保护配置（特性 ID `84h`），提供四种保护级别：
+
+| 保护级别 | 说明 | 可否改变 |
+|---|---|---|
+| **无保护** | 允许正常读写 | 可随时设置 |
+| **写保护** | 禁止写入，可解除 | 可随时设置 |
+| **断电前保护** | 写保护直到断电，期间无法解除 | 需要能力支持，多域子系统禁止使用 |
+| **永久保护** | 永久写保护，无法解除 | 一旦设置无法撤销 |
+
+**重要行为：**
+当命名空间转入保护状态（后两种）时，系统会自动将该命名空间的易失性数据和元数据刷新到非易失性介质，确保数据持久化。
+
+[规范 PDF 第 425-426 页](../_source/pages/page-425.md)
+
+## 规范依据
+
+- [规范性定义区域，PDF 第 33 页](../_source/pages/page-033.md)
+- [存储模型与共享机制，PDF 第 46-57 页](../_source/pages/page-046.md)

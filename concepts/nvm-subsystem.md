@@ -1,28 +1,43 @@
-# NVM Subsystem
+# NVM 子系统（NVM Subsystem）
 
-An NVM subsystem is the system boundary that contains controllers, ports, namespaces, and the storage resources those namespaces expose. Hosts interact with its storage through controllers rather than directly with underlying media. [PDF pp. 46-52](../_source/pages/page-046.md)
+NVM 子系统是一个系统边界，它包含控制器、端口、命名空间，以及这些命名空间所对应的存储资源。主机通过控制器与子系统中的存储进行交互，而不是直接访问底层介质。
 
-## Mental model
+[规范 PDF 第 46-52 页](../_source/pages/page-046.md)
+
+## 理解子系统的边界与组成
 
 ```text
-                 +----------- NVM Subsystem -----------+
-Host A <-------->| Controller A                        |
-Host B <-------->| Controller B ----+                  |
-                 |                  +--> Namespaces    |
-                 |                       |             |
-                 |                 storage resources   |
-                 +-------------------------------------+
+                 +----------- NVM 子系统 -----------+
+主机 A <-------->| 控制器 A                          |
+主机 B <-------->| 控制器 B ----+                    |
+                 |              +--> 命名空间        |
+                 |                   存储资源        |
+                 +-----------------------------------+
 ```
 
-This is explanatory; controller/namespace visibility and sharing depend on subsystem configuration. [PDF pp. 52-57](../_source/pages/page-052.md)
+这是一个说明性示例。控制器和命名空间的可见性、共享方式取决于子系统的具体配置。
 
-## Relationships
+[规范 PDF 第 52-57 页](../_source/pages/page-052.md)
 
-- A controller is the interface between a host and the subsystem.
-- A subsystem may contain multiple controllers and namespaces.
-- Domains, Endurance Groups, NVM Sets, and Reclaim Groups organize underlying resources.
+## 关键组成部分
 
-## Evidence
+**控制器（Controller）**
+- 控制器是主机与子系统之间的接口
+- 一个子系统可以包含多个控制器
 
-- [Storage entities, PDF pp. 46-52](../_source/pages/page-046.md)
-- [Controller architecture, PDF p. 58](../_source/pages/page-058.md)
+**命名空间（Namespace）**
+- 一个子系统可以包含多个命名空间
+- 命名空间的访问通过控制器进行
+
+**底层存储组织**
+- **域（Domain）**：故障隔离边界
+- **持久组（Endurance Group）**：耐久性和资源管理边界
+- **NVM 集（NVM Set）**：容量分配单元
+- **回收组（Reclaim Group）**：数据放置管理单元
+
+这些组织结构提供了从故障隔离到数据放置的多层次资源管理能力。
+
+## 规范依据
+
+- [存储实体定义，PDF 第 46-52 页](../_source/pages/page-046.md)
+- [控制器架构，PDF 第 58 页](../_source/pages/page-058.md)

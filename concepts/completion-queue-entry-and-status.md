@@ -1,107 +1,188 @@
-# Completion Queue Entry and Status
+# 完成队列条目与状态（Completion Queue Entry and Status）
 
-A Completion Queue Entry (CQE) correlates a completed command, returns queue-consumption information, and reports its outcome. Admin and I/O commands share a common layout of at least 16 bytes; Fabrics responses use a separate 16-byte common layout. [PDF pp. 160-161](../_source/pages/page-160.md)
+完成队列条目（CQE）用于关联已完成的命令、返回队列消费信息并报告命令的执行结果。管理命令和 I/O 命令共享至少 16 字节的通用布局；Fabrics 响应使用独立的 16 字节通用布局。
 
-## Mental model
+[规范 PDF 第 160-161 页](../_source/pages/page-160.md)
+
+## 理解完成队列条目的作用
 
 ```text
-submitted command                         posted completion
-SQID + CID ------------------------------> SQID + CID
-SQ tail ---- controller consumes SQEs ---> SQHD releases slots
-command processing ----------------------> STATUS + optional error log
-CQ wrap ---------------------------------> Phase Tag marks a new CQE
+已提交的命令                           已发布的完成
+提交队列ID + 命令ID ----------------> 提交队列ID + 命令ID
+提交队列尾部 ---- 控制器消费条目 -----> 提交队列头部释放槽位
+命令处理 --------------------------> 状态码 + 可选错误日志
+完成队列环绕 -----------------------> 阶段标签标记新条目
 ```
 
-This explanatory flow joins the correlation, flow-control, and visibility roles of Figures 96-100. `SQID` is reserved for Fabrics, and the Phase Tag is reserved there because its queue transport does not use the memory circular-CQ mechanism. [PDF pp. 160-162](../_source/pages/page-160.md)
+这个流程展示了完成队列条目的关联、流量控制和可见性机制。
 
-## Common layouts
+**特殊说明：**
+- 对于 Fabrics，`SQID` 字段是保留的
+- 阶段标签在 Fabrics 中也是保留的，因为其队列传输不使用基于内存的循环完成队列机制
 
-| Region | Admin and I/O CQE | Fabrics CQE |
+[规范 PDF 第 160-162 页](../_source/pages/page-160.md)
+
+## 通用布局
+
+| 区域 | 管理和 I/O 完成条目 | Fabrics 完成条目 |
 |---|---|---|
-| bytes 0:7 | command-specific DW0-DW1 | Fabrics response type specific |
-| bytes 8:11 | `SQID` + `SQHD` | `SQHD` + reserved |
-| bytes 12:15 | `CID` + Phase Tag + Status | `CID` + reserved bit + Status |
+| **字节 0:7** | 命令特定的双字 0-1 | Fabrics 响应类型特定内容 |
+| **字节 8:11** | `SQID` + `SQHD` | `SQHD` + 保留字段 |
+| **字节 12:15** | `CID` + 阶段标签 + 状态 | `CID` + 保留位 + 状态 |
 
-In the memory-style common CQE, `SQID` plus `CID` uniquely identifies the command. `SQHD` is a snapshot taken when the CQE is created, so the controller may have consumed more SQEs before the host reads it. If a CQE is written in pieces, the controller updates the Phase Tag in the final write. [PDF pp. 160-161](../_source/pages/page-160.md)
+**基于内存的完成条目：**
+- `SQID` 加 `CID` 唯一标识命令
+- `SQHD` 是创建完成条目时的快照，控制器可能在主机读取前已消费更多条目
+- 如果完成条目分多次写入，控制器在最后一次写入时更新阶段标签
 
-For Fabrics, `SQHD` is reserved when Submission Queue flow control is disabled. The common status encoding is shifted into bits 15:1 of the final two-byte Status Info field, leaving bit 0 reserved. [PDF p. 161](../_source/pages/page-161.md)
+[规范 PDF 第 160-161 页](../_source/pages/page-160.md)
 
-## Status contract
+**Fabrics 完成条目：**
+- 当提交队列流量控制被禁用时，`SQHD` 是保留的
+- 通用状态编码被移到最后两个字节的状态信息字段的位 15:1，位 0 保留
 
-```text
-31      30    29:28      27:25        24:17
-+-------+-----+-----------+------------+-----------+
-| DNR   | M   | CRD       | SCT        | SC        |
-+-------+-----+-----------+------------+-----------+
- retry?  log?  delay slot   code family  detail
-```
+[规范 PDF 第 161 页](../_source/pages/page-161.md)
 
-This reconstructed bit field follows rendered Figure 100. A zero Status means successful completion without fatal or non-fatal error. Otherwise `SCT` selects the family and `SC` the detailed condition; if several errors apply and no precedence is specified, the vendor chooses which applicable status to return. [PDF pp. 161-163](../_source/pages/page-161.md)
-
-| Field | Host interpretation |
-|---|---|
-| `DNR=1` | the same command is expected to fail if resubmitted to any controller in the subsystem |
-| `M=1` | additional command status information is available in the Error Information log |
-| `CRD` | when retry is allowed and ACRE is enabled, select immediate retry or controller delay time 1, 2, or 3 |
-| `SCT` | Generic, Command Specific, Media/Data Integrity, Path Related, or Vendor Specific family |
-
-`DNR=0` only means retry may succeed; it is not a guarantee. A nonzero `CRD` is advisory: the host should wait for the selected delay, but retrying early is not itself an error. `CRD` is reserved when `DNR=1` or Advanced Command Retry is disabled. [PDF p. 162](../_source/pages/page-162.md)
-
-## Code-space organization
-
-Within each status-code family, `SC=00h..7Fh` applies to Admin or multiple command sets, `80h..BFh` is I/O-Command-Set-specific, and `C0h..FFh` is vendor-specific. The Generic family therefore groups protocol-wide outcomes rather than defining a separate concept page for every code. [PDF pp. 163-166](../_source/pages/page-163.md)
-
-| Generic outcome class | Representative conditions |
-|---|---|
-| command/sequence validation | invalid opcode or field, CID conflict, missing fused command, invalid namespace |
-| transfer description | data-transfer error, invalid SGL form/length/type/offset, invalid PRP offset |
-| controller/lifecycle gate | internal error, power-loss abort, SQ deletion, keep-alive expiry, sanitize state, media-not-ready |
-| resource/access gate | CMB use, write protection, lockdown, capacity, reservation, placement-handle validation |
-| retry-significant | Command Interrupted requires `DNR=0`; Format In Progress also requires `DNR=0` |
-
-These classes summarize the reviewed cross-page Generic Command Status table without replacing its normative per-code definitions. [PDF pp. 163-166](../_source/pages/page-163.md)
-
-Command Specific status binds a detailed error to one or more opcodes. Its common `00h..6Fh` range covers queue management, firmware, Features, namespace management/attachment, virtualization, sanitize, discovery/zoning, exported-subsystem management, and controller-data-queue operations; `70h..7Fh` is Directive specific, `80h..BFh` selects the I/O-command-specific table, and `C0h..FFh` is vendor specific. [PDF pp. 166-169](../_source/pages/page-166.md)
-
-| Command-specific branch | What the host learns |
-|---|---|
-| common Admin/management | which command contract or lifecycle gate rejected the operation |
-| I/O Command Set specific | an outcome whose meaning belongs to the selected I/O Command Set |
-| Fabrics command specific | Connect/Disconnect format, controller availability, discovery restart, authentication, or transport-specific failure |
-
-The Fabrics branch includes an explicit `Authentication Required` gate for queues that have not completed in-band authentication and reserves `B0h..BFh` for the applicable Transport binding. [PDF pp. 168-169](../_source/pages/page-168.md)
-
-Media and Data Integrity status identifies media commitment/recovery failures, end-to-end protection-tag checks, access denial, or command-set-specific media conditions. Path Related status instead describes the particular host-controller or controller-resource path; in a multipath environment the host should generally try another path when one exists, while ANA Transition is retried after the transition completes and Persistent Loss/Inaccessible should not be retried through the same controller. [PDF pp. 169-171](../_source/pages/page-169.md)
-
-## Phase Tag lifecycle
+## 状态码的组成
 
 ```text
-host initializes every CQ slot P=0
-              |
-controller first posts slot 0 with P=1
-              |
-controller advances Tail through the ring
-              |
-Tail wraps to slot 0 -> posted Phase value toggles to P=0
-              |
-each later wrap toggles the expected posted Phase again
+位 31    30    29:28        27:25          24:17
++-------+-----+------------+-------------+-----------+
+| DNR   | M   | CRD        | SCT         | SC        |
++-------+-----+------------+-------------+-----------+
+  可重试? 有日志? 重试延迟槽   状态码族      详细条件
 ```
 
-This explanatory state sequence condenses rendered Figure 108. The host recognizes a new memory-based CQE by the Phase value expected for its current Head position; the controller writes the Phase Tag last when constructing a CQE in multiple writes. [PDF pp. 160, 171-173](../_source/pages/page-171.md)
+**状态为零：**表示成功完成，没有致命或非致命错误。
 
-Admin CQ slots are initialized before `CC.EN` becomes one; I/O CQ slots are initialized before Create I/O Completion Queue is submitted. Host consumption advances Head but does not rewrite the Phase bits, so an empty slot may retain an old Phase value. [PDF pp. 171-173](../_source/pages/page-171.md)
+**非零状态：**
+- `SCT` 选择状态族
+- `SC` 选择详细条件
+- 如果多个错误同时适用且未规定优先级，供应商选择返回哪个适用的状态
 
-## Relationships
+[规范 PDF 第 161-163 页](../_source/pages/page-161.md)
 
-- `SQHD` connects completion processing to Submission Queue capacity and may release multiple consumed entries at once. [PDF pp. 160-161](../_source/pages/page-160.md)
-- The Phase Tag belongs to circular Completion Queue visibility, while `CID`/`SQID` provide command correlation; its expected value toggles only when the controller's posting position wraps. [PDF pp. 160-161, 171-173](../_source/pages/page-160.md)
-- `M` links a CQE to Error Information log retrieval; `DNR` and `CRD` inform, but do not by themselves define, a safe higher-level retry policy. [PDF p. 162](../_source/pages/page-162.md)
+### 状态字段详解
 
-## Evidence
+| 字段 | 主机解释 |
+|---|---|
+| **`DNR=1`** | 不要重试（Do Not Retry）：相同的命令重新提交到子系统中的任何控制器预计仍会失败 |
+| **`M=1`** | 更多信息（More）：错误信息日志中有额外的命令状态信息 |
+| **`CRD`** | 命令重试延迟（Command Retry Delay）：当允许重试且启用高级命令重试时，选择立即重试或控制器延迟时间 1、2 或 3 |
+| **`SCT`** | 状态码类型（Status Code Type）：通用、命令特定、介质/数据完整性、路径相关或供应商特定族 |
+| **`SC`** | 状态码（Status Code）：在所选 `SCT` 族内的具体条件代码 |
 
-- [Rendered Figures 96-99, common CQE layouts, PDF pp. 160-161](../_source/pages/page-160.md)
-- [Rendered Figures 100-101, Status field and families, PDF pp. 162-163](../_source/pages/page-162.md)
-- [Rendered Figure 102, Generic status values, PDF pp. 163-166](../_source/pages/page-163.md)
-- [Rendered Figures 103-105, Command Specific status branches, PDF pp. 166-169](../_source/pages/page-166.md)
-- [Rendered Figures 106-107, media/data and path-related status, PDF pp. 169-171](../_source/pages/page-169.md)
-- [Rendered Figure 108, Phase Tag transitions, PDF pp. 171-173](../_source/pages/page-171.md)
+**重要提示：**
+- `DNR=0` 只意味着重试可能成功，不是保证
+- 非零 `CRD` 是建议性的：主机应该等待选定的延迟，但提前重试本身不是错误
+- 当 `DNR=1` 或高级命令重试被禁用时，`CRD` 是保留的
+
+[规范 PDF 第 162 页](../_source/pages/page-162.md)
+
+## 状态码空间的组织
+
+在每个状态码族内：
+- `SC=00h..7Fh`：适用于管理命令或多个命令集
+- `80h..BFh`：I/O 命令集特定
+- `C0h..FFh`：供应商特定
+
+### 通用状态族（Generic）
+
+通用族汇总了协议级的结果：
+
+| 通用结果类别 | 代表性条件 |
+|---|---|
+| **命令/序列验证** | 无效操作码或字段、CID 冲突、缺失融合命令、无效命名空间 |
+| **传输描述** | 数据传输错误、无效 SGL 形式/长度/类型/偏移、无效 PRP 偏移 |
+| **控制器/生命周期门控** | 内部错误、掉电中止、提交队列删除、保活超时、清理状态、介质未就绪 |
+| **资源/访问门控** | CMB 使用、写保护、锁定、容量、预留、放置句柄验证 |
+| **重试相关** | 命令中断需要 `DNR=0`；格式化进行中也需要 `DNR=0` |
+
+[规范 PDF 第 163-166 页](../_source/pages/page-163.md)
+
+### 命令特定状态族（Command Specific）
+
+命令特定状态将详细错误绑定到一个或多个操作码：
+
+| 命令特定分支 | 主机了解到的内容 |
+|---|---|
+| **通用管理/管理** | 哪个命令约定或生命周期门控拒绝了操作 |
+| **I/O 命令集特定** | 其含义属于所选 I/O 命令集的结果 |
+| **Fabrics 命令特定** | Connect/Disconnect 格式、控制器可用性、发现重启、认证或传输特定失败 |
+
+**Fabrics 分支包括：**
+- 对未完成带内认证的队列的明确"需要认证"门控
+- 为适用的传输绑定保留 `B0h..BFh`
+
+[规范 PDF 第 166-169 页](../_source/pages/page-166.md)
+
+### 介质与数据完整性状态族
+
+标识介质提交/恢复失败、端到端保护标签检查、访问拒绝或命令集特定的介质条件。
+
+### 路径相关状态族
+
+描述特定的主机-控制器或控制器-资源路径：
+- **多路径环境**：当存在其他路径时，主机通常应尝试另一条路径
+- **ANA 转换**：转换完成后重试
+- **持久丢失/不可访问**：不应通过同一控制器重试
+
+[规范 PDF 第 169-171 页](../_source/pages/page-169.md)
+
+## 阶段标签生命周期
+
+阶段标签用于在循环完成队列中标识新发布的条目：
+
+```text
+主机将每个完成队列槽位的阶段标签初始化为 0
+              |
+控制器首次发布槽位 0，设置阶段标签=1
+              |
+控制器将尾部指针在环中推进
+              |
+尾部指针回绕到槽位 0 → 发布的阶段值切换为 0
+              |
+之后每次回绕，期望的发布阶段再次切换
+```
+
+**关键点：**
+- 主机通过当前头部位置期望的阶段值识别新的基于内存的完成条目
+- 当控制器分多次写入完成条目时，阶段标签在最后一次写入时才更新
+
+[规范 PDF 第 160、171-173 页](../_source/pages/page-171.md)
+
+**初始化时机：**
+- 管理完成队列槽位在 `CC.EN` 变为 1 之前初始化
+- I/O 完成队列槽位在创建 I/O 完成队列提交前初始化
+
+**主机消费行为：**
+- 主机消费推进头部指针但不重写阶段位
+- 因此一个空槽位可能保留旧的阶段值
+
+[规范 PDF 第 171-173 页](../_source/pages/page-171.md)
+
+## 关键关系
+
+**`SQHD` 与流量控制：**
+- 将完成处理连接到提交队列容量
+- 可一次性释放多个已消费的条目
+
+**阶段标签与命令关联：**
+- 阶段标签属于循环完成队列的可见性机制
+- `CID`/`SQID` 提供命令关联
+- 期望值仅在控制器发布位置回绕时切换
+
+**`M` 标志与错误日志：**
+- 将完成条目链接到错误信息日志读取
+- `DNR` 和 `CRD` 提供信息，但本身不构成完整的高层重试策略
+
+[规范 PDF 第 160-162 页](../_source/pages/page-160.md)
+
+## 规范依据
+
+- [图 96-99，通用完成条目布局，PDF 第 160-161 页](../_source/pages/page-160.md)
+- [图 100-101，状态字段与族，PDF 第 162-163 页](../_source/pages/page-162.md)
+- [图 102，通用状态值，PDF 第 163-166 页](../_source/pages/page-163.md)
+- [图 103-105，命令特定状态分支，PDF 第 166-169 页](../_source/pages/page-166.md)
+- [图 106-107，介质/数据与路径相关状态，PDF 第 169-171 页](../_source/pages/page-169.md)
+- [图 108，阶段标签转换，PDF 第 171-173 页](../_source/pages/page-171.md)

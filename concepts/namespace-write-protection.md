@@ -1,25 +1,145 @@
-# Namespace Write Protection
+# 命名空间写保护
 
-Namespace Write Protection is a host-configurable namespace state that gates writes independently of Feature saveability. [PDF pp. 425-426](../_source/pages/page-425.md)
+## 概述
 
-## Mental model
+命名空间写保护（Namespace Write Protection）是 NVMe 规范中的一项安全特性，允许主机（Host）配置命名空间（Namespace）的写保护状态，防止数据被意外或恶意修改。这项特性独立于功能保存性（Feature Saveability）机制，直接控制对存储介质的修改操作。[PDF pp. 425-426, 553-556](../_source/pages/page-425.md)
+
+**核心价值：** 通过写保护机制，系统可以确保关键数据不被篡改，特别适用于需要数据完整性保证的应用场景。
+
+## 状态转换模型
+
+命名空间写保护支持三种保护级别，它们之间的转换关系如下：
 
 ```text
-[No Write Protect] --> [Write Protect]
-        |                    |
-        +--> [Until Power Cycle] --power cycle--> implementation state
-        `--> [Permanent Write Protect] (irreversible by this Feature)
+                    设置写保护
+ [无写保护]     ─────────────────────>  [写保护]
+    ^   |                                  |   |
+    |   +──>  [直到掉电前写保护]  <────────+   |
+    |           | 掉电后恢复                   |
+    +───────────+                              |
+    `────────────────────────────────── [永久写保护]
 ```
 
-This explanatory state summary preserves the two terminal Feature restrictions; the complete state machine is defined later in section 8.1.16. [PDF pp. 425-426](../_source/pages/page-425.md)
+### 三种保护状态说明
 
-## Contract and invariants
+| 保护状态 | 中文说明 | 英文术语 | 转换特性 |
+|---------|---------|---------|---------|
+| **无写保护** | 正常读写状态 | No Write Protect | 可以转换到其他任意状态 |
+| **直到掉电前写保护** | 临时写保护，掉电后自动解除 | Until Power Cycle | 只能通过掉电（Power Cycle）返回无写保护状态 |
+| **永久写保护** | 不可逆的写保护 | Permanent Write Protect | 无法退出，永久生效 |
 
-The Feature is namespace-specific and non-saveable, but has no independent default: reset and power-cycle results derive from the namespace's prior state, except the until-power-cycle state. Attempts to leave the until-power-cycle or permanent state fail with Feature Not Changeable. Entering until-power-cycle also requires Identify support and is prohibited in multi-Domain subsystems. [PDF pp. 425-426](../_source/pages/page-425.md)
+**转换规则解读：**
 
-Before entering any protected state, the controller commits the namespace's volatile write data and metadata to non-volatile media. [PDF p. 426](../_source/pages/page-426.md)
+- 从"无写保护"状态可以进入"写保护"或"直到掉电前写保护"状态
+- 普通"写保护"状态可以返回到"无写保护"状态
+- "直到掉电前写保护"只能在系统掉电重启后自动返回"无写保护"
+- 一旦进入"永久写保护"状态，将永远无法退出
 
-## Evidence
+> **提示：** 进入"直到掉电前写保护"和"永久写保护"状态可能受到 RPMB（Replay Protected Memory Block）写保护控制的限制。[PDF p. 554](../_source/pages/page-554.md)
 
-- [Feature states and change restrictions, PDF p. 425](../_source/pages/page-425.md)
-- [Multi-Domain restriction and cache commit barrier, PDF p. 426](../_source/pages/page-426.md)
+上图是对规范中 Figure 622 的解释性重建，清晰展示了各状态间允许的转换方向。
+
+## 功能特性与约束
+
+### 基本特性
+
+写保护功能具有以下特点：
+
+- **作用范围：** 针对特定命名空间（Namespace-Specific），不同命名空间可以有不同的保护状态
+- **持久性：** 该功能不可保存（Non-Saveable），但状态持久性取决于具体的保护级别
+- **默认值：** 没有独立的默认值，重置（Reset）和掉电（Power Cycle）后的状态由命名空间之前的状态决定（"直到掉电前写保护"除外）
+
+### 状态持久性对比
+
+| 保护状态 | 是否必须支持 | 跨掉电保持 | 跨控制器重置保持 |
+|---------|-------------|-----------|----------------|
+| 无写保护 | 是（capability 存在时） | 是 | 是 |
+| 永久写保护 | 可选 | 是 | 是 |
+| 直到掉电前写保护 | 可选 | **否**（掉电后恢复） | 是 |
+
+### 操作约束
+
+**状态转换限制：**
+
+1. 尝试退出"直到掉电前写保护"或"永久写保护"状态会失败，返回 `Feature Not Changeable`（功能不可更改）错误
+2. 进入"直到掉电前写保护"状态需要 Identify 数据结构中明确表明支持该功能
+3. 在多域（Multi-Domain）子系统中，禁止使用"直到掉电前写保护"功能
+
+[PDF pp. 425-426, 553-554](../_source/pages/page-425.md)
+
+**数据完整性保证：**
+
+在进入任何受保护状态之前，控制器（Controller）必须将该命名空间中所有易失性（Volatile）的写入数据和元数据（Metadata）提交到非易失性（Non-Volatile）介质上。这确保了所有待写入的数据都已持久化，不会因为启用写保护而丢失。[PDF p. 426](../_source/pages/page-426.md)
+
+### 初始状态与强制执行
+
+- **初始状态：** 命名空间创建时的初始状态为"无写保护"
+- **强制范围：** 如果子系统中任意一个控制器支持写保护能力（Capability），则连接到该命名空间的每个控制器都必须强制执行其保护状态
+- **SMART 兼容性：** 通过该功能设置的写保护不会触发 SMART（Self-Monitoring, Analysis and Reporting Technology）中的"All Media Read-Only"警告
+
+[PDF pp. 553-555](../_source/pages/page-553.md)
+
+## 命令执行边界
+
+写保护状态会影响命名空间上可执行的命令类型。以下是详细的命令行为说明：
+
+### 允许执行的命令
+
+以下命令不修改存储介质，因此在写保护状态下可以继续执行：
+
+- **读取类命令：** Read（读取数据）
+- **信息查询：** Identify、Get Log Page（获取日志页）
+- **预留管理：** Reservation Acquire/Release/Report（预留获取/释放/报告）
+- **命名空间管理：** Namespace Attach/Detach（命名空间附加/分离）
+- **数据验证：** Compare（比较）、Verify（验证）
+- **自检：** Device Self-test（设备自检）
+
+**特殊情况：**
+
+- **Flush 命令：** 可以成功执行但无实际效果。由于在进入写保护状态时，控制器已经将所有易失性数据持久化，因此 Flush 命令不需要再执行任何操作。
+- **条件性命令：** 某些名义上允许的命令，如果其执行过程中会修改受保护的命名空间，仍然会失败。例如，Directive Receive 命令不能分配 Streams 资源。
+
+[PDF p. 555](../_source/pages/page-555.md)
+
+### 被阻止的命令
+
+以下情况下，命令会被拒绝执行，并返回 `Namespace Is Write Protected`（命名空间已写保护）错误：
+
+1. **直接指定受保护命名空间：** 命令明确指定了一个处于写保护状态的命名空间作为操作目标
+2. **间接修改受保护命名空间：** 命令操作会间接影响到受保护的命名空间
+   - 例如：Format NVM 命令可能影响多个命名空间
+3. **无 NSID 但会修改受保护命名空间：** 命令不指定特定的命名空间 ID（NSID），但其操作会修改受保护的命名空间
+   - 例如：Sanitize（数据清理）命令作用于整个控制器
+
+[PDF pp. 555-556](../_source/pages/page-555.md)
+
+### 命令行为总结表
+
+| 命令类型 | 写保护状态下的行为 | 典型示例 |
+|---------|------------------|---------|
+| 只读操作 | 允许执行 | Read, Identify, Get Log Page |
+| 管理操作（不修改数据） | 允许执行 | Attach, Detach, Reservation |
+| 数据验证 | 允许执行 | Compare, Verify |
+| 数据写入 | 被阻止 | Write, Write Zeroes |
+| 格式化操作 | 被阻止 | Format NVM |
+| 数据清理 | 被阻止 | Sanitize |
+| 缓存刷新 | 成功但无效果 | Flush |
+
+## 相关概念
+
+写保护功能与其他 NVMe 功能紧密关联：
+
+- **[通用控制器特性](common-controller-features.md)** - 定义了 Set Feature 和 Get Feature 命令的控制平面，用于设置和查询写保护状态 [PDF pp. 395-405](../_source/pages/page-395.md)
+
+- **[命名空间管理生命周期](namespace-management-lifecycle.md)** - 负责创建初始的未受保护命名空间，并控制命名空间的附加（Attachment）集合 [PDF pp. 550-553](../_source/pages/page-550.md)
+
+- **[Format NVM 生命周期](format-nvm-lifecycle.md)** 和 **[Sanitize 操作生命周期](sanitize-operation-lifecycle.md)** - 这些是会被写保护机制阻止的典型操作示例，展示了写保护如何防止数据被擦除或重新格式化 [PDF pp. 555-556](../_source/pages/page-555.md)
+
+## 规范参考
+
+以下是本文档中引用的 NVMe 规范页面：
+
+- [Feature 状态与变更限制，PDF p. 425](../_source/pages/page-425.md)
+- [Multi-Domain 限制与缓存提交屏障，PDF p. 426](../_source/pages/page-426.md)
+- [状态定义与 Figure 622 转换图，PDF pp. 553-554](../_source/pages/page-553.md)
+- [子系统范围强制执行与命令交互，PDF pp. 555-556](../_source/pages/page-553.md)

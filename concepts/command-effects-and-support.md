@@ -1,63 +1,164 @@
-# Command Effects and Support
+# 命令效果与支持
 
-The Commands Supported and Effects log is a controller-published catalog that tells host software whether each Admin or selected I/O opcode is supported and what subsystem state that command may change. The 4,096-byte log contains one 32-bit descriptor for each Admin opcode and one for each I/O opcode in the selected I/O Command Set. [PDF p. 236](../_source/pages/page-236.md)
+## 概述
 
-## Mental model
+在 NVMe 系统中，控制器（Controller）需要告知主机（Host）软件两个关键信息：
 
-```text
-opcode -> supported? -> possible effects -> host coordination
-                         | scope             | pause conflicts
-                         | capability change | wait for completion
-                         ` data change       ` re-enumerate / re-Identify
-```
+1. **哪些命令受支持**：控制器实际支持哪些管理命令（Admin Command）和 I/O 命令
+2. **命令会产生什么效果**：每个命令可能对子系统（Subsystem）状态产生哪些影响
 
-This explanatory flow shows why the log is operational metadata rather than merely an opcode list. [PDF pp. 236-238](../_source/pages/page-236.md)
+NVMe 规范通过 **Commands Supported and Effects Log**（命令支持与效果日志）来提供这些信息。这是一个 4,096 字节的日志结构，其中包含：
 
-## Descriptor semantics
+- 每个管理操作码（Admin Opcode）对应一个 32 位描述符（Descriptor）
+- 所选 I/O 命令集（I/O Command Set）中每个 I/O 操作码也对应一个 32 位描述符
 
-| Group | Meaning |
-|---|---|
-| `CSUPP` | The opcode is supported; when clear, every other descriptor field is zero. |
-| Scope | Possible impact on namespace, controller, NVM Set, Endurance Group, Domain, or whole NVM subsystem; multiple scope bits may be set. |
-| `USS` | The command supports UUID selection. |
-| `CSE` / `CSER` | Submission/execution recommendations serialize commands that could conflict at namespace or global scope; a supported nonzero relaxation supersedes `CSE`. |
-| Capability effects | The command may change controller capability, namespace inventory, one namespace's capability, or logical-block content. |
+通过这个日志，主机软件可以了解每个命令的支持情况及其可能的副作用，从而进行合理的命令调度和状态管理。
 
-The compact table summarizes rendered Figure 210 without reproducing reserved bits. The controller describes possible overall effects, including optional command behavior, so the host should treat set flags conservatively. [PDF pp. 237-238](../_source/pages/page-237.md)
+> **规范参考**：[PDF p. 236](../_source/pages/page-236.md)
 
-## Host use
+## 工作机制
 
-After a command that may change a capability or namespace inventory, host software may need to pause use of affected namespaces, wait for command completion, and re-enumerate or reissue Identify. When a namespace is attached to multiple controllers, hosts coordinate submissions across those controllers to satisfy the descriptor's execution recommendation. [PDF p. 236](../_source/pages/page-236.md)
-
-The I/O half of the log is interpreted for the command set selected by `CC.CSS`, except that the Command Set Identifier in Command Dword 14 selects the command set when `CC.CSS=110b`. [PDF p. 236](../_source/pages/page-236.md)
-
-## Feature and management-command effects
+### 信息流程
 
 ```text
-interface instance + selected command set / UUID
-                |
-                +--> FID 00h..FFh -> supported + one scope + effects
-                `--> MI opcode 00h..FFh -> supported + one scope + effects
+操作码（Opcode）
+    ↓
+是否支持？
+    ↓
+可能的效果
+    ├─ 影响范围（Scope）
+    ├─ 能力变更（Capability Change）
+    └─ 数据变更（Data Change）
+    ↓
+主机协调策略
+    ├─ 暂停冲突操作
+    ├─ 等待命令完成
+    └─ 重新枚举/重新识别
 ```
 
-The Feature Identifiers Supported and Effects log is interface-instance-specific: an Admin Queue, PCIe VDM endpoint, or 2-Wire endpoint may expose a different FID set. For I/O controllers, the selected or profiled I/O Command Set also filters support; when UUID selection is advertised, `UIDX` further selects the reported FID namespace. [PDF p. 281](../_source/pages/page-281.md)
+这个流程说明了该日志的核心价值：它不仅仅是一个简单的操作码列表，而是包含了**操作元数据**（Operational Metadata），帮助主机软件做出正确的协调决策。
 
-| Catalog | Per-entry support | Scope rule | Common change flags |
-|---|---|---|---|
-| Feature Identifier | `FSUPP`; unsupported means all other bits zero | zero means unreported; otherwise exactly one of namespace/controller/NVM Set/Endurance Group/Domain/subsystem/CDQ | user data, one namespace capability, namespace inventory, controller capability |
-| NVMe-MI opcode | `CSUPP`; unsupported means all other bits zero | zero means unreported; otherwise exactly one of namespace/controller/NVM Set/Endurance Group/Domain/subsystem | user data, one namespace capability, namespace inventory, controller capability |
+> **规范参考**：[PDF pp. 236-238](../_source/pages/page-236.md)
 
-This compact comparison was checked against rendered Figures 261–264. The Feature catalog additionally reports whether Get/Set Features accepts UUID selection; both catalogs describe the overall possible effect, including optional behavior, rather than the effect of one particular invocation. [PDF pp. 282-284](../_source/pages/page-282.md)
+## 描述符字段详解
 
-## Relationships
+每个命令的 32 位描述符包含多个字段组，用于描述命令的支持状态和效果特征。
 
-- [Command Ordering and Arbitration](command-ordering-and-arbitration.md) selects work for execution; command-effects metadata tells the host where additional serialization is advisable. [PDF pp. 120-123, 237-238](../_source/pages/page-120.md)
-- [Namespace Identifiers](namespace-identifiers.md) supplies the namespace inventory that a command may invalidate or require the host to rediscover. [PDF pp. 235-238](../_source/pages/page-235.md)
+### 字段组说明
 
-## Evidence
+| 字段组 | 含义说明 |
+|--------|----------|
+| **CSUPP**<br>命令支持位 | 该操作码受控制器支持。<br>当此位清零时，描述符中的所有其他字段均为零。 |
+| **Scope**<br>影响范围 | 命令可能影响的范围，包括：<br>- 命名空间（Namespace）<br>- 控制器（Controller）<br>- NVM 集合（NVM Set）<br>- 耐久性组（Endurance Group）<br>- 域（Domain）<br>- 整个 NVM 子系统<br><br>**注意**：多个范围位可以同时被设置。 |
+| **USS**<br>UUID 选择支持 | 该命令支持 UUID（通用唯一标识符）选择功能。<br>主机可以通过 UUID 来指定命令作用的特定对象。 |
+| **CSE / CSER**<br>提交与执行建议 | 提供命令串行化建议，用于避免冲突：<br>- 在命名空间范围内串行化命令<br>- 在全局范围内串行化命令<br><br>如果支持非零的放宽策略（Relaxation），则该策略会取代 CSE 字段的值。 |
+| **Capability Effects**<br>能力效果标志 | 指示命令可能产生的变更类型：<br>- 控制器能力变更<br>- 命名空间清单变更<br>- 单个命名空间能力变更<br>- 逻辑块内容变更 |
 
-- Log layout, command-set selection, and host coordination: [PDF p. 236](../_source/pages/page-236.md)
-- Scope and command-submission fields: [PDF p. 237](../_source/pages/page-237.md)
-- Relaxation and capability/data-change flags: [PDF p. 238](../_source/pages/page-238.md)
-- Interface-specific Feature support and effects: [PDF pp. 281-283](../_source/pages/page-281.md)
-- NVMe-MI command support, scope, and effects: [PDF pp. 283-284](../_source/pages/page-283.md)
+### 重要说明
+
+1. **保守原则**：控制器描述的是命令**可能**产生的所有效果，包括可选的命令行为。因此，主机软件应该保守地对待所有被设置的标志位。
+
+2. **字段组合**：多个字段可以同时有效，主机需要综合考虑所有标志位来决定命令协调策略。
+
+3. **完整定义**：上表是对规范 Figure 210 的概括性总结，省略了保留位（Reserved bits）的详细说明。完整的位定义请参考规范文档。
+
+> **规范参考**：[PDF pp. 237-238](../_source/pages/page-237.md)
+
+## 主机软件使用指南
+
+### 命令执行后的处理流程
+
+当主机执行可能修改控制器能力或命名空间清单（Namespace Inventory）的命令后，需要按以下步骤处理：
+
+1. **暂停相关操作**：暂停对受影响命名空间的访问
+2. **等待命令完成**：确保命令已经完全执行完毕
+3. **更新系统视图**：
+   - 重新枚举（Re-enumerate）命名空间
+   - 重新发出 Identify 命令获取最新状态
+
+### 多控制器场景下的协调
+
+当一个命名空间连接到多个控制器时，主机软件需要在这些控制器之间协调命令提交，以满足描述符中的执行建议。这样可以避免并发命令产生冲突。
+
+例如：
+- 如果命令建议在命名空间范围内串行化，主机需确保不会同时向该命名空间发送冲突命令
+- 如果命令建议在全局范围内串行化，主机需要更严格的全局协调
+
+### 命令集选择
+
+该日志的 I/O 命令部分需要根据当前激活的命令集进行解释：
+
+- **标准情况**：由控制器配置寄存器中的 `CC.CSS` 字段选定命令集
+- **动态选择**：当 `CC.CSS=110b` 时，使用命令双字 14（Command Dword 14）中的命令集标识符（Command Set Identifier）来动态选择具体的命令集
+
+> **规范参考**：[PDF p. 236](../_source/pages/page-236.md)
+
+## 特性与管理命令效果
+
+### 特性标识符支持与效果日志
+
+除了命令支持与效果日志外，NVMe 还提供了 **Feature Identifiers Supported and Effects Log**（特性标识符支持与效果日志），用于描述各种特性和管理命令的支持情况。
+
+```text
+接口实例 + 选定的命令集 / UUID
+    ↓
+    ├─ FID 00h..FFh → 是否支持 + 影响范围 + 效果
+    └─ MI opcode 00h..FFh → 是否支持 + 影响范围 + 效果
+```
+
+### 接口实例特性
+
+**重要特点**：特性标识符日志是**接口实例特定**的（Interface-Instance-Specific），这意味着不同接口可能暴露不同的特性集合：
+
+- 管理队列（Admin Queue）
+- PCIe VDM 端点（PCIe VDM Endpoint）
+- 2-Wire 端点（2-Wire Endpoint）
+
+对于 I/O 控制器，选定的或由配置文件指定的 I/O 命令集也会过滤支持范围。当系统通告支持 UUID 选择时，`UIDX` 字段可以进一步选择所报告的 FID 命名空间。
+
+> **规范参考**：[PDF p. 281](../_source/pages/page-281.md)
+
+### 效果日志对比
+
+| 日志类型 | 每条目的支持字段 | 影响范围规则 | 通用变更标志 |
+|----------|------------------|--------------|--------------|
+| **特性标识符** | `FSUPP`：不支持时所有其他位为零 | 零表示未报告<br>非零时在以下范围中**恰好一个**位为 1：<br>- 命名空间<br>- 控制器<br>- NVM 集合<br>- 耐久性组<br>- 域<br>- 子系统<br>- CDQ | - 用户数据变更<br>- 单个命名空间能力变更<br>- 命名空间清单变更<br>- 控制器能力变更 |
+| **NVMe-MI 操作码** | `CSUPP`：不支持时所有其他位为零 | 零表示未报告<br>非零时在以下范围中**恰好一个**位为 1：<br>- 命名空间<br>- 控制器<br>- NVM 集合<br>- 耐久性组<br>- 域<br>- 子系统 | - 用户数据变更<br>- 单个命名空间能力变更<br>- 命名空间清单变更<br>- 控制器能力变更 |
+
+### 理解要点
+
+1. **可能性描述**：这些日志描述的是命令或特性**可能**产生的总体效果，包括可选行为，而不是某一次具体调用的实际效果。
+
+2. **范围规则差异**：
+   - 命令效果日志：多个范围位可以同时设置
+   - 特性标识符和 NVMe-MI 日志：只能有一个范围位设置
+
+3. **UUID 选择支持**：特性日志还额外报告 Get Features 和 Set Features 命令是否接受 UUID 选择功能。
+
+4. **规范核查**：上述对比表已与规范中的 Figures 261–264 核对确认。
+
+> **规范参考**：[PDF pp. 282-284](../_source/pages/page-282.md)
+
+## 相关概念
+
+### 命令排序与仲裁
+
+[Command Ordering and Arbitration](command-ordering-and-arbitration.md)（命令排序与仲裁）机制负责从提交队列中选择待执行的命令。而命令效果元数据则告知主机软件在哪些场景下建议进行额外的串行化处理，两者配合确保命令的正确执行顺序。
+
+> **规范参考**：[PDF pp. 120-123, 237-238](../_source/pages/page-120.md)
+
+### 命名空间标识符
+
+[Namespace Identifiers](namespace-identifiers.md)（命名空间标识符）提供了命名空间清单信息。某些命令可能使这些清单失效，或者要求主机重新发现命名空间配置。命令效果日志帮助主机识别这些情况并采取相应的更新措施。
+
+> **规范参考**：[PDF pp. 235-238](../_source/pages/page-235.md)
+
+## 规范引用
+
+本文档基于以下 NVMe 规范页面编写：
+
+- **日志布局、命令集选择与主机协调**：[PDF p. 236](../_source/pages/page-236.md)
+- **影响范围与命令提交字段**：[PDF p. 237](../_source/pages/page-237.md)
+- **放宽策略与能力/数据变更标志**：[PDF p. 238](../_source/pages/page-238.md)
+- **接口特定的特性支持与效果**：[PDF pp. 281-283](../_source/pages/page-281.md)
+- **NVMe-MI 命令支持、范围与效果**：[PDF pp. 283-284](../_source/pages/page-283.md)

@@ -1,74 +1,119 @@
-# Controller
+# 控制器（Controller）
 
-A controller is the interface between a host and an NVM subsystem. Every controller executes commands from Submission Queues, posts completions to Completion Queues, and implements one Admin Submission Queue and one Admin Completion Queue. [PDF p. 29](../_source/pages/page-029.md)
+控制器是主机与 NVM 子系统之间的桥梁接口。它的核心职责包括：
+- 从提交队列中取出并执行命令
+- 将执行结果写入完成队列
+- 维护一对专门的管理队列（管理提交队列和管理完成队列）
 
-## Mental model
+[规范 PDF 第 29 页](../_source/pages/page-029.md)
 
-```text
-Host software
-    |
-    | commands / completions / data
-    v
-+---------------- Controller ----------------+
-| properties | queues | command processing   |
-+---------------------------------------------+
-    |
-    v
-NVM subsystem resources and namespaces
-```
-
-## Contract and invariants
-
-All controllers in one NVM subsystem use the same allocation model. A static controller preserves Controller ID and saved Feature state across Controller Level Reset and, for message-based controllers, across associations. A dynamic controller is allocated on demand and preserves no state from an earlier association. [PDF p. 58](../_source/pages/page-058.md)
+## 理解控制器的工作方式
 
 ```text
-                         Controller allocation model
-                    +----------------+----------------+
-                    |                                 |
-              [Static controller]              [Dynamic controller]
-              state survives reset             allocated on demand
-              Fabrics state may survive         no prior-association state
-              across associations
-
-Memory-based ------> static only
-Message-based -----> static or dynamic (Discovery: dynamic only)
+主机软件
+    |
+    | 发送命令、接收完成通知、传输数据
+    v
++---------------------- 控制器 ----------------------+
+| 属性配置 | 队列管理 | 命令处理                      |
++----------------------------------------------------+
+    |
+    v
+NVM 子系统资源和命名空间
 ```
 
-This explanatory classification preserves the transport constraints and the subsystem-wide model invariant. [PDF p. 58](../_source/pages/page-058.md)
+## 核心机制与约束
 
-| Controller type | Purpose | I/O queues / namespace access |
+### 分配模型：静态 vs 动态
+
+同一个 NVM 子系统中的所有控制器必须使用统一的分配模型。这里有两种模式：
+
+**静态控制器（Static Controller）**
+- 控制器 ID 固定不变
+- 已保存的特性配置在控制器级别重置后依然保留
+- 对于基于消息的传输（如 NVMe over Fabrics），这些状态甚至可以跨连接会话保留
+
+**动态控制器（Dynamic Controller）**
+- 按需创建分配
+- 不保留之前会话的任何状态
+- 每次连接都是全新开始
+
+[规范 PDF 第 58 页](../_source/pages/page-058.md)
+
+```text
+                    控制器分配模型
+              +------------------+------------------+
+              |                                     |
+        [静态控制器]                          [动态控制器]
+     状态在重置后保留                        按需动态分配
+   Fabrics 状态可跨会话保留                  无历史状态保留
+
+基于内存的传输（PCIe）  ──→  只能是静态
+基于消息的传输（Fabrics） ──→  可静态可动态（发现控制器必须是动态）
+```
+
+这个分类设计保持了传输层约束与子系统级模型的一致性。[规范 PDF 第 58 页](../_source/pages/page-058.md)
+
+### 控制器的三种功能类型
+
+| 类型 | 主要用途 | I/O 队列与命名空间访问能力 |
 |---|---|---|
-| I/O | Accesses user data through one or more supported I/O Command Sets; may manage | Supports I/O queues; namespaces may be attached |
-| Discovery | Discovers NVM or Discovery subsystems over Fabrics | No I/O queues, I/O commands, or exposed namespaces |
-| Administrative | Manages an NVM subsystem | No I/O queues, namespace attachments, or user-data I/O |
+| **I/O 控制器** | 通过一个或多个 I/O 命令集访问用户数据，可同时承担管理职责 | 支持 I/O 队列，可以挂载命名空间 |
+| **发现控制器** | 在 Fabrics 网络中发现 NVM 子系统或其他发现服务 | 不支持 I/O 队列、I/O 命令，也不暴露命名空间 |
+| **管理控制器** | 专门用于管理 NVM 子系统 | 不支持 I/O 队列，不能挂载命名空间，不能访问用户数据 |
 
-Every type still implements exactly one Admin Submission Queue and one Admin Completion Queue; `CNTRLTYPE` in Identify Controller reports the functional type. [PDF p. 59](../_source/pages/page-059.md)
+每种类型的控制器都必须实现一对管理队列（一个提交队列和一个完成队列）。控制器的具体类型通过识别控制器结构中的 `CNTRLTYPE` 字段报告。[规范 PDF 第 59 页](../_source/pages/page-059.md)
 
-An I/O controller may simultaneously support multiple I/O Command Sets, and support may differ between controllers in the same subsystem. An Administrative controller may support I/O-Command-Set-specific Admin commands, but cannot execute I/O commands because it has no I/O Queues. [PDF pp. 60-61](../_source/pages/page-060.md)
+**关于 I/O 控制器的补充说明：**
+- 单个 I/O 控制器可以同时支持多种 I/O 命令集
+- 同一子系统内不同 I/O 控制器支持的命令集可以不同
+- 管理控制器可以支持特定于某个 I/O 命令集的管理命令，但因为没有 I/O 队列，所以无法执行 I/O 命令本身
 
-Administrative controllers are optional in a subsystem and may manage namespaces, virtualization, health, enclosure functions, subsystem reset, or subsystem shutdown. They can also exist in a subsystem with no non-volatile medium or namespaces. [PDF pp. 61-62](../_source/pages/page-061.md)
+[规范 PDF 第 60-61 页](../_source/pages/page-060.md)
 
-The generic term *controller* may stand for any applicable type when context determines the type. [PDF pp. 24, 28-30](../_source/pages/page-024.md) [PDF p. 28](../_source/pages/page-028.md) [PDF pp. 29-30](../_source/pages/page-029.md)
+**关于管理控制器的补充说明：**
+- 管理控制器在子系统中是可选的
+- 可以管理命名空间、虚拟化、健康状态、机箱功能、子系统重置或关机
+- 甚至可以存在于没有非易失性存储介质或命名空间的子系统中
 
-A dynamic controller is allocated on demand and does not preserve state such as Feature settings from prior associations. An emulated controller is software-defined and may or may not have a physical NVMe controller underneath it. [PDF pp. 30, 58](../_source/pages/page-030.md)
+[规范 PDF 第 61-62 页](../_source/pages/page-061.md)
 
-A static controller pre-exists with a specific Controller ID and preserves state such as Feature settings across associations. Primary and secondary describe a different axis: a secondary controller depends on a primary controller for management of some controller resources. [PDF pp. 34-35](../_source/pages/page-034.md)
+**术语使用说明：**
+在具体的上下文中，"控制器"这个通用术语可以指代上述任何一种类型，具体含义由上下文决定。[规范 PDF 第 24、28-30 页](../_source/pages/page-024.md)
 
-| Axis | Alternatives |
+### 理解控制器的多个维度
+
+控制器有多个正交的分类维度，它们可以组合使用：
+
+| 分类维度 | 可选项 |
 |---|---|
-| Transport behavior | memory-based / message-based |
-| Allocation lifetime | static / dynamic |
-| Functional role | I/O / Discovery / Administrative |
-| Resource management | primary / secondary |
+| **传输行为** | 基于内存（PCIe）/ 基于消息（Fabrics） |
+| **分配生命周期** | 静态 / 动态 |
+| **功能角色** | I/O / 发现 / 管理 |
+| **资源管理** | 主控制器 / 从属控制器 |
 
-These labels are composable classifications, not one flat mutually exclusive type list. [PDF pp. 28, 30, 32, 34-35](../_source/pages/page-028.md) [PDF p. 30](../_source/pages/page-030.md) [PDF p. 32](../_source/pages/page-032.md) [PDF pp. 34-35](../_source/pages/page-034.md)
+这些不是互斥的单一类型，而是可以自由组合的特征标签。例如：
+- 一个"静态 I/O 主控制器，使用 PCIe 传输"
+- 一个"动态发现控制器，使用 Fabrics 传输"
 
-## Evidence
+[规范 PDF 第 28、30、32、34-35 页](../_source/pages/page-028.md)
 
-- [Controller models and association rules, PDF p. 58](../_source/pages/page-058.md)
-- [Controller type taxonomy and common Admin queues, PDF p. 59](../_source/pages/page-059.md)
-- [I/O controller capabilities, PDF p. 60](../_source/pages/page-060.md)
-- [Administrative controller constraints and uses, PDF pp. 61-62](../_source/pages/page-061.md)
-- [Controller definition and common queue behavior, PDF p. 29](../_source/pages/page-029.md)
-- [Controller type definitions, PDF pp. 28-30](../_source/pages/page-028.md)
-- [Transport, allocation, and resource-management classifications, PDF pp. 32, 34-35](../_source/pages/page-032.md)
+**关于动态与静态的进一步说明：**
+- 动态控制器按需分配，不保留特性配置等历史状态
+- 静态控制器预先存在，具有固定的控制器 ID，特性配置跨会话保留
+- 仿真控制器（Emulated Controller）是软件定义的，底层可能有也可能没有物理 NVMe 控制器
+
+[规范 PDF 第 30、58 页](../_source/pages/page-030.md)
+
+**关于主从关系的说明：**
+主控制器和从属控制器描述的是另一个维度：从属控制器依赖主控制器来管理某些控制器资源（如虚拟队列和虚拟中断资源）。[规范 PDF 第 34-35 页](../_source/pages/page-034.md)
+
+## 规范依据
+
+- [控制器模型与关联规则，PDF 第 58 页](../_source/pages/page-058.md)
+- [控制器类型分类与通用管理队列，PDF 第 59 页](../_source/pages/page-059.md)
+- [I/O 控制器能力，PDF 第 60 页](../_source/pages/page-060.md)
+- [管理控制器约束与用途，PDF 第 61-62 页](../_source/pages/page-061.md)
+- [控制器定义与通用队列行为，PDF 第 29 页](../_source/pages/page-029.md)
+- [控制器类型定义，PDF 第 28-30 页](../_source/pages/page-028.md)
+- [传输、分配与资源管理分类，PDF 第 32、34-35 页](../_source/pages/page-032.md)

@@ -1,84 +1,379 @@
-# Common Controller Features
+# 控制器通用特性（Common Controller Features）
 
-Common controller Features apply across transport models and configure recurring policy surfaces such as arbitration, controller power, thermal thresholds, and volatile write caching. [PDF pp. 395-398](../_source/pages/page-395.md)
+## 概述
 
-## Mental model
+控制器通用特性（Common Controller Features）是 NVMe 规范中跨越所有传输协议的通用功能配置机制。这些特性用于配置控制器（Controller）的核心策略，包括：
+
+- **仲裁机制**（Arbitration）：控制命令队列的调度策略
+- **电源管理**（Power Management）：控制器功耗状态的配置
+- **温度管理**（Temperature Management）：热阈值和事件处理
+- **缓存策略**（Volatile Write Cache）：写入数据的持久化边界
+
+这些特性通过 Set Features 和 Get Features 命令进行配置和查询。
+
+> **参考规范**：[PDF pp. 395-398](../_source/pages/page-395.md)
+
+---
+
+## 工作原理
+
+### 特性生效模型
+
+当 Set Features 命令成功完成后，新的配置会立即影响后续的命令行为，但已经在执行的命令不一定会受到影响。下图展示了各类特性的作用目标：
 
 ```text
-Set Features completion
+Set Features 命令完成
        |
-       +-- Arbitration ------> future queue fetch policy
-       +-- Power Management -> requested controller power state
-       +-- Temperature ------> threshold event / hysteresis policy
-       `-- Volatile Cache ---> write persistence boundary
+       +-- Arbitration（仲裁）---------> 影响后续队列取命令的策略
+       +-- Power Management（电源管理）--> 请求控制器进入目标功耗状态
+       +-- Temperature（温度管理）--------> 配置温度阈值事件和迟滞策略
+       `-- Volatile Cache（易失性缓存）---> 定义写入数据的持久化边界
 ```
 
-This explanatory policy map groups the first common Feature definitions by downstream behavior. Commands submitted after successful completion use the new setting; already executing commands may or may not. [PDF pp. 395-398](../_source/pages/page-395.md)
+> **参考规范**：[PDF pp. 395-398](../_source/pages/page-395.md)
 
-## Feature contracts
+---
 
-| Feature | Control | Key invariant |
-|---|---|---|
-| Arbitration (`01h`) | high/medium/low zero-based weights and power-of-two fetch burst | `AB=111b` means no burst limit |
-| Power Management (`02h`) | supported power-state index plus workload hint | successful Set completion places or is transitioning the controller to that state; autonomous transitions may continue |
-| Temperature Threshold (`04h`) | sensor, over/under type, Kelvin threshold, optional hysteresis | Composite over-threshold is mandatory; all implemented sensors have both threshold types |
-| Volatile Write Cache (`06h`) | cache enable | when present but disabled, namespace write data must be persistent |
+## 核心特性详解
 
-[PDF pp. 396-398](../_source/pages/page-396.md)
+### 特性参数对照表
 
-## Temperature hysteresis
+下表总结了主要通用特性的控制参数和关键行为约束：
+
+| 特性 | Feature ID | 控制参数 | 关键行为约束 |
+|------|-----------|---------|-------------|
+| **Arbitration**<br>仲裁 | `01h` | • 高优先级权重（HPW）<br>• 中优先级权重（MPW）<br>• 低优先级权重（LPW）<br>• 仲裁突发限制（AB） | • 权重值从 0 开始计数<br>• 突发限制必须是 2 的幂<br>• `AB=111b` 表示无突发限制 |
+| **Power Management**<br>电源管理 | `02h` | • 目标功耗状态索引（PS）<br>• 工作负载提示（Workload Hint） | • 命令成功完成后，控制器进入或正在转换到指定状态<br>• 自主功耗转换（APST）可能继续工作 |
+| **Temperature Threshold**<br>温度阈值 | `04h` | • 传感器选择<br>• 阈值类型（过温/低温）<br>• 开尔文温度值<br>• 可选迟滞值 | • 复合温度过温阈值是强制的<br>• 所有已实现的传感器都必须支持两种阈值类型 |
+| **Volatile Write Cache**<br>易失性写缓存 | `06h` | • 缓存使能标志（WCE） | • 当特性存在但被禁用时，写入命名空间的数据必须持久化 |
+
+> **参考规范**：[PDF pp. 396-398](../_source/pages/page-396.md)
+
+---
+
+### 1. 仲裁特性（Arbitration，Feature ID: 01h）
+
+仲裁特性控制控制器如何从不同优先级的队列中获取命令执行。
+
+**配置参数**：
+
+- **HPW（High Priority Weight，高优先级权重）**：从 0 开始计数的权重值
+- **MPW（Medium Priority Weight，中优先级权重）**：从 0 开始计数的权重值
+- **LPW（Low Priority Weight，低优先级权重）**：从 0 开始计数的权重值
+- **AB（Arbitration Burst，仲裁突发）**：必须是 2 的幂，`111b` 表示无限制
+
+**工作机制**：
+- 权重值决定了各优先级队列被调度的相对频率
+- 突发限制控制了连续从同一队列取命令的最大数量
+- 权重值越大，该优先级队列获得的调度机会越多
+
+---
+
+### 2. 电源管理特性（Power Management，Feature ID: 02h）
+
+电源管理特性用于控制控制器的功耗状态。
+
+**配置参数**：
+- **PS（Power State）**：目标功耗状态的索引号
+- **Workload Hint（工作负载提示）**：可选参数，帮助控制器优化性能
+
+**行为规则**：
+- Set Features 命令成功完成后，控制器会进入或正在转换到指定的功耗状态
+- 即使设置了新状态，自主功耗状态转换（APST）机制仍然可能继续工作
+- 必须指定控制器支持的功耗状态，否则命令失败
+
+---
+
+### 3. 温度阈值特性（Temperature Threshold，Feature ID: 04h）
+
+温度阈值特性为温度传感器配置过温和低温阈值，并设置迟滞（Hysteresis）参数以防止频繁触发告警。
+
+**配置参数**：
+- **传感器选择**：指定监控哪个温度传感器
+- **阈值类型**：过温（Over-temperature）或低温（Under-temperature）
+- **温度阈值**：以开尔文（Kelvin）为单位
+- **迟滞值**：可选参数，定义恢复的温度差
+
+**温度迟滞机制**：
 
 ```text
-Over-temperature:  start at T >= threshold
-                   end   at T < threshold - hysteresis
+过温情况：
+  触发条件：温度 >= 阈值
+  恢复条件：温度 < 阈值 - 迟滞值
 
-Under-temperature: start at T <= threshold
-                   end   at T > threshold + hysteresis
+低温情况：
+  触发条件：温度 <= 阈值
+  恢复条件：温度 > 阈值 + 迟滞值
 ```
 
-This explanatory threshold diagram follows the specified strict/non-strict comparisons. While active, the SMART Critical Warning temperature bit is set; recovery clears it, stops warning-temperature time accumulation, and triggers the configured hysteresis-recovery event. Unsupported sensors or hysteresis above `TMPTHMH` are invalid. [PDF pp. 397-398](../_source/pages/page-397.md)
+该机制遵循规范规定的严格/非严格比较规则。当温度超出阈值时：
+- SMART 健康信息（Critical Warning）中的温度位被置 1
+- 温度恢复到正常范围后，该位被清除
+- 停止温度告警时间的累加
+- 触发已配置的迟滞恢复事件（hysteresis-recovery event）
 
-## Relationships
+**限制条件**：
+- 不支持的传感器编号会导致命令失败
+- 迟滞值不能超过 `TMPTHMH`（温度阈值最大迟滞）字段的限制
+- 复合温度（Composite Temperature）的过温阈值是强制必须支持的
+- 所有已实现的传感器都必须支持过温和低温两种阈值类型
 
-- [Feature Values and Scope](feature-values-and-scope.md) defines the shared Set/Get, save, UUID, scope, and reset semantics. [PDF pp. 181-183, 392-395](../_source/pages/page-181.md)
-- [Command Ordering and Arbitration](command-ordering-and-arbitration.md), [Power State Descriptors](power-state-descriptors.md), and [Error and Health Logs](error-and-health-logs.md) define the mechanisms controlled or observed by these Features. [PDF pp. 396-398](../_source/pages/page-396.md)
+> **参考规范**：[PDF pp. 397-398](../_source/pages/page-397.md)
 
-## Autonomous and non-operational power policy
+---
 
-Autonomous Power State Transition (`0Ch`) uses a physically contiguous 256-byte table with one 64-bit entry for each possible power state. A non-zero idle timer selects a non-operational destination after continuous idleness; zero disables autonomous transition for that source state. Unsupported-state entries are zero. [PDF pp. 400-401](../_source/pages/page-400.md)
+### 4. 易失性写缓存特性（Volatile Write Cache，Feature ID: 06h）
 
-| `APSTE` | `NOPPME` | Entry path | Background work in non-operational state |
-|---|---|---|---|
-| 1 | 1 | host or idle timer | allowed to exceed state power up to last operational-state limit |
-| 0 | 1 | host only | allowed |
-| 1 | 0 | host or idle timer | not allowed |
-| 0 | 0 | host only | not allowed |
+易失性写缓存特性控制写入数据的持久化策略。
 
-The permissive mode may trade strict power compliance for background maintenance. Without it, thermal mechanisms may be unavailable and resume performance may remain degraded until deferred work finishes. [PDF pp. 401, 404-405](../_source/pages/page-401.md)
+**配置参数**：
+- **WCE（Write Cache Enable）**：写缓存使能标志
 
-## Timestamp and thermal management
+**行为规则**：
+- **缓存使能**：写入数据可能暂存在易失性缓存中，掉电时可能丢失
+- **缓存禁用**：写入到命名空间（Namespace）的数据必须立即持久化到非易失性介质
 
-Timestamp (`0Eh`) is a 48-bit millisecond counter. Its origin reports reset initialization versus host initialization, while `SYNC=1` warns that vendor-specific intervals were not counted. Saved timestamps may appear to move backward after reset and are unsuitable for security. [PDF pp. 402-403](../_source/pages/page-402.md)
+**重要说明**：
+- 如果控制器的写缓存本身是非易失性的（掉电后数据仍保持），则不属于此特性的管理范畴
+- 如果控制器没有易失性写缓存，Set Features 和 Get Features 命令都会返回 `Invalid Field in Command` 错误
 
-Host Controlled Thermal Management (`10h`) defines a lower-impact threshold `TMT1` and heavier-action threshold `TMT2`; each may be disabled with zero, both must lie in the Identify-reported range, and when both are non-zero `TMT1 < TMT2`. [PDF pp. 403-404](../_source/pages/page-403.md)
+> **参考规范**：[PDF p. 398](../_source/pages/page-398.md)
 
-Read Recovery Level Config (`12h`) changes recovery policy without changing namespace data. Its scope is one NVM Set when NVM Sets exist, otherwise the whole subsystem and its NVM Set selector is ignored. [PDF p. 405](../_source/pages/page-405.md)
+---
 
-## Edge cases
+## 高级电源管理
 
-Software Progress Marker (`80h`) is a persistent saturating pre-boot load count: pre-boot software increments it after successful initialization unless already 255, and the OS clears it after successful OS initialization. [PDF p. 422](../_source/pages/page-422.md)
+### 自主功耗状态转换（APST，Feature ID: 0Ch）
 
-Spinup Control (`1Ah`) persistently selects host-controlled initial spinup for rotational-media Endurance Groups and is invalid when the subsystem contains none. Power Loss Signaling Config (`1Bh`) selects disabled, Emergency Power Fail, or Forced Quiescence mode within Identify-advertised support; it cannot be changed during Forced Quiescence processing. [PDF pp. 411-412](../_source/pages/page-411.md)
+自主功耗状态转换（Autonomous Power State Transition，APST）允许控制器在空闲时自动进入低功耗状态，无需主机干预。
 
-- In a multi-controller Domain, conflicting requested power states produce an unspecified Domain power state. [PDF pp. 394-395](../_source/pages/page-394.md)
-- A cache guaranteed to persist through power loss is non-volatile and therefore outside the Volatile Write Cache Feature. If no volatile cache exists, both Set and Get fail with `Invalid Field in Command`. [PDF p. 398](../_source/pages/page-398.md)
+**配置机制**：
+- 使用一个 256 字节的物理连续内存表
+- 每个可能的功耗状态对应一个 64 位表项
+- 每个表项配置一个空闲超时定时器和目标非操作性功耗状态
 
-## Evidence
+**工作原理**：
+- **非零空闲定时器**：控制器在持续空闲超过该时间后自动进入目标非操作性功耗状态
+- **零空闲定时器**：禁用从该源状态的自主转换
+- **不支持的功耗状态**：对应的表项必须为零
 
-- [Common Feature update boundary and changeability, PDF p. 395](../_source/pages/page-395.md)
-- [Arbitration and Power Management fields, PDF p. 396](../_source/pages/page-396.md)
-- [Temperature thresholds and hysteresis transitions, PDF p. 397](../_source/pages/page-397.md)
-- [Threshold selectors and Volatile Write Cache contract, PDF p. 398](../_source/pages/page-398.md)
-- [AER configuration boundary and APST table/interactions, PDF pp. 399-401](../_source/pages/page-399.md)
-- [Timestamp origin/continuity and Keep Alive boundary, PDF pp. 402-403](../_source/pages/page-402.md)
-- [Host thermal, non-operational power, and read recovery policy, PDF pp. 404-405](../_source/pages/page-404.md)
+> **参考规范**：[PDF pp. 400-401](../_source/pages/page-400.md)
+
+---
+
+### APST 与非操作性功耗状态的交互模式
+
+下表说明了不同配置组合下的功耗管理行为：
+
+| APSTE | NOPPME | 进入非操作性状态的方式 | 后台工作的功耗限制 |
+|:-----:|:------:|---------------------|------------------|
+| 1 | 1 | 主机请求 或 空闲超时 | 允许超出当前状态功耗上限，但不超过最近操作性状态的限制 |
+| 0 | 1 | 仅主机请求 | 允许后台工作 |
+| 1 | 0 | 主机请求 或 空闲超时 | 不允许后台工作超出功耗限制 |
+| 0 | 0 | 仅主机请求 | 不允许后台工作超出功耗限制 |
+
+**参数说明**：
+- **APSTE**：APST 使能位（APST Enable）
+- **NOPPME**：非操作性功耗状态最大功耗使能（Non-Operational Power State Max Power Enable）
+
+**宽松模式（APSTE=1, NOPPME=1）的权衡**：
+- 允许后台维护工作短暂超出当前功耗状态的限制
+- 可以牺牲严格的功耗合规性来执行后台任务（如垃圾回收、磨损均衡）
+- 如果不允许这种灵活性，热管理机制可能无法正常工作，性能恢复可能延迟
+
+**严格模式（APSTE=0, NOPPME=0）的影响**：
+- 不允许任何后台工作超出功耗限制
+- 热管理机制可能受限或不可用
+- 延迟的后台工作可能导致性能持续下降，直到工作完成
+
+> **参考规范**：[PDF pp. 401, 404-405](../_source/pages/page-401.md)
+
+---
+
+## 时间与热管理特性
+
+### 时间戳特性（Timestamp，Feature ID: 0Eh）
+
+时间戳特性提供一个 48 位的毫秒级计数器，用于控制器和主机之间的时间同步。
+
+**计数器特性**：
+- **宽度**：48 位
+- **精度**：毫秒（milliseconds）
+
+**初始化与同步**：
+- **Origin 字段**：报告计数器是基于复位初始化还是主机初始化
+- **SYNC=1 标志**：警告存在厂商特定的时间间隔未被计入（例如深度休眠期间）
+
+**使用限制**：
+- 控制器复位后，保存的时间戳可能显示时间倒退
+- **不适合用于安全相关目的**，如时间戳验证、防重放攻击等
+
+> **参考规范**：[PDF pp. 402-403](../_source/pages/page-402.md)
+
+---
+
+### 主机控制热管理（HCTM，Feature ID: 10h）
+
+主机控制热管理（Host Controlled Thermal Management，HCTM）允许主机配置两级温度阈值，引导控制器采取不同程度的降温措施。
+
+**配置参数**：
+
+| 参数 | 说明 | 配置规则 |
+|------|------|---------|
+| **TMT1** | 轻度热管理阈值 | • 必须在 Identify 报告的温度范围内<br>• 设为 0 可禁用此阈值 |
+| **TMT2** | 重度热管理阈值 | • 必须在 Identify 报告的温度范围内<br>• 设为 0 可禁用此阈值<br>• 当两个阈值都非零时，必须满足 TMT1 < TMT2 |
+
+**温度响应机制**：
+
+控制器根据复合温度（Composite Temperature）与阈值的关系采取相应的降温措施。复合温度是综合多个传感器读数计算得出的综合温度值。
+
+**工作细节**：
+- **TMT1**：请求控制器采取对性能影响最小的降温措施
+- **TMT2**：强制控制器采取有效的降温措施，无论对性能的影响如何
+- **恢复策略**：从任一阈值区域恢复都需要温度降到 TMT1 以下，但具体的迟滞量由厂商实现决定
+
+**重要提示**：
+- HCTM 观察的是复合温度，相同的阈值配置在不同设备和平台组合下可能产生不同的行为
+- 建议在目标平台上进行验证测试
+
+> **参考规范**：[PDF pp. 403-404](../_source/pages/page-403.md)
+
+---
+
+### 读取恢复等级配置（Read Recovery Level Config，Feature ID: 12h）
+
+读取恢复等级配置允许主机在不改变命名空间数据的前提下，调整读取操作的错误恢复策略。
+
+**作用域规则**：
+- **支持 NVM Set 时**：作用于单个 NVM Set
+- **不支持 NVM Set 时**：作用于整个子系统（Subsystem），NVM Set 选择器参数被忽略
+
+**继承关系**：
+- 命名空间继承其所属 NVM Set 的恢复等级设置
+- 不支持 NVM Set 时，所有命名空间共享同一个子系统级别的恢复等级
+
+> **参考规范**：[PDF p. 405](../_source/pages/page-405.md)
+
+---
+
+## 边界情况与特殊场景
+
+### 软件进度标记（Software Progress Marker，Feature ID: 80h）
+
+软件进度标记是一个持久化的饱和计数器，用于追踪预启动（Pre-Boot）环境的加载次数。
+
+**工作机制**：
+- **预启动软件**：在成功初始化后递增计数器（除非已达到最大值 255）
+- **操作系统**：在成功初始化后将计数器清零
+
+**用途**：
+- 用于诊断启动问题
+- 检测反复启动失败的情况（计数器持续增长）
+
+**特性**：
+- 持久化存储，跨电源循环保持
+- 饱和计数，达到 255 后不再增长
+
+> **参考规范**：[PDF p. 422](../_source/pages/page-422.md)
+
+---
+
+### 启动控制（Spinup Control，Feature ID: 1Ah）
+
+启动控制特性用于配置包含旋转介质（如机械硬盘）的耐久性组（Endurance Group）的启动行为。
+
+**配置选项**：
+- **主机控制启动**：由主机决定何时启动旋转介质
+- **自动启动**：控制器自动启动旋转介质
+
+**适用条件**：
+- 仅适用于包含旋转介质的耐久性组
+- 如果子系统不包含此类耐久性组，设置此特性会返回错误（Invalid）
+
+**持久性**：
+- 配置持久化保存，跨电源循环有效
+
+> **参考规范**：[PDF p. 411](../_source/pages/page-411.md)
+
+---
+
+### 掉电信号配置（Power Loss Signaling Config，Feature ID: 1Bh）
+
+掉电信号配置特性控制控制器如何响应电源故障信号。
+
+**配置模式**：
+- **Disabled（禁用）**：不响应掉电信号
+- **Emergency Power Fail（紧急掉电）**：快速保存关键数据
+- **Forced Quiescence（强制静默）**：有序关闭所有操作
+
+**约束条件**：
+- 必须在 Identify Controller 数据结构报告的支持范围内选择模式
+- **在 Forced Quiescence 处理过程中不可更改此配置**
+
+> **参考规范**：[PDF p. 412](../_source/pages/page-412.md)
+
+---
+
+### 多控制器域的功耗状态冲突
+
+在支持多控制器的 NVM 子系统中，不同控制器可能请求不同的功耗状态。
+
+**行为说明**：
+- 当多个控制器请求相互冲突的功耗状态时，最终的域功耗状态（Domain Power State）是**未指定的**
+- 实现可能选择最高功耗状态、最低功耗状态或其他策略
+- 建议主机软件协调多个控制器的功耗请求
+
+> **参考规范**：[PDF pp. 394-395](../_source/pages/page-394.md)
+
+---
+
+### 易失性写缓存的特殊情况
+
+**非易失性缓存不适用**：
+- 如果控制器的写缓存本身是非易失性的（掉电后数据仍然保持），则不属于易失性写缓存特性的管理范围
+- 这种缓存始终提供数据持久性保证，无需通过此特性配置
+
+**无易失性缓存的情况**：
+- 如果控制器没有易失性写缓存，Set Features 和 Get Features 命令都会返回 `Invalid Field in Command` 错误
+- 主机不应假设所有控制器都支持此特性
+
+> **参考规范**：[PDF p. 398](../_source/pages/page-398.md)
+
+---
+
+## 相关概念链接
+
+以下概念文档与控制器通用特性密切相关，建议一并阅读以获得完整理解：
+
+- **[Feature Values and Scope](feature-values-and-scope.md)**  
+  定义所有特性共享的 Set/Get 语义、保存机制、UUID、作用域和复位行为  
+  [PDF pp. 181-183, 392-395](../_source/pages/page-181.md)
+
+- **[Command Ordering and Arbitration](command-ordering-and-arbitration.md)**  
+  详细说明仲裁特性控制的命令调度机制  
+  [PDF pp. 396-398](../_source/pages/page-396.md)
+
+- **[Power State Descriptors](power-state-descriptors.md)**  
+  定义功耗状态的描述符格式和能力报告  
+  [PDF pp. 396-398](../_source/pages/page-396.md)
+
+- **[Error and Health Logs](error-and-health-logs.md)**  
+  定义温度和电压阈值特性观察和报告的 SMART 健康信息  
+  [PDF pp. 396-398](../_source/pages/page-396.md)
+
+---
+
+## 规范引用索引
+
+本文档内容基于 NVMe Base Specification 的以下页面，所有陈述均有规范依据：
+
+### 核心定义
+- [通用特性更新边界与可变性，PDF p. 395](../_source/pages/page-395.md)
+- [仲裁与电源管理字段定义，PDF p. 396](../_source/pages/page-396.md)
+- [温度阈值与迟滞转换机制，PDF p. 397](../_source/pages/page-397.md)
+- [阈值选择器与易失性写缓存契约，PDF p. 398](../_source/pages/page-398.md)
+
+### 高级电源管理
+- [异步事件通知配置与 APST 表/交互，PDF pp. 399-401](../_source/pages/page-399.md)
+- [时间戳 origin/连续性与 Keep Alive 边界，PDF pp. 402-403](../_source/pages/page-402.md)
+- [主机热管理、非操作性功耗与读取恢复策略，PDF pp. 404-405](../_source/pages/page-404.md)

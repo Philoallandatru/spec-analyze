@@ -1,64 +1,193 @@
-# Controller Virtualization Resources
+# 控制器虚拟化资源（Controller Virtualization Resources）
 
-Controller virtualization resources are the flexible and private Virtual Queue (`VQ`) and Virtual Interrupt (`VI`) capacity managed by a primary controller for itself and its associated secondary controllers. [PDF pp. 366-368](../_source/pages/page-366.md)
+控制器虚拟化资源是一种由主控制器（Primary Controller）统一管理的资源分配机制，用于为自身及其关联的从控制器（Secondary Controller）提供灵活可调的虚拟队列（Virtual Queue, VQ）和虚拟中断（Virtual Interrupt, VI）容量。[PDF pp. 366-368](../_source/pages/page-366.md)
 
-## Mental model
+## 核心概念
+
+虚拟化资源管理遵循"资源池 + 分配机制"的设计模式，主控制器作为资源的所有者和分配者，可以动态地将资源分配给从控制器使用。
+
+### 资源分类
+
+资源按照所有权和使用方式分为两大类：
+
+- **私有资源（Private Resources）**：专属于主控制器，不参与灵活分配，始终保留给主控制器使用
+- **灵活资源（Flexible Resources）**：可以在主控制器、从控制器和未分配池之间动态移动和重新分配
+
+### 资源池结构
 
 ```text
-Primary controller resource pool
-|-- VQ flexible total ----+-- assigned to secondary controllers
-|                         `-- allocated to primary
-|-- VQ private total -------- primary only
-|-- VI flexible total ----+-- assigned to secondary controllers
-|                         `-- allocated to primary
-`-- VI private total -------- primary only
+主控制器资源池
+├── VQ 灵活资源总量
+│   ├── 已分配给从控制器
+│   ├── 已分配给主控制器自身
+│   └── 未分配池
+├── VQ 私有资源总量（仅主控制器使用）
+├── VI 灵活资源总量
+│   ├── 已分配给从控制器
+│   ├── 已分配给主控制器自身
+│   └── 未分配池
+└── VI 私有资源总量（仅主控制器使用）
 ```
 
-This explanatory allocation view preserves the separate VQ/VI pools and flexible/private ownership classes; exact byte positions remain in Figure 330. [PDF pp. 366-367](../_source/pages/page-366.md)
+这个结构清晰地展示了 VQ/VI 资源池以及灵活/私有两种所有权类别的划分关系。详细的字段布局参见规范图 330。[PDF pp. 366-367](../_source/pages/page-366.md)
 
-## Contract and invariants
+## 资源类型说明
 
-| View | Meaning |
+### 虚拟队列资源（VQ Resources）
+
+每个 VQ 资源代表一个提交队列（SQ）和完成队列（CQ）的配对组合。
+
+- **资源标识符**：VQ 资源 ID 等同于队列 ID（Queue ID）
+- **资源单位**：一个 SQ/CQ 对为一个资源单位
+
+### 虚拟中断资源（VI Resources）
+
+每个 VI 资源代表一个中断向量（如 MSI-X 向量）。
+
+- **资源标识符**：VI 资源 ID 等同于中断向量编号（Interrupt Vector Number）
+- **资源单位**：一个中断向量为一个资源单位
+- **版本限制**：NVMe 2.1 修订版中，MSI-X 是唯一支持的 VI 资源类型
+
+需要注意的是，VQ 和 VI 的支持是相互独立的。如果某个资源类型不受支持，则该类型的所有资源都被视为私有资源。[PDF pp. 624-625](../_source/pages/page-624.md)
+
+## 资源分配规则
+
+### 基本约束
+
+| 约束项 | 说明 |
 |---|---|
-| Resource support | If the primary supports VQ or VI resources, every associated secondary controller supports that resource type. |
-| Flexible total / assigned | Pool capacity across the primary and its secondaries, and the portion assigned to secondaries. |
-| Allocated to primary / private total | Flexible allocation currently retained by the primary, plus primary-only capacity. |
-| Secondary maximum / preferred granularity | Per-secondary ceiling and allocation unit that minimizes wasted implementation resources. |
+| **资源支持继承** | 如果主控制器支持 VQ 或 VI 资源，则其所有关联的从控制器都必须支持相同的资源类型 |
+| **灵活资源总量与分配** | 灵活资源池容量在主控制器及其从控制器之间共享，可查询已分配给从控制器的部分 |
+| **主控制器资源组成** | 主控制器当前保留的灵活资源分配 + 主控制器专用的私有资源总量 |
+| **从控制器上限与粒度** | 每个从控制器都有资源数量上限，以及能够最小化实现资源浪费的首选分配粒度 |
 
-The flexible allocation to the primary may change after an applicable Controller Level Reset when Virtualization Management programmed a new value; its default is implementation-specific. [PDF p. 367](../_source/pages/page-367.md)
+主控制器的灵活资源分配可以在适用的控制器级复位（Controller Level Reset）之后改变（当虚拟化管理命令设置了新值时）。灵活资源的默认分配值由具体实现决定。[PDF p. 367](../_source/pages/page-367.md)
 
-## Secondary Controller directory
+## 从控制器列表
 
-`CNS=15h` returns up to 127 secondary controllers associated with the primary processing Identify, beginning with controller identifiers greater than or equal to `CNTID`. Offline controllers remain present, including SR-IOV VFs disabled by configuration. [PDF pp. 367-368](../_source/pages/page-367.md)
+使用 `CNS=15h` 的 Identify 命令可以获取从控制器列表，该命令返回与发起请求的主控制器关联的最多 127 个从控制器信息。
 
-Each entry binds the secondary and primary Controller IDs to online/offline state, optional SR-IOV VF number, and current flexible VQ/VI assignments. A non-VF secondary reports VF number zero. [PDF p. 368](../_source/pages/page-368.md)
+### 查询参数
 
-## Virtualization Management lifecycle
+- **起始位置**：从大于或等于 `CNTID`（Controller Identifier）的控制器 ID 开始返回
+- **包含范围**：包括处于离线状态的从控制器，以及被配置禁用的 SR-IOV VF（Virtual Function）
+
+### 列表条目内容
+
+每个从控制器条目包含以下关键信息：
+
+- 从控制器的控制器 ID（Controller ID）
+- 关联的主控制器 ID
+- 当前状态（在线/离线）
+- SR-IOV VF 编号（如果适用）
+- 当前分配的灵活 VQ 资源数量
+- 当前分配的灵活 VI 资源数量
+
+**特殊说明**：非 SR-IOV VF 类型的从控制器会将 VF 编号字段报告为 0。
+
+[PDF pp. 367-368](../_source/pages/page-367.md)
+
+## 虚拟化管理生命周期
+
+### 状态转换
 
 ```text
-[secondary online] -- Offline --> [secondary offline, flexible VQ/VI removed]
-                                          |
-                                          +-- Assign VQ/VI resources
-                                          `-- Online (only when configured and primary enabled)
+┌─────────────────┐
+│ 从控制器在线状态 │
+└────────┬────────┘
+         │
+         │ Offline 操作
+         ▼
+┌─────────────────────────────────┐
+│ 从控制器离线状态                  │
+│ （所有灵活 VQ/VI 资源已移除）     │
+└────────┬────────────────────────┘
+         │
+         ├─► 分配 VQ 资源
+         ├─► 分配 VI 资源
+         │
+         │ Online 操作
+         │ （需要满足：配置完成 + 主控制器已使能）
+         ▼
+┌─────────────────┐
+│ 从控制器在线状态 │
+└─────────────────┘
 ```
 
-This explanatory state machine preserves the offline-before-assignment rule and the idempotent Online/Offline requests. [PDF pp. 446-447](../_source/pages/page-446.md)
+这个状态机保留了"先离线再分配"的规则，以及在线/离线操作的幂等性特征。[PDF pp. 446-447](../_source/pages/page-446.md)
 
-Only a capable primary controller issues Virtualization Management. It can persistently change its own flexible allocation for the next applicable Controller Level Reset, or take an associated secondary offline, assign VQ/VI flexible resources while offline, and bring it online. Requests for nonexistent, private, or currently unavailable resource ranges are invalid. [PDF pp. 446-447](../_source/pages/page-446.md)
+## 虚拟化管理命令
 
-The resource type distinguishes VQ from VI, while `NR` is the count to allocate or assign. Primary allocation must name the processing primary; secondary actions must name one of its associated secondaries. Assignment requires Offline state, and Online requires appropriate configuration plus an enabled primary controller. [PDF p. 447](../_source/pages/page-447.md)
+虚拟化管理（Virtualization Management）命令只能由具备相应能力的主控制器发出。
 
-For Primary Controller Flexible Allocation and Secondary Controller Assign, completion dword 0 reports the number of resources actually modified (`NRM`); it may be smaller or larger than the requested `NR`. Distinct command-specific failures separate invalid controller identity, invalid controller state, invalid requested count, and unavailable or invalid resource identifiers. [PDF pp. 447-448](../_source/pages/page-447.md)
+### 命令能力
 
-## Relationships
+该命令可以执行以下操作：
 
-- [Controller](controller.md) defines primary/secondary as one composable controller-classification axis. [PDF pp. 34-35](../_source/pages/page-034.md)
-- [Identify Command Model](identify-command-model.md) supplies the `CNS` selection envelope for the primary capability and secondary list structures. [PDF pp. 317-320](../_source/pages/page-317.md)
+1. **主控制器自身的灵活资源调整**
+   - 持久地改变主控制器的灵活资源分配
+   - 变更在下一次适用的控制器级复位后生效
 
-## Evidence
+2. **从控制器的资源管理**
+   - 将从控制器设为离线状态（Offline）
+   - 在离线期间分配/调整 VQ/VI 灵活资源
+   - 将从控制器设为在线状态（Online）
 
-- [Primary Controller Capabilities opening fields, PDF p. 366](../_source/pages/page-366.md)
-- [VQ/VI resource pools and Secondary Controller List contract, PDF p. 367](../_source/pages/page-367.md)
-- [Secondary Controller entry layout, PDF p. 368](../_source/pages/page-368.md)
-- [Virtualization Management resource gates and state actions, PDF pp. 446-447](../_source/pages/page-446.md)
-- [Virtualization Management completion result and status taxonomy, PDF pp. 447-448](../_source/pages/page-447.md)
+### 操作约束
+
+对不存在、属于私有资源或当前不可用的资源范围的请求会被拒绝。[PDF pp. 446-447](../_source/pages/page-446.md)
+
+### 命令参数
+
+| 参数 | 说明 |
+|---|---|
+| **Resource Type（资源类型）** | 指定操作的资源类型：VQ 或 VI |
+| **Controller ID（控制器 ID）** | 主控制器操作：指定发起命令的主控制器 ID<br>从控制器操作：指定目标从控制器 ID |
+| **NR（Number of Resources）** | 请求分配或重新分配的资源数量 |
+
+**状态要求**：
+- 资源分配操作要求从控制器处于离线状态
+- 在线操作要求配置完成且主控制器已使能
+
+[PDF p. 447](../_source/pages/page-447.md)
+
+### 命令完成结果
+
+对于以下两种操作：
+- 主控制器灵活资源分配调整（Primary Controller Flexible Allocation）
+- 从控制器资源分配（Secondary Controller Assign）
+
+命令完成后，完成队列条目的 Dword 0 会报告实际被修改的资源数量（NRM，Number of Resources Modified）。
+
+**重要特性**：
+- NRM 可能小于、等于或大于请求的资源数量 NR
+- 这允许实现根据实际情况进行资源分配调整
+
+### 错误码分类
+
+命令失败时，不同的状态码会区分不同的失败原因：
+
+- 非法的控制器标识符
+- 非法的控制器状态
+- 非法的请求资源数量
+- 不可用或非法的资源标识符
+
+[PDF pp. 447-448](../_source/pages/page-447.md)
+
+## 与其他概念的关系
+
+### Controller（控制器）
+控制器概念定义了主控制器（Primary）和从控制器（Secondary）作为控制器分类的一个可组合维度。详见 [Controller](controller.md)。[PDF pp. 34-35](../_source/pages/page-034.md)
+
+### Identify Command Model（Identify 命令模型）
+Identify 命令模型提供了用于主控制器能力查询和从控制器列表查询的 `CNS` 选择器封装。详见 [Identify Command Model](identify-command-model.md)。[PDF pp. 317-320](../_source/pages/page-317.md)
+
+## 规范参考
+
+本文档内容基于以下规范章节：
+
+- [主控制器能力结构的字段定义，PDF p. 366](../_source/pages/page-366.md)
+- [VQ/VI 资源池与从控制器列表的约束规则，PDF p. 367](../_source/pages/page-367.md)
+- [从控制器条目的数据布局，PDF p. 368](../_source/pages/page-368.md)
+- [虚拟化管理命令的资源门控与状态操作，PDF pp. 446-447](../_source/pages/page-446.md)
+- [虚拟化管理命令的完成结果与状态码分类，PDF pp. 447-448](../_source/pages/page-447.md)

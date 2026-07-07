@@ -1,191 +1,342 @@
-# Queue Pair
+# 队列对（Queue Pair）
 
-A queue pair consists of a Submission Queue used by the host to submit commands and an associated Completion Queue used by the controller to post completions. Admin queues handle management/control; I/O queues carry I/O command sets. [PDF pp. 41-43](../_source/pages/page-041.md)
+队列对由两部分组成：主机用于提交命令的**提交队列（Submission Queue）**和控制器用于发布完成通知的**完成队列（Completion Queue）**。管理队列处理管理和控制操作；I/O 队列承载 I/O 命令集的命令。
 
-## Mental model
+[规范 PDF 第 41-43 页](../_source/pages/page-041.md)
 
-```text
-Host                 Submission Queue       Controller       Completion Queue
- |  write command ---------->|                  |                    |
- |  notify / ring doorbell ->|----------------->|                    |
- |                           |     execute      |                    |
- |                           |                  |---- completion --->|
- |<-------------------------- interrupt or poll ---------------------|
-```
-
-For memory-based transports queues reside in memory. Queue mapping is not universally one-to-one: I/O Submission Queues may share an I/O Completion Queue, while the Admin pair is one-to-one. In NVMe over Fabrics, every I/O Submission Queue maps one-to-one to an I/O Completion Queue. [PDF pp. 41-43](../_source/pages/page-041.md)
+## 理解队列对的工作流程
 
 ```text
-Memory-based I/O                 NVMe over Fabrics I/O
-SQ A --+                         SQ A ------------ CQ A
-       +--> CQ X                 SQ B ------------ CQ B
-SQ B --+                         (no n:1 I/O mapping)
+主机                  提交队列           控制器          完成队列
+ |  写入命令 -------->|                  |                 |
+ |  敲门铃通知 ------->|----------------->|                 |
+ |                    |     执行命令      |                 |
+ |                    |                  |---- 写入完成 --->|
+ |<----------------------- 中断或轮询通知 ------------------|
 ```
 
-This explanatory comparison is reconstructed from the rendered queue-pair examples and the Fabrics differences list. [PDF pp. 41-43](../_source/pages/page-041.md)
+**关于队列映射的重要区别：**
 
-The Admin Queue is specifically the Submission Queue and Completion Queue with identifier 0. Its Submission Queue is uniquely associated with its Completion Queue. [PDF p. 28](../_source/pages/page-028.md)
+对于基于内存的传输（如 PCIe）：
+- 队列驻留在内存中
+- 多个 I/O 提交队列可以共享一个 I/O 完成队列（多对一映射）
+- 管理队列对是严格的一对一映射
 
-| Event | Memory-based model | Message-based model |
+对于 NVMe over Fabrics：
+- 每个 I/O 提交队列必须与一个 I/O 完成队列一对一映射
+- 不支持多对一的 I/O 队列映射
+
+[规范 PDF 第 41-43 页](../_source/pages/page-041.md)
+
+```text
+基于内存的 I/O 映射              NVMe over Fabrics I/O 映射
+提交队列 A --+                   提交队列 A -------- 完成队列 A
+            +--> 完成队列 X      提交队列 B -------- 完成队列 B
+提交队列 B --+                   (不支持多对一映射)
+```
+
+**管理队列的特殊性：**
+管理队列专指标识符为 0 的提交队列和完成队列。管理提交队列与其完成队列是唯一关联的。
+
+[规范 PDF 第 28 页](../_source/pages/page-028.md)
+
+## 两种传输模型的对比
+
+| 事件 | 基于内存的模型 | 基于消息的模型 |
 |---|---|---|
-| Submission | Tail Doorbell write advances past the occupied SQ slot | Host adds a command capsule to a Submission Queue |
-| Completion | Controller finishes processing, updates the CQ entry status, and posts it to the associated CQ | Same protocol-level completion condition |
+| **命令提交** | 写入尾部门铃寄存器，推进到已占用的提交队列槽位之后 | 主机向提交队列添加一个命令胶囊（capsule） |
+| **提交完成通知** | 主机可以立即修改槽位，或等待完成队列条目（通过阶段标签翻转检测） | 传输层投递胶囊并接收对应的响应胶囊；不在提交队列中写入状态翻转 |
+| **流量控制** | 通过尾部/头部门铃寄存器驱动；Fabrics 模式下不存在完成队列流量控制 | 不使用内存门铃，由传输层的胶囊投递和容量预留驱动；提交队列流量控制可通过协商禁用 |
+| **完成关联** | 完成队列条目包含提交队列标识符 + 命令标识符；阶段标签翻转表示新发布 | 相同——关联仍由提交队列ID/命令ID对承担，阶段标签不适用 |
 
-These submission definitions distinguish placement of a command from the point at which the protocol considers it submitted. [PDF p. 29](../_source/pages/page-029.md)
+[规范 PDF 第 29、32、42-43、59-60 页](../_source/pages/page-029.md)
 
-An I/O command is defined by where it is submitted: an I/O Submission Queue. An I/O Completion Queue may be associated with one or more I/O Submission Queues, preserving the many-to-one mapping shown above. [PDF p. 32](../_source/pages/page-032.md)
+## 命令处理的关键特性
 
-For memory-based queues, the SQ and CQ are fixed-slot circular buffers. The host advances the SQ Tail doorbell after adding commands and advances the CQ Head after consuming completions; a CQE Phase Tag lets the host detect newly posted entries without a register read. The controller fetches SQEs in order but may execute their commands out of order. [PDF pp. 42-43](../_source/pages/page-042.md)
+**执行顺序的灵活性：**
+- 除了融合操作（fused operations）外，控制器可以按任意顺序处理同一提交队列或跨提交队列的命令
+- 介质提交也无需遵循命令提交顺序
+- 队列优先级属于提交队列，而非单个命令
 
-NVMe over Fabrics does not support CQ flow control, so the host must reserve completion capacity before submission. SQ flow control may be disabled by agreement, in which case the host must also ensure SQ capacity. [PDF p. 43](../_source/pages/page-043.md)
+**完成通知的无序性：**
+- 完成通知也是无序的
+- 通过完成队列条目中的提交队列标识符和命令标识符进行关联
 
-Except for fused operations, a controller may process commands within or across Submission Queues in any order, and media commitment need not follow submission order. Queue priority belongs to the Submission Queue, not to an individual command. Completions are also unordered; the CQE's Submission Queue Identifier and Command Identifier provide correlation. [PDF pp. 59-60](../_source/pages/page-059.md)
+[规范 PDF 第 59-60 页](../_source/pages/page-059.md)
 
-The host creates both members of every I/O queue pair before use. Completion notification is transport-specific, while the protocol-level correlation remains the SQID/CID pair. [PDF p. 60](../_source/pages/page-060.md)
+## 基于内存的队列生命周期
 
-## Memory-based queue lifecycle and flow control
+### 队列数量协商
 
-Before creating any I/O queue, the host uses Number of Queues (`07h`) to request separate SQ and CQ counts. Counts are zero-based, the controller may allocate fewer or more than requested, and the allocation remains fixed until reset. Issuing Set after any I/O SQ or CQ exists is a Command Sequence Error. [PDF pp. 427-428](../_source/pages/page-427.md)
+在创建任何 I/O 队列之前，主机必须使用"队列数量"特性（Feature ID `07h`）来请求独立的提交队列和完成队列数量。
 
-Interrupt Coalescing (`08h`) applies only to I/O queues and recommends signaling when either a 100-microsecond time bound or completion-count threshold is met. Zero in either field effectively permits immediate interrupts. Interrupt Vector Configuration (`09h`) disables coalescing per already-associated I/O interrupt vector; Admin CQ interrupts are never coalesced. [PDF pp. 428-429](../_source/pages/page-428.md)
+**协商规则：**
+- 计数值是从零开始的（0 表示 1 个队列）
+- 控制器可以分配少于或多于请求的数量
+- 分配结果在重置之前保持固定
+- 在任何 I/O 队列已存在后调用设置操作会导致"命令序列错误"
+
+[规范 PDF 第 427-428 页](../_source/pages/page-427.md)
+
+### 中断合并配置
+
+**中断合并特性（Feature ID `08h`）：**
+- 仅适用于 I/O 队列
+- 建议在达到 100 微秒时间限制或完成计数阈值时触发信号
+- 任一字段为零都相当于允许立即中断
+
+**中断向量配置（Feature ID `09h`）：**
+- 可在已关联的 I/O 中断向量上禁用合并
+- 管理完成队列的中断从不进行合并
+
+[规范 PDF 第 428-429 页](../_source/pages/page-428.md)
+
+### 队列创建和删除顺序
 
 ```text
-configure Admin queues -> negotiate queue count -> create CQ -> create associated SQ(s)
-        use circular Head/Tail pointers and doorbells       |
-delete CQ <- delete every associated SQ <-------------------'
+配置管理队列 → 协商队列数量 → 创建完成队列 → 创建关联的提交队列
+               使用循环的头/尾指针与门铃寄存器      |
+删除完成队列 ← 删除每条关联的提交队列 ←-----------'
 ```
 
-Completion Queues must exist before their associated Submission Queues and must outlive them. The host uses SQ Tail and CQ Head doorbells; the controller reports consumed SQ slots through `SQHD`, while a changed Phase Tag marks a newly posted CQE. A full CQ blocks further posts to that CQ and may stall its associated SQs, but other SQs must continue. [PDF pp. 107-108](../_source/pages/page-107.md)
+**关键约束：**
+- 完成队列必须先于其关联的提交队列创建
+- 完成队列必须比提交队列存活更长
+- 主机使用提交队列尾部和完成队列头部门铃寄存器
+- 控制器通过 `SQHD` 报告已消费的提交队列槽位
+- 变化的阶段标签（Phase Tag）标识新发布的完成队列条目
 
-| Circular-buffer condition | Pointer relation | Consequence |
+[规范 PDF 第 107-108 页](../_source/pages/page-107.md)
+
+### 循环缓冲区的状态判断
+
+| 循环缓冲区状态 | 指针关系 | 结果 |
 |---|---|---|
-| Empty | Head equals Tail | consumer has no entry |
-| Full | Head equals Tail plus one, with wrap | one slot remains unused; producer must stop |
+| **空** | 头指针等于尾指针 | 消费者没有条目可处理 |
+| **满**（单槽未使用） | 尾指针 + 1（取模）等于头指针 | 无可用槽位；生产者必须等待消费者推进头指针 |
+| **部分满** | 头指针与尾指针不相等且不符合空/满条件 | 既可入队也可出队，数量 = (尾 - 头) mod 大小 |
+| **环绕翻转** | 尾指针递增跨越队列大小时绕回 0；阶段标签在每次环绕时翻转 | 阶段标签帮助主机区分新旧条目，支持无需读取寄存器即可检测新条目 |
 
-The one-unused-slot rule distinguishes Full from Empty without another state bit. These conditions were checked against rendered Figures 73-74 on PDF pages 109-110. [PDF pp. 109-110](../_source/pages/page-109.md)
+**单槽未使用规则：**
+这个规则使得系统无需额外的状态位即可区分"满"和"空"状态。
 
-Invalid doorbell values trigger an Invalid Doorbell Write Value asynchronous event when a request is outstanding; the affected queue is then deleted and recreated. Modifying an SQE after submission but before consumption, or a CQE after posting but before host consumption, is undefined. [PDF p. 108](../_source/pages/page-108.md)
+[规范 PDF 第 109-110 页](../_source/pages/page-109.md)
 
-Bulk abort uses Multiple Command Cancel or deletion/recreation of the I/O Submission Queue. If communication is lost before all completions or successful queue deletion, retry/recovery must follow the communication-loss rules to avoid interaction with outstanding commands. [PDF p. 109](../_source/pages/page-109.md)
+### 错误处理
 
-For Fabrics, each queue is a unidirectional capsule channel and the Connect command creates Submission and Completion Queues as a pair. Transport delivery replaces memory doorbells, and transport-specific low-level congestion/reliability flow control is outside the Base Specification's end-to-end contract. [PDF p. 110](../_source/pages/page-110.md)
+**非法门铃值：**
+- 触发"非法门铃写入值"异步事件
+- 受影响的队列随后被删除并重建
 
-## Message-based queue lifecycle and capacity
+**未定义行为：**
+- 在提交之后、控制器消费之前修改提交队列条目
+- 在发布之后、主机消费之前修改完成队列条目
+
+[规范 PDF 第 108 页](../_source/pages/page-108.md)
+
+## 基于消息的队列生命周期（Fabrics）
+
+### 队列创建流程
 
 ```text
-[transport connection established]
-              |
-       Connect on the queue being created
-              v
-[queue pair created] -- AUTHREQ != 0 --> [authentication only]
-              |                                  |
-              | AUTHREQ = 0                      | authentication succeeds
-              `---------------------+------------'
-                                    v
-                    Admin: Fabrics only while CC.EN=0
-                    Admin: Fabrics + Admin while RDY=1
-                    I/O: I/O commands while controller enabled
-                                    |
-                   Disconnect on that I/O SQ (last SQ command)
-                                    v
-                  [final Disconnect response] -> [queue deleted]
+[传输连接已建立]
+       |
+    发送 Connect 命令到正在创建的队列
+       v
+[队列对已创建] -- 需要认证？ --> [仅限认证命令]
+       |                              |
+       | 无需认证                      | 认证成功
+       `---------------+---------------'
+                       v
+         管理队列：CC.EN=0 时仅 Fabrics 命令
+         管理队列：RDY=1 时 Fabrics + 管理命令
+         I/O 队列：控制器启用时的 I/O 命令
+                       |
+         在该 I/O 提交队列上发送 Disconnect（最后一条命令）
+                       v
+         [最终 Disconnect 响应] → [队列已删除]
 ```
 
-This explanatory state sequence was checked against rendered PDF pages 114-117. Connect is sent exactly once over a pre-established transport connection and creates both queues only on success. A duplicate Queue ID is a Command Sequence Error. The message-based model therefore does not use `AQA`, `ASQ`, `ACQ`, or the memory-model Create/Delete I/O Queue Admin commands. [PDF pp. 114-115](../_source/pages/page-114.md)
+**Connect 命令的关键特性：**
+- 在预先建立的传输连接上仅发送一次
+- 仅在成功时创建提交队列和完成队列
+- 重复的队列 ID 会导致"命令序列错误"
+- 不使用内存模型中的 `AQA`、`ASQ`、`ACQ` 或创建/删除 I/O 队列的管理命令
 
-Individual I/O Queue deletion is isolated only when both endpoints advertise support. Otherwise, deleting an I/O Queue or losing its transport connection terminates the association. A successful Disconnect is the last command processed on that SQ and its response is the last CQE consumed for that pair; commands before it may complete or abort, but none may be processed after its completion is posted. [PDF pp. 115-117](../_source/pages/page-115.md)
+[规范 PDF 第 114-115 页](../_source/pages/page-114.md)
 
-The Connect command negotiates SQ flow control per queue pair. It is disabled only when the host sets `DISSQFC=1` and the controller returns `SQHD=FFFFh`; otherwise it remains enabled and later response capsules carry valid SQ head progress, subject to the defined update optimization. [PDF pp. 474-475](../_source/pages/page-474.md)
+### 队列删除的隔离性
 
-Connect also declares connecting entity, individual-I/O-queue-deletion support, optional I/O priority, Admin KATO, and optional I/O SQ-to-NVM-Set association. Queue ID zero creates the Admin pair; IDs 1 through 65,534 create I/O pairs, with zero-based SQ size. [PDF pp. 475-476](../_source/pages/page-475.md)
+**单独 I/O 队列删除：**
+- 仅当两端都公布支持时才是隔离的
+- 否则，删除一条 I/O 队列或丢失其传输连接会终止整个关联
 
-Disconnect is valid only on the I/O Queue it deletes; Admin submission is Invalid Queue Type. It does not itself delete the transport connection, which may be released only after all queues using it are gone. Its response is the final CQE and the controller performs no further command work on that pair; host submissions after Disconnect are undefined. [PDF pp. 478-479](../_source/pages/page-478.md)
+**Disconnect 命令的特性：**
+- 成功的 Disconnect 是该提交队列上最后被处理的命令
+- 其响应是该队列对上被消费的最后一个完成队列条目
+- 此前的命令可以完成或中止，但不能在该完成发布之后再被处理
 
-| Message-based capacity rule | Required behavior |
+[规范 PDF 第 115-117 页](../_source/pages/page-115.md)
+
+### 流量控制协商
+
+**提交队列流量控制：**
+Connect 命令为每个队列对协商提交队列流量控制。
+
+- **启用**：默认状态，后续响应胶囊携带有效的提交队列头部进度
+- **禁用**：仅当主机设置 `DISSQFC=1` 且控制器返回 `SQHD=FFFFh` 时才禁用
+
+[规范 PDF 第 474-475 页](../_source/pages/page-474.md)
+
+### 容量管理规则
+
+| 容量规则 | 必需行为 |
 |---|---|
-| SQ flow control enabled | Controller reports consumed slots via `SQHD`; full means Head is one beyond Tail, so usable capacity is size minus one |
-| SQ flow control disabled | Host keeps outstanding commands below SQ size; `SQHD` is zero/reserved after Connect |
-| CQ capacity | No CQ Head/Tail flow control; host sizes for all possible outstanding responses |
+| **提交队列流量控制启用** | 控制器通过 `SQHD` 报告已消费槽位；满意味着头部在尾部之后一位，因此可用容量为大小减一 |
+| **提交队列流量控制禁用** | 主机保持未完成命令数低于提交队列大小；连接后 `SQHD` 为零/保留 |
+| **完成队列容量** | 无完成队列头/尾流量控制；主机必须为所有可能的未完成响应预留尺寸 |
 
-With enabled SQ flow control, submitting to a full SQ is fatal: the controller stops command processing, sets `CSTS.CFS`, terminates the transport connection, and ends the association. The same fatal outcome applies when disabled flow control permits outstanding commands to reach or exceed SQ size. A too-small message-based CQ instead has undefined results when a response reaches a full CQ. [PDF pp. 117-118](../_source/pages/page-117.md)
+**致命错误条件：**
+- 提交到满的提交队列时，控制器停止命令处理，设置 `CSTS.CFS`，终止传输连接并结束关联
+- 禁用流量控制时，未完成命令数达到或超过提交队列大小也会导致同样的致命结果
+- 完成队列过小时，响应到达满的完成队列会导致未定义结果
 
-The transport may omit `SQHD` only from ordinary successful responses, never Connect or Disconnect responses. Responses without an update may arrive in any order, but transmitted `SQHD` values must progress in order and be sent periodically to prevent SQ starvation. [PDF pp. 118-119](../_source/pages/page-118.md)
+[规范 PDF 第 117-118 页](../_source/pages/page-117.md)
 
-## Queue attributes and transport guarantees
+## 队列属性与传输保证
 
-| Attribute | Contract |
+### 队列属性
+
+| 属性 | 约定 |
 |---|---|
-| Size | 16-bit 0's-based slot count; minimum two slots; one slot is unusable under Head/Tail pointer semantics |
-| I/O queue identifier | `1` through `65535`; Admin queues use identifier `0` |
-| Priority | Urgent, High, Medium, or Low only has effect with weighted round robin plus urgent priority |
-| Coordination | Admin actions may affect multiple I/O queue pairs, so host software coordinates them with I/O-owning threads |
+| **大小** | 16 位从零开始的槽位计数；最少两个槽位；在头/尾指针语义下其中一个槽位不可用 |
+| **I/O 队列标识符** | `1` 到 `65535`；管理队列使用标识符 `0` |
+| **优先级** | 紧急、高、中、低优先级仅在加权轮询加紧急优先级模式下有效 |
+| **协调** | 管理操作可能影响多个 I/O 队列对，因此主机软件需要与拥有 I/O 的线程进行协调 |
 
-I/O queues may contain at most 65,536 slots subject to `CAP.MQES`; Admin queues are capped at 4,096 slots, with the message-based Admin SQ further bounded by the Discovery Log Page Entry `ASQSZ`. `MAXCMD` describes how many commands a controller processes at once per I/O Queue and can guide CQ sizing, but is not the queue's slot count. [PDF pp. 119-120](../_source/pages/page-119.md)
+**队列大小限制：**
+- I/O 队列最多可包含 65,536 个槽位，受 `CAP.MQES` 约束
+- 管理队列上限为 4,096 个槽位
+- 基于消息的管理提交队列进一步受发现日志页条目 `ASQSZ` 限制
+- `MAXCMD` 描述控制器每条 I/O 队列一次可以处理的命令数量，可作为完成队列大小的参考，但不是队列的槽位数
+
+[规范 PDF 第 119-120 页](../_source/pages/page-119.md)
+
+### 传输层保证
 
 ```text
-ordinary capsules: transport may reorder reliably delivered capsules
-fused pair:         First -> Second, with no same-SQ capsule inserted between
-SQHD-bearing CQEs:  update 1 -> update 2 -> update 3 (delivered in order)
-transport failure:  delete affected I/O queue/connection, or end association
+普通胶囊：传输层可以重排已可靠交付的胶囊
+融合对：  第一条 → 第二条，同一提交队列中没有胶囊插入其间
+携带 SQHD 的完成条目：更新 1 → 更新 2 → 更新 3（按顺序交付）
+传输失败：删除受影响的 I/O 队列/连接，或结束关联
 ```
 
-This explanatory transport contract separates reliable delivery from ordering. A transport may report detected errors through command status and the Error Information log, but unrecoverable loss must cause queue/connection deletion or association termination. Altering a response capsule after controller submission and before host delivery is undefined. [PDF p. 119](../_source/pages/page-119.md)
+**关键点：**
+- 传输层可以通过命令状态和错误信息日志上报已检测到的错误
+- 不可恢复的丢失必须导致队列/连接删除或关联终止
+- 在控制器提交之后、主机投递之前修改响应胶囊属于未定义行为
 
-## Queue-level reset
+[规范 PDF 第 119 页](../_source/pages/page-119.md)
+
+## 队列级别重置
 
 ```text
-quiesce affected SQ(s)
+静止受影响的提交队列
         |
-memory: Delete SQ(s) -> Delete CQ -> Create CQ -> Create SQ(s)
-fabrics: Disconnect I/O pair -> Connect again with nonzero QID
+基于内存：删除提交队列 → 删除完成队列 → 创建完成队列 → 创建提交队列
+Fabrics：断开 I/O 队列对 → 用非零队列 ID 再次连接
         |
-        `-> queue attributes may change
+        └─→ 队列属性可以改变
 ```
 
-This explanatory sequence was checked against rendered PDF page 141. A queue-level reset is deletion followed by recreation, not a distinct wire operation. For a memory-based shared CQ, every associated SQ should be deleted before the CQ and recreated after it; an SQ without its corresponding CQ has undefined behavior. The host should make the affected queues idle first because deletion aborts pending commands and those aborts may or may not produce CQEs. [PDF p. 141](../_source/pages/page-141.md)
+**重要说明：**
+- 队列级别重置是删除后重建，不是单独的线上操作
+- 对于基于内存的共享完成队列，每条关联的提交队列应该在完成队列之前删除，并在完成队列之后重建
+- 主机应先让受影响队列静止，因为删除会中止待处理命令，而这些中止可能产生完成队列条目，也可能不产生
 
-## Evidence
+[规范 PDF 第 141 页](../_source/pages/page-141.md)
 
-Number of Queues (`07h`) is an initialization-only negotiation before any I/O queues exist. Requested and allocated SQ/CQ counts are zero-based and may differ because of availability or allocation units; allocation remains fixed until reset. [PDF pp. 427-428](../_source/pages/page-427.md)
+## PCIe 特定的队列创建细节
 
-Interrupt Coalescing (`08h`) applies only to I/O queues and combines a 100-microsecond time recommendation with a zero-based completion threshold; either zero effectively disables aggregation. Interrupt Vector Configuration (`09h`) may disable coalescing per vector only after that vector is associated with an I/O CQ; the Admin CQ never uses coalescing. [PDF pp. 428-429](../_source/pages/page-428.md)
+**完成队列创建（在提交队列之前）：**
+- 使用从零开始的 `QSIZE`
+- 非零队列标识符，受"队列数量"特性约束
+- 页对齐的 PRP 存储
+- PRP 列表必须保持稳定不变，直至成功删除或控制器重置
+- `CAP.CQR` 可能禁止非连续队列
+- CMB 放置增加了 `CMBLOC.CQPDS` 门控
 
-- [Command-set and queue overview, PDF p. 41](../_source/pages/page-041.md)
-- [Admin Queue definition, PDF p. 28](../_source/pages/page-028.md)
-- [Submission and completion definitions, PDF p. 29](../_source/pages/page-029.md)
-- [I/O queue and command definitions, PDF p. 32](../_source/pages/page-032.md)
-- [Circular queues, identifiers, and Phase Tag, PDF pp. 42-43](../_source/pages/page-042.md)
-- [Fabrics queue mapping and flow-control differences, PDF p. 43](../_source/pages/page-043.md)
-- [Processing, priority, completion ordering, and I/O queue creation, PDF pp. 59-60](../_source/pages/page-059.md)
-- [Memory queue setup, pointer use, posting, and flow control, PDF pp. 107-108](../_source/pages/page-107.md)
-- [Abort and circular-buffer Empty/Full conditions, PDF pp. 109-110](../_source/pages/page-109.md)
-- [Fabrics unidirectional queue model, PDF p. 110](../_source/pages/page-110.md)
-- [Fabrics queue creation, authentication state, and deletion, PDF pp. 114-117](../_source/pages/page-114.md)
-- [Fabrics SQ flow control and CQ capacity, PDF pp. 117-119](../_source/pages/page-117.md)
-- [Connect flow-control and queue attributes, PDF pp. 474-477](../_source/pages/page-474.md)
-- [Disconnect final-response barrier, PDF pp. 478-479](../_source/pages/page-478.md)
-- [Transport guarantees and queue attributes, PDF pp. 119-120](../_source/pages/page-119.md)
-- [Queue-level reset for memory- and message-based transports, PDF p. 141](../_source/pages/page-141.md)
-For PCIe, I/O Completion Queues are created before the Submission Queues that reference them. Both use zero-based `QSIZE`, non-zero queue identifiers bounded by the Number of Queues Feature, page-aligned PRP storage, and stable PRP Lists until successful deletion or controller reset. `CAP.CQR` may prohibit non-contiguous queues; CMB placement adds the `CMBLOC.CQPDS` gate. [PDF pp. 441-443](../_source/pages/page-441.md)
-
-An I/O SQ selects its CQ, arbitration priority, contiguity, and optional NVM Set association. A non-zero NVM Set association must name an advertised NVM Set when the capability is supported, and the host should keep namespaces from other NVM Sets off that SQ. [PDF p. 443](../_source/pages/page-443.md)
+**提交队列创建：**
+- 选择其完成队列
+- 仲裁优先级
+- 连续性
+- 可选的 NVM 集关联
 
 ```text
-Create CQ(qid, storage, interrupt)
+创建完成队列(队列ID, 存储, 中断)
         |
-        `-- Create SQ(qid, CQID, priority, optional NVM Set)
+        └─→ 创建提交队列(队列ID, 完成队列ID, 优先级, 可选 NVM 集)
                     |
-Delete SQ: drain/abort prior commands; completion closes CQE production
+删除提交队列：排空/中止先前的命令；完成关闭完成队列条目生产
         |
-        `-- Delete CQ only after every associated SQ is gone
+        └─→ 仅在每条关联提交队列都已消失之后才能删除完成队列
 ```
 
-This explanatory lifecycle preserves the dependency and deletion barriers of the rendered command tables. [PDF pp. 441-445](../_source/pages/page-441.md)
+**提交队列删除的行为：**
+- 成功的删除明确完成那些已收到完成队列条目的命令
+- 将所有剩余命令隐式完成为"由于提交队列删除而中止命令"
+- 在删除完成之后不能再为该提交队列发布更多完成队列条目
+- 任何提交队列仍引用完成队列时，完成队列不能被删除
+- 管理队列不能通过这些命令删除
 
-Successful SQ deletion explicitly completes commands that already received CQEs and implicitly completes all remaining commands as Command Aborted due to SQ Deletion; after the delete completion, no further CQE may be posted for that SQ. A CQ cannot be deleted while any SQ still references it. Admin queues cannot be deleted by these commands. [PDF pp. 444-445](../_source/pages/page-444.md)
+[规范 PDF 第 441-445 页](../_source/pages/page-441.md)
 
-### Shadow Doorbell and EventIdx buffers
+## 影子门铃与事件索引缓冲区
 
-Doorbell Buffer Config supplies two single-page, page-aligned host-memory mirrors for emulated controllers: the host updates Shadow Doorbell entries and the para-virtualized controller updates EventIdx entries. Entries alternate SQ tail and CQ head by queue identifier at stride `4 << CAP.DSTRD`; the page must cover identifiers through `max(NSQA, NCQA)`. [PDF pp. 445-446](../_source/pages/page-445.md)
+这是为仿真控制器提供的优化机制，使用两个单页、页对齐的主机内存镜像：
 
-This configuration is controller-scoped, supports neither metadata nor SGLs, and is lost on Controller Level Reset. Invalid buffer addresses fail the command. [PDF pp. 445-446](../_source/pages/page-445.md)
+- **影子门铃（Shadow Doorbell）**：主机更新
+- **事件索引（EventIdx）**：准虚拟化控制器更新
+
+条目按队列标识符交替出现提交队列尾部与完成队列头部，跨距为 `4 << CAP.DSTRD`；该页必须覆盖直到 `max(最大提交队列数, 最大完成队列数)` 的标识符。
+
+**配置特性：**
+- 控制器范围的配置
+- 不支持元数据或 SGL
+- 在控制器级别重置时丢失
+- 无效的缓冲区地址会导致命令失败
+
+[规范 PDF 第 445-446 页](../_source/pages/page-445.md)
+
+**使用算法：**
+启用后，主机提交命令时先写对应的影子门铃条目。令 `D` 为队列深度、`new` 为新门铃、`old` 为影子中旧值、`event` 为事件索引：
+
+| 量 | 模运算 |
+|---|---|
+| `X` | `(new - event) mod D` |
+| `Y` | `(new - old) mod D` |
+
+当 `X <= Y` 时，主机还应把控制器门铃属性更新为 `new`。所有比较必须按队列环绕解释。
+
+[规范 PDF 第 702 页](../_source/pages/page-702.md)
+
+## 规范依据
+
+- [命令集与队列概述，PDF 第 41 页](../_source/pages/page-041.md)
+- [管理队列定义，PDF 第 28 页](../_source/pages/page-028.md)
+- [提交与完成定义，PDF 第 29 页](../_source/pages/page-029.md)
+- [I/O 队列与命令定义，PDF 第 32 页](../_source/pages/page-032.md)
+- [循环队列、标识符与阶段标签，PDF 第 42-43 页](../_source/pages/page-042.md)
+- [Fabrics 队列映射与流量控制差异，PDF 第 43 页](../_source/pages/page-043.md)
+- [处理、优先级、完成顺序与 I/O 队列创建，PDF 第 59-60 页](../_source/pages/page-059.md)
+- [内存队列设置、指针使用、发布与流量控制，PDF 第 107-108 页](../_source/pages/page-107.md)
+- [中止与循环缓冲区空/满条件，PDF 第 109-110 页](../_source/pages/page-109.md)
+- [Fabrics 单向队列模型，PDF 第 110 页](../_source/pages/page-110.md)
+- [Fabrics 队列创建、认证状态与删除，PDF 第 114-117 页](../_source/pages/page-114.md)
+- [Fabrics 提交队列流量控制与完成队列容量，PDF 第 117-119 页](../_source/pages/page-117.md)
+- [Connect 流量控制与队列属性，PDF 第 474-477 页](../_source/pages/page-474.md)
+- [Disconnect 最终响应屏障，PDF 第 478-479 页](../_source/pages/page-478.md)
+- [传输保证与队列属性，PDF 第 119-120 页](../_source/pages/page-119.md)
+- [基于内存与基于消息传输的队列级别重置，PDF 第 141 页](../_source/pages/page-141.md)
+- [PCIe 队列创建与删除，PDF 第 441-445 页](../_source/pages/page-441.md)
+- [影子门铃与事件索引缓冲区，PDF 第 445-446、702 页](../_source/pages/page-445.md)

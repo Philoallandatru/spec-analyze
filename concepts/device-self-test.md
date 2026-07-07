@@ -1,78 +1,142 @@
-# Device Self-test
+# 设备自检（Device Self-test）
 
-Device Self-test is an Admin operation that starts a short, extended, Host-Initiated Refresh, or vendor-specific test, or aborts an operation already in progress. Host-Initiated Refresh is itself a device self-test operation. [PDF pp. 210-212](../_source/pages/page-210.md)
+设备自检是一个管理员命令（Admin Command），用于启动设备的诊断测试或刷新操作。它支持多种测试类型，包括快速测试、扩展测试、主机发起的刷新（Host-Initiated Refresh）以及厂商特定的测试，同时也可以用于中止正在进行的测试操作。[PDF pp. 210-212](../_source/pages/page-210.md)
 
-## Mental model
+## 核心工作流程
+
+设备自检的状态转换遵循以下逻辑：
 
 ```text
-                         start short / extended / refresh
-[no test in progress] ------------------------------------> [test in progress]
-        ^                                                           |
-        |                                                           | new start
-        | success, log unchanged                                    `--> reject
-        |                                                           |
-        `----------------------- abort command ----------------------'
+                         启动 短测试/扩展测试/刷新操作
+[无测试在运行] ----------------------------------------> [测试正在运行]
+        ^                                                      |
+        |                                                      | 尝试启动新测试
+        | 成功完成，日志保持不变                                   `--> 拒绝请求
+        `-------------------- 中止命令 -----------------------'
                                   |
-                                  `-> abort operation -> write newest result
-                                      -> clear current result -> success
+                                  `-> 执行中止操作 -> 记录最新结果
+                                      -> 清除当前状态 -> 成功返回
 ```
 
-This explanatory state machine reconstructs the non-vendor actions in rendered Figure 173. [PDF pp. 211-212](../_source/pages/page-211.md)
+上述状态机重建了规范图 173 中定义的标准行为（不包括厂商特定行为）。[PDF pp. 211-212](../_source/pages/page-211.md)
 
-## Scope and selectors
+## 测试范围与选择器
 
-| `NSID` | Included scope |
+设备自检可以针对不同的范围执行，通过 `NSID`（命名空间标识符，Namespace ID）字段来指定：
+
+| `NSID` 取值 | 测试覆盖范围 |
 |---|---|
-| `00000000h` | controller only; no namespace |
-| `00000001h`-`FFFFFFFEh` | one valid, active namespace |
-| `FFFFFFFFh` | all attached namespaces accessible when the operation starts |
+| `00000000h` | 仅测试控制器（Controller），不包含任何命名空间（Namespace） |
+| `00000001h`-`FFFFFFFEh` | 测试单个有效且活跃的命名空间 |
+| `FFFFFFFFh` | 测试所有当前已挂接且可访问的命名空间 |
 
-For Host-Initiated Refresh, the controller ignores `NSID`. The table condenses rendered Figure 170. [PDF p. 210](../_source/pages/page-210.md)
+**特殊说明**：对于主机发起的刷新操作，控制器会忽略 `NSID` 字段。上表内容精简自规范图 170。[PDF p. 210](../_source/pages/page-210.md)
 
-The `STC` action code distinguishes short (`1h`), extended (`2h`), refresh (`3h`), vendor-specific (`Eh`), and abort (`Fh`). Command Dword 15 is vendor-specific only with `STC=Eh`; otherwise it is reserved. [PDF p. 211](../_source/pages/page-211.md)
+### 测试类型代码
 
-## State and completion contract
+测试类型通过 `STC`（Self-test Code）字段指定：
 
-With no operation running, a valid short, extended, or refresh command updates the current Device Self-test Status result, starts the operation, and then completes successfully. An abort with no operation running succeeds without modifying the log. [PDF pp. 211-212](../_source/pages/page-211.md)
+| `STC` 值 | 测试类型 |
+|---|---|
+| `1h` | 短测试（Short test） |
+| `2h` | 扩展测试（Extended test） |
+| `3h` | 主机发起的刷新（Host-Initiated Refresh） |
+| `Eh` | 厂商特定测试 |
+| `Fh` | 中止当前测试 |
 
-With an operation running, a new standard start is rejected as Device Self-test in Progress. Abort performs an ordered transition: abort the operation, create the newest-result log entry, clear the current result, then complete successfully. Vendor-specific behavior remains vendor-specific. [PDF pp. 211-212](../_source/pages/page-211.md)
+**说明**：命令双字 15（Command Dword 15）仅在 `STC=Eh`（厂商特定测试）时有意义，其他情况下为保留字段。[PDF p. 211](../_source/pages/page-211.md)
 
-The in-progress scope is controller-local when `SDSO=0` and subsystem-wide when `SDSO=1`. Completion is posted after the applicable state actions. [PDF p. 212](../_source/pages/page-212.md)
+## 命令处理规则
 
-## Status and result log
+### 无测试运行时
+
+当没有测试在运行时：
+- **启动测试命令**（短测试、扩展测试或刷新）：更新设备自检状态（Device Self-test Status）、启动测试操作，然后成功返回
+- **中止命令**：直接成功返回，不修改日志
+
+### 有测试运行时
+
+当已有测试正在运行时：
+- **新的标准启动命令**：被拒绝，返回"设备自检正在进行中"（Device Self-test in Progress）错误
+- **中止命令**（`STC=Fh`）：执行有序的状态转换流程
+  1. 终止正在运行的测试操作
+  2. 创建最新结果日志条目
+  3. 清除当前测试状态
+  4. 成功返回
+- **厂商特定命令**：行为由厂商自行定义
+
+[PDF pp. 211-212](../_source/pages/page-211.md)
+
+### 测试作用域
+
+测试的可见范围取决于 `SDSO`（Self-test Device Scope Override）设置：
+- `SDSO=0`：测试状态仅在本地控制器可见
+- `SDSO=1`：测试状态在整个子系统（Subsystem）范围内可见
+
+命令在完成相应的状态操作后才会返回完成状态。[PDF p. 212](../_source/pages/page-212.md)
+
+## 状态与结果日志
+
+设备自检日志提供了当前测试状态和历史测试结果：
 
 ```text
-current operation + percent complete
+当前操作 + 完成百分比
                  |
                  v
-completion/abort -> push newest result at slot 1
-                    shift older results toward slot 20
+完成或中止 -> 将最新结果插入到槽位 1
+            旧结果依次向后移动到槽位 20
 ```
 
-The Device Self-test log exposes the current operation (`none`, `short`, or `extended` for Base-defined values), a percentage-complete field that is meaningful only while a test is active, and the twenty newest completed or aborted results in newest-first order. [PDF pp. 238-239](../_source/pages/page-238.md)
+### 日志结构
 
-When fewer than twenty results exist, unused entries use status `Fh` and clear the remaining result fields. A controller completing or aborting a test creates the new result before clearing the current-operation field, preserving the transition observed by the host. [PDF pp. 238-239](../_source/pages/page-238.md)
+设备自检日志（Device Self-test Log）包含以下信息：
 
-Each 28-byte result records the requested test code and its outcome: success, explicit abort, reset, namespace removal, Format, execution failure, failed segment, unknown abort, or sanitize. Validity bits independently qualify the optional namespace, failing LBA, Status Code Type, and Status Code fields; a first-failing segment number is meaningful only for the outcome that explicitly identifies it. [PDF pp. 240-241](../_source/pages/page-240.md)
+1. **当前操作状态**
+   - 取值：无测试（`none`）、短测试（`short`）、扩展测试（`extended`）
+   - 仅在基础规范中定义了这三种状态
 
-| Result evidence | Use |
+2. **完成百分比**
+   - 仅在测试活跃时有意义
+   - 用于监控测试进度
+
+3. **历史结果记录**
+   - 最多保存 20 条最新的已完成或已中止的测试结果
+   - 按时间倒序排列（最新的在前）
+
+### 结果记录管理
+
+- **未使用条目**：当结果少于 20 条时，未使用的条目状态标记为 `Fh`，其他字段清零
+- **原子更新**：控制器在完成或中止测试时，先创建新结果条目，再清除当前操作字段，确保主机能观察到完整的状态转换
+
+[PDF pp. 238-239](../_source/pages/page-238.md)
+
+### 结果条目详情
+
+每条结果记录占用 28 字节，包含以下信息：
+
+| 字段 | 说明 |
 |---|---|
-| Power-on hours | Timestamp-like age at completion/abort, excluding low-power-state time. |
-| Namespace + failing LBA | Locate the failure only when their validity bits are set. |
-| SCT + SC | Preserve completion-style diagnostic status only when separately marked valid. |
-| Vendor-specific | Carry implementation-defined detail without changing Base-defined validity rules. |
+| **测试类型代码** | 记录请求的测试类型（短测试、扩展测试等） |
+| **测试结果** | 成功、显式中止、复位、命名空间移除、格式化、执行失败、段失败、未知中止或清理操作 |
+| **通电时间** | 完成或中止时的设备运行时长（类似时间戳），不计入低功耗状态的时间 |
+| **命名空间 + 失败 LBA** | 仅当有效性位被设置时，用于定位失败位置 |
+| **状态码类型 + 状态码** | 仅当单独标记为有效时，保留完成式的诊断状态信息 |
+| **失败段编号** | 仅对特定结果类型有效，标识第一个失败的测试段 |
+| **厂商特定数据** | 携带实现定义的细节，但不改变基础规范定义的有效性规则 |
+
+**有效性位机制**：独立的有效性位控制各个可选字段（命名空间、失败 LBA、状态码类型和状态码）是否包含有效数据，确保主机正确解析结果。
 
 [PDF pp. 240-241](../_source/pages/page-240.md)
 
-## Relationships
+## 相关概念
 
-- Operation status and history are exposed through the Device Self-test log page. [PDF pp. 211-212](../_source/pages/page-211.md)
-- Namespace validity and controller-relative attachment affect ordinary self-tests, while Host-Initiated Refresh deliberately ignores the namespace selector. [PDF p. 210](../_source/pages/page-210.md)
+- **设备自检日志页**：暴露操作状态与历史测试结果的日志页面 [PDF pp. 211-212](../_source/pages/page-211.md)
+- **命名空间作用域**：命名空间的有效性与控制器的挂接关系影响普通自检的范围，但主机发起的刷新会刻意忽略命名空间选择器 [PDF p. 210](../_source/pages/page-210.md)
 
-## Evidence
+## 规范参考
 
-- [Rendered namespace scope and command boundary, PDF p. 210](../_source/pages/page-210.md)
-- [Rendered action codes and first half of processing matrix, PDF p. 211](../_source/pages/page-211.md)
-- [Rendered processing-matrix continuation, scope note, and completion status, PDF p. 212](../_source/pages/page-212.md)
-- [Rendered Device Self-test log header and newest-first result list, PDF pp. 238-239](../_source/pages/page-238.md)
-- [Rendered Self-test Result structure, outcomes, and validity-gated diagnostics, PDF pp. 240-241](../_source/pages/page-240.md)
+- [命名空间作用域与命令边界，PDF p. 210](../_source/pages/page-210.md)
+- [操作代码与处理矩阵（前半部分），PDF p. 211](../_source/pages/page-211.md)
+- [处理矩阵（续），作用域说明与完成状态，PDF p. 212](../_source/pages/page-212.md)
+- [设备自检日志头部与结果列表结构，PDF pp. 238-239](../_source/pages/page-238.md)
+- [自检结果结构、结果类型与有效性门控的诊断信息，PDF pp. 240-241](../_source/pages/page-240.md)

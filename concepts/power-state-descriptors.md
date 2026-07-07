@@ -1,45 +1,153 @@
-# Power State Descriptors
+# 电源状态描述符（Power State Descriptors）
 
-Identify Controller exposes up to 32 power-state descriptors. Each descriptor combines whether I/O is operational, entry/exit latency, relative read/write performance, idle/active/maximum power, and optional power-loss processing times so a host can trade power against service and recovery latency. [PDF pp. 350-353](../_source/pages/page-350.md)
+## 概述
 
-## Mental model
+电源状态描述符是 NVMe 控制器（Controller）用来向主机（Host）描述其电源管理能力的数据结构。通过 Identify Controller 命令，控制器最多可以暴露 **32 个电源状态描述符**，每个描述符详细说明了该电源状态下的各项特性，帮助主机在功耗、性能和响应延迟之间做出最优权衡。
+
+### 为什么需要电源状态描述符？
+
+现代存储设备需要在性能和功耗之间取得平衡。电源状态描述符让主机能够：
+- 根据工作负载动态调整控制器的功耗水平
+- 了解切换电源状态的时间代价
+- 预测不同电源状态下的性能表现
+- 规划断电保护策略
+
+**规范参考**: [PDF pp. 350-353](../_source/pages/page-350.md)
+
+---
+
+## 描述符包含的信息
+
+每个电源状态描述符提供了以下关键信息：
+
+| 信息类别 | 说明 |
+|---------|------|
+| **运行状态标识** | 该电源状态是否支持 I/O 操作（操作态 vs 非操作态） |
+| **转换延迟** | 进入和退出该电源状态所需的时间 |
+| **相对性能** | 读写操作的相对吞吐量和延迟表现 |
+| **功耗指标** | 空闲功耗、活动功耗和持续最大功耗 |
+| **断电时序** | （可选）强制静默和紧急断电处理的时间边界 |
+
+这些信息共同构成了主机进行电源管理决策的依据。
+
+---
+
+## 概念模型
+
+以下模型展示了主机如何使用电源状态描述符进行决策：
 
 ```text
-host chooses power state
+主机选择电源状态
        |
-       +-- operational? -> I/O may continue
-       +-- entry/exit latency
-       +-- relative read/write throughput + latency
-       +-- idle / active / sustained-maximum power
-       `-- forced-quiesce / emergency-power-fail timing
+       +-- 是否为操作态？ --> 可以继续处理 I/O
+       |
+       +-- 进入/退出延迟 --> 状态切换需要多长时间？
+       |
+       +-- 相对读/写性能 --> 吞吐量和延迟如何？
+       |
+       +-- 功耗水平 --> 空闲/活动/最大功耗分别是多少？
+       |
+       `-- 断电时序 --> 断电保护需要多少时间？
 ```
 
-This is an explanatory grouping of Figure 313 rather than a bit-layout reproduction. [PDF pp. 350-353](../_source/pages/page-350.md)
+> **说明**: 这是对规范 Figure 313 的概念性解释，便于理解各字段的作用，并非实际的位布局。
 
-## Power and performance contract
+**规范参考**: [PDF pp. 350-353](../_source/pages/page-350.md)
 
-| Descriptor group | Interpretation |
-|---|---|
-| `NOPS` | Clear means I/O commands are processed; set marks a non-operational state. |
-| Entry/exit latency | Maximum transition times in microseconds; zero means unreported. |
-| Relative performance | Lower latency numbers mean lower latency; lower throughput numbers mean higher throughput. Values are ranks within the supported-state count. |
-| Idle power | Typical 30-second power after ten seconds of strict idle, excluding commands, property access, background work, sanitize, and self-test. |
-| Active power | Largest ten-second average under the stated workload. |
-| Maximum power | Sustained maximum power guideline for host policy. |
+---
 
-Power values pair a magnitude with their own scale. Zero magnitude or “not reported” scale means the host lacks that estimate; these fields are guidance and may be supplemented by platform/form-factor requirements. [PDF pp. 351-353](../_source/pages/page-351.md)
+## 电源与性能约定
 
-## Power-loss timing
+### 核心字段说明
 
-Forced-quiescence vault time, emergency-power-fail vault time, and emergency-power-fail recovery time are reported only when the corresponding Power Loss Signaling mode is supported. Each is `value × scale`, where the scale ranges from one microsecond through one million seconds; zero value means unreported and forces its scale to zero. [PDF pp. 350-353](../_source/pages/page-350.md)
+| 描述符字段 | 含义 | 详细说明 |
+|-----------|------|----------|
+| **NOPS** | 操作态标识 | 清零 (0) = 可处理 I/O 命令<br>置位 (1) = 非操作态，不处理 I/O |
+| **进入/退出延迟** | 状态转换时间 | 以微秒为单位的最大转换时间<br>值为 0 表示未报告 |
+| **相对性能** | 性能排名指标 | **延迟值**: 数值越低，延迟越小<br>**吞吐量值**: 数值越低，吞吐量越高<br>数值范围在支持的电源状态数量内 |
+| **空闲功耗** | 空闲状态功耗 | 严格空闲 10 秒后，在接下来 30 秒内的典型功耗<br>不包括命令处理、属性访问、后台工作、Sanitize 和自检 |
+| **活动功耗** | 工作负载功耗 | 在规定工作负载下，最大 10 秒平均功耗 |
+| **最大功耗** | 持续最大功耗 | 为主机电源管理策略提供的持续最大功耗指导值 |
 
-## Relationships
+### 功耗值的编码方式
 
-- [Controller Initialization](controller-initialization.md) consumes entry/exit and recovery timing when returning a controller to service. [PDF pp. 124-134, 351-353](../_source/pages/page-124.md)
-- [Identify Command Model](identify-command-model.md) locates the descriptor array after the controller/Fabrics capability region. [PDF p. 350](../_source/pages/page-350.md)
+功耗值采用 **幅度（Magnitude）+ 比例（Scale）** 的配对方式表示：
 
-## Evidence
+```
+实际功耗 = 幅度值 × 比例系数
+```
 
-- Descriptor array and time-scale fields: [PDF pp. 350-351](../_source/pages/page-350.md)
-- Active/idle power, relative performance, transition latency, and operational flag: [PDF p. 352](../_source/pages/page-352.md)
-- Maximum power and time-scale value table: [PDF p. 353](../_source/pages/page-353.md)
+**特殊情况处理**:
+- 幅度为 0，或比例为"未报告"：表示主机无法获得该功耗估算值
+- 这些字段仅为指导性质，可能由平台或外形规格要求补充
+
+**规范参考**: [PDF pp. 351-353](../_source/pages/page-351.md)
+
+---
+
+## 断电时序（可选特性）
+
+某些电源状态描述符可能报告断电相关的时序信息，用于支持断电保护功能。
+
+### 断电时序类型
+
+| 时序类型 | 英文名称 | 说明 |
+|---------|---------|------|
+| **强制静默保存时间** | Forced-Quiescence Vault Time | 在强制静默信号后，完成数据保存所需的时间 |
+| **紧急断电保存时间** | Emergency Power-Fail Vault Time | 在紧急断电信号后，完成数据保存所需的时间 |
+| **紧急断电恢复时间** | Emergency Power-Fail Recovery Time | 从紧急断电恢复后，重新就绪所需的时间 |
+
+### 何时报告这些时序？
+
+这些时序**仅在对应的断电信号模式（Power Loss Signaling）受支持时**才会报告。
+
+### 时间值的计算方式
+
+每个时间值采用 **值 × 比例（Scale）** 的方式编码：
+
+```
+实际时间 = 时间值 × 时间比例
+```
+
+| 时间比例范围 | 说明 |
+|------------|------|
+| 最小 | 1 微秒（µs） |
+| 最大 | 1,000,000 秒（~11.6 天） |
+
+### 特殊值的含义
+
+- **值为 0**: 表示该时序未报告
+- **值为 0 时**: 时间比例也必须为 0
+
+**规范参考**: [PDF pp. 350-353](../_source/pages/page-350.md)
+
+---
+
+## 相关概念
+
+电源状态描述符与其他 NVMe 概念紧密相关：
+
+### 控制器初始化（Controller Initialization）
+
+在将控制器从非操作态或低功耗状态恢复为可用状态时，会用到：
+- 进入/退出延迟信息
+- 恢复时序信息
+
+**参考**: [Controller Initialization](controller-initialization.md) | [PDF pp. 124-134, 351-353](../_source/pages/page-124.md)
+
+### Identify 命令模型（Identify Command Model）
+
+电源状态描述符数组位于 Identify Controller 数据结构中，紧跟在控制器/Fabrics 能力区域之后。
+
+**参考**: [Identify Command Model](identify-command-model.md) | [PDF p. 350](../_source/pages/page-350.md)
+
+---
+
+## 规范证据索引
+
+本文档内容基于 NVMe 规范的以下章节：
+
+### 数据结构定义
+- 描述符数组与时间比例字段：[PDF pp. 350-351](../_source/pages/page-350.md)
+- 活动/空闲功耗、相对性能、转换延迟与操作态标志：[PDF p. 352](../_source/pages/page-352.md)
+- 最大功耗与时间比例值表：[PDF p. 353](../_source/pages/page-353.md)
