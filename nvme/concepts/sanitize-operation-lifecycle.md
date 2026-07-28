@@ -1,146 +1,125 @@
-# Sanitize 操作生命周期
+# Sanitize 操作生命周期（Sanitize Operation Lifecycle）
 
-## 概述
+## 一句话说明
 
-Sanitize（数据清除）操作用于启动或恢复一次覆盖整个子系统（Subsystem）范围的后台数据擦除。该操作支持三种擦除方式：块擦除（Block Erase）、加密擦除（Crypto Erase）或覆写（Overwrite）。此外，还可以选择性地启用介质验证（Media Verification）以及验证后的空间释放（Post-Verification Deallocation）。
+Sanitize（数据清除）命令用于**启动**或**恢复**一次覆盖整个 NVM 子系统（Subsystem）范围的后台数据擦除；它本身只是触发器，真正的擦除在后台异步进行，进度通过 Sanitize Status 日志（LID `81h`）观察。
 
-**重要限制**：在导出型 NVM 子系统（Exported NVM Subsystem）上禁止执行此操作。
+## 生活化类比
 
-[PDF pp. 387-390](../_source/pages/page-387.md)
+把 NVM 子系统想成**一座仓库**：
 
-## 核心概念模型
+- **Sanitize 命令** = 仓库经理下达"清仓"指令
+- **块擦除（Block Erase）** = 工人用钢丝球磨掉货架上的所有标签
+- **加密擦除（Crypto Erase）** = 直接换锁——把仓库门锁换了，旧的标签虽然还贴在货架上但已经打不开
+- **覆写（Overwrite）** = 在货架上用油漆反复盖掉旧标签若干遍
+- **介质验证（Media Verification）** = 经理再派一个人逐个货架检查"真的清干净了吗？"
+- **验证后空间释放（Post-Verification Deallocation）** = 检查通过后把货架也拆了
 
-为了帮助理解，我们先用简化的状态转换图来说明 Sanitize 操作的基本流程：
+> 关键：经理下达"清仓"指令后**不等清完就回办公室**——Sanitize 命令成功完成**不代表**擦除完成。
+
+## 工作流程
 
 ```text
-                         成功处理 + 启用介质验证
-[空闲] -- 开始擦除 ------------------------------> [介质验证]
-   |             |                                         |
-   |             `-- 不验证 -------------------------> [空闲]
-   |                                                       |
-   `-- 退出失败模式                                         | 退出验证
-                                                           v
-                                         [验证后空间释放]
-                                                           |
-                                                           v
-                                                        [空闲]
+                       EMVS=1 + 启用验证
+   +-------+   Sanitize 命令 +------------------+ Exit Media Verify
+   | Idle  | ----------------> | Media Verify    | ----------------+
+   | 空闲  |                   | 介质验证        |                 |
+   +-------+                   +-----------------+                 |
+       ^                                |                          v
+       |                                | 验证后释放                 |
+       |                                v                          |
+       |                       +------------------+                |
+       |                       | Post-Verify      |                |
+       +---------------------- | Dealloc 释放     |<---------------+
+        Sanitize 完成/          +------------------+
+        失败清除状态
 ```
 
-这个解释性预览重构了 Sanitize 命令显式选择的状态转换。完整的受限/非受限失败状态机保留在规范第 8.1.24 节，将在处理该源范围时集成。
+**端到端流程**：
 
-[PDF pp. 387-390](../_source/pages/page-387.md)
+1. 主机发 Sanitize 命令（`SANACT` 选择 Block Erase / Crypto Erase / Overwrite / Exit Media Verify）。
+2. 控制器在返回 CQE 前**先更新** Sanitize Status 日志；任何失败都不动日志、不动用户数据。
+3. 成功后进入对应阶段；主机通过 LID `81h` 轮询进度（`SPROG` / `SOS`）。
+4. 处理完成后回到 Idle 状态；下次 Sanitize 必须由新命令触发。
+5. Sanitize 期间**禁止**新固件激活；固件已"待激活"也会拒绝 Sanitize。
 
-## 命令与后台操作的边界
+## 初学者案例
 
-### 命令完成的含义
+**场景：服务器淘汰前的安全擦除，怎么做得"专业可信"？**
 
-**重要概念**：Sanitize 命令的成功完成并不意味着擦除操作已完成。
+1. IT 工程师确认目标 SSD **不是** Exported NVM Subsystem（导出型子系统不支持 Sanitize）。
+2. 检查是否有 `pmr0` 等 Persistent Memory Region 启用——若有，先停掉。
+3. 检查是否有命名空间处于写保护——若有，先解除。
+4. 确认没有"待固件激活"状态——若有固件未激活，需先完成激活或重置。
+5. 检查控制器是否被挂起——若有，恢复控制器。
+6. 用 `nvme sanitize /dev/nvme0n1 -a 0x02`（Crypto Erase）发起后台擦除。
+7. 命令立即返回（同步部分仅"启动"），但状态日志已变 `SOS=010b`（Sanitizing）。
+8. 工程师轮询 `nvme sanitize-log /dev/nvme0n1` 看 `SPROG` 进度。
+9. 完成时 `SOS=001b`（Sanitized），且 `GDE=1` 表示"自上次成功 Sanitize 后没写过用户数据"。
 
-**实际行为**：
-- 命令成功只是启动了后台操作
-- 在命令完成队列条目（CQE, Completion Queue Entry）返回之前，系统会更新 Sanitize Status 日志
-- 任何不成功的命令都不会启动任何操作，既不修改日志也不改动用户数据，保留先前的状态
+> 错误示范：直接对一台多域（Multi-Domain）SSD 发 Sanitize 会被拒（Asymmetric Access Inaccessible）；必须先合并域。
 
-[PDF pp. 389-390](../_source/pages/page-389.md)
+## 必须记住的规则
 
-### 命令参数与控制契约
+| 规则 | 要点 |
+|------|------|
+| 命令成功 ≠ 擦除完成 | Sanitize 命令成功只意味"已启动后台处理"；完成要看 LID `81h` 的 `SOS=001b` |
+| 失败不动状态 | 命令失败（CQE status ≠ 0）不启动任何后台操作，**不**修改 Sanitize Status 日志，**不**改用户数据 |
+| CQE 与日志顺序 | CQE 返回前，Sanitize Status 日志已被更新；读日志比看 CQE 更准 |
+| 范围 = 整个 NVM 子系统 | 不存在"只擦一个 NS"——若想"只擦一个 NS"，请用 Format NVM（带 Secure Erase 选项） |
+| 三种擦除方式 | Block Erase / Crypto Erase / Overwrite；不支持的方式在 `SANICAP` 中清零，必须 Invalid Field 失败 |
+| 介质验证可选 | 需 `EMVS=1` + `VERS=1`（`SANICAP` 报告支持） + `NDAS=0` + 擦除方式不是 Overwrite |
+| 退出验证独立动作 | `SANACT=101b`（Exit Media Verify）只在目标处于 Media Verification 状态时合法；否则 Invalid Field |
+| NDAS 行为 | `NDAS=1` 要求控制器不释放空间；若控制器禁止该行为，行为由 `Sanitize Config` 决定 |
+| 不可用于 Exported Subsystem | 导出型 NVM 子系统**不支持** Sanitize；命令直接被拒 |
+| 拒绝条件 | 下列任一条件成立即拒绝：PMR 启用 / 命名空间写保护 / 固件激活待定 / 控制器挂起 / 多域分割 / CMB 队列不合规 |
+| 固件互斥 | Sanitize 运行期间禁止新固件激活；固件激活待定也拒绝 Sanitize |
+| Overwrite 参数 | Overwrite 时可设 Pass 计数（`0`=16 次）、模式反转位、32 位数据模式 |
+| 不支持要"显式失败" | 不支持的方式/非法组合不能"静默降级"——必须 Invalid Field 失败，保证可审计 |
 
-| 操作/控制参数 | 说明 |
-|-------------|------|
-| **Block/Crypto/Overwrite**<br/>擦除类型 | 启动选定的后台数据清除处理 |
-| **EMVS**<br/>启用介质验证 | 在成功完成块擦除或加密擦除且执行正常空间释放后，进入介质验证状态 |
-| **Exit Media Verification**<br/>退出介质验证 | 不启动新的清除操作；仅在当前处于验证状态时转换到空间释放阶段 |
-| **NDAS**<br/>不释放空间 | 请求保留分配状态，除非控制器禁止该行为 |
-| **AUSE**<br/>允许非受限退出 | 选择受限（Restricted）或非受限（Unrestricted）完成模式 |
-| **Overwrite 参数** | • Pass 数量（`0` 表示 16 次）<br/>• 可选的模式反转<br/>• 32 位数据模式 |
+## 容易混淆的地方
 
-### 参数有效性约束
+| 容易混 | 实际区别 |
+|--------|----------|
+| Sanitize vs Format NVM | Sanitize = 子系统级后台擦除；Format NVM = 命名空间级格式化（可附 Secure Erase） |
+| Sanitize vs Secure Erase | "Secure Erase" 是 Format NVM 的一个选项；"Sanitize" 是独立命令+状态机 |
+| 块擦除 vs 加密擦除 vs 覆写 | 三种擦除的"清干净"机制完全不同；同一台 SSD 通常只支持其中一两种 |
+| 介质验证 vs 数据擦除 | 验证 ≠ 擦除：擦除清掉数据，验证**只检查**"是否真的清干净"；可能要花更久 |
+| NDAS=1 vs Sanitize Config | NDAS 是"这次请求不要释放空间"；Sanitize Config 是"控制器对 NDAS 请求的总策略" |
+| 受限失败 vs 非受限失败 | 失败模式下"受限"（Restricted）= 旧数据可能仍在；"非受限"（Unrestricted）= 必须完整擦除后才能退出 |
+| 错误模式 vs 警告模式 | Sanitize Config 选错误模式 → NDAS=1 直接拒；选警告模式 → 接受但记"Sanitized Unexpected Deallocate" |
+| AUSE=0 vs AUSE=1 | AUSE=0 = Restricted 完成（更严格）；AUSE=1 = Unrestricted（更快但允许中间状态退出） |
+| 控制器挂起 vs 域分割 | 挂起是控制器状态；域分割是 NVM 子系统物理/逻辑划分；两者都阻断 Sanitize 但原因不同 |
+| "范围"语义 | 子系统范围 ≠ 命名空间范围 ≠ Endurance Group 范围；Sanitize 是子系统范围 |
 
-**介质验证的限制**：
-在以下情况下，介质验证（Media Verification）无效：
-- 使用 Overwrite 擦除方式
-- 设置了 `NDAS=1`（不释放空间）
-- 控制器能力不支持验证功能
+## 进阶细节
 
-**退出介质验证的限制**：
-Exit Media Verification 命令仅在目标当前处于介质验证状态时有效。
+- **SANICAP 字段**（规范 5.1.22，Identify Controller）：编码支持的擦除类型、No-Deallocate 行为、是否禁止 NDAS=1、是否支持 Media Verification（VERS 位）。
+- **AUSE 行为**：选择 Unrestricted 完成允许控制器在未完成完整 Sanitize 处理时进入 Idle；Restricted 模式必须等 Sanitize 处理完成才能退出。AUSE 体现在 Sanitize Status 的 `SSI.SANS` 字段。
+- **EMVS 限制细节**（规范 5.1.22）：
+  - `EMVS=1` + `SANACT=011b`（Overwrite）→ Invalid Field
+  - `EMVS=1` + `NDAS=1` → Invalid Field
+  - `EMVS=1` + `SANACT ∈ {010b, 100b}` + `NDAS=0` → 成功后进入 Media Verification 状态
+- **Overwrite 模式反转**（规范 5.1.22）：Pass 计数为 `0` 时表示 16 次；模式反转在多 Pass 场景下用于"奇数次写 0xAAAAAAAA、偶数次写 0x55555555"以掩盖残影。
+- **Sanitize Config**（Feature ID `17h`，规范 5.1.25.1.15）：只在 `SANICAP` 报告"控制器禁止 NDAS=1"时才有意义；决定此时收到 NDAS=1 的请求是"拒绝"还是"接受并记 Unexpected Deallocate"。
+- **多域限制**：NVM 子系统被划分为多个 Domain 时，若控制器无法访问所有命名空间，Sanitize 命令会返回 `Asymmetric Access Inaccessible` 或 `Asymmetric Access Persistent Loss`。
+- **与 Format NVM 的边界**（规范 5.1.22）：Format NVM 是命名空间级、**通常在控制器侧同步或近同步**完成；Sanitize 是子系统级、**显式后台异步**——监控接口（LID `81h`）也是 Sanitize 独有的。
+- **与 Sanitize Status 日志的关系**：本概念定义"命令与启动条件"；Sanitize Status 日志定义"如何观察后台进度和最近结果"。
+- **失败状态机**（规范 8.1.24.3）：Restricted Failure 和 Unrestricted Failure 是 Sanitize Operation State Machine 中的失败节点；AUSE=0 进入 Restricted Failure，AUSE=1 进入 Unrestricted Failure；两者都对应 `SOS=011b`（Failed）。
+- **恢复方式**：从 Restricted Failure 恢复用 Restricted Exit Media Verify 或重新 Sanitize；从 Unrestricted Failure 恢复直接重发 Sanitize（具体步骤见 8.1.24.3）。
+- **MTFA 与激活时间**：固件激活在 `MTFA`（Max Time for Firmware Activation）内必须完成；超时会返回 Firmware Activation Requires Maximum Time Violation；此时 Sanitize 不能启动（因有"待激活"条件）。
 
-[PDF pp. 388-390](../_source/pages/page-388.md)
+## 规范依据
 
-## 启动条件与序列化
+- [Sanitize 命令范围、操作类型、能力门控（SANICAP）与多域限制，PDF 第 387 页](../_source/pages/page-387.md)
+- [介质验证转换、序列化门控与拒绝条件细节，PDF 第 388 页](../_source/pages/page-388.md)
+- [命令启动原子性、字段、Overwrite 参数与 CQE/日志顺序，PDF 第 389 页](../_source/pages/page-389.md)
+- [操作值、SANICAP 字段、Sanitize Config 与多域、固件互斥，PDF 第 390 页](../_source/pages/page-390.md)
+- [Sanitize Config Feature（Feature `17h`）的错误/警告模式，PDF 第 409 页](../_source/pages/page-409.md)
 
-### 命令拒绝条件
+## 相关阅读
 
-在以下情况下，Sanitize 命令会被拒绝：
-
-| 条件 | 说明 |
-|-----|------|
-| **PMR 已启用** | 持久内存区域（Persistent Memory Region）处于启用状态 |
-| **Namespace 写保护** | 任何命名空间被设置为写保护 |
-| **固件激活待定** | 需要重置的固件激活（Firmware Activation）仍在等待执行 |
-| **控制器挂起** | 子系统中任一控制器被挂起（Suspended） |
-| **多域限制** | 被分割的多域（Multi-Domain）子系统不能启动该操作 |
-| **队列放置限制** | 使用了不支持的 CMB 队列放置方式 |
-
-**固件操作互斥**：在 Sanitize 操作期间，禁止新的固件激活操作。
-
-[PDF pp. 387-390](../_source/pages/page-387.md)
-
-### 能力与选项验证
-
-**能力控制**：`SANICAP` 字段控制：
-- 支持的擦除操作类型
-- No-Deallocate 行为选项
-- 验证支持情况
-
-**错误处理原则**：
-不支持的操作或非法的选项组合会直接以 "Invalid Field" 失败，而不是静默降级为其他擦除方法。这确保了操作的可预测性和审计要求的满足。
-
-[PDF pp. 387-388](../_source/pages/page-387.md)
-
-## 相关配置与功能
-
-### Sanitize Config 配置
-
-**配置命令**：Sanitize Config (`17h`)
-
-**功能**：选择当 No-Deallocate 行为被禁止时，控制器如何处理 `NDAS=1` 请求。
-
-| 模式 | 行为 |
-|-----|------|
-| **Error Mode**<br/>错误模式 | 拒绝命令 |
-| **Warning Mode**<br/>警告模式 | 允许处理，成功完成后记录 "Sanitized Unexpected Deallocate"<br/>（清除时意外释放空间） |
-
-**作用范围**：此配置是子系统范围的设置，仅在 No-Deallocate 被禁止时有效。
-
-[PDF p. 409](../_source/pages/page-409.md)
-
-## 相关主题
-
-### 状态监控
-
-- [Sanitize Operation Status](sanitize-operation-status.md) - 提供后台生命周期的持久进度和结果观察接口。这是监控 Sanitize 操作执行状态的主要方式。[PDF pp. 302-305](../_source/pages/page-302.md)
-
-### 序列化依赖
-
-以下特性定义了与 Sanitize 操作的独立序列化门控：
-
-- [Firmware Update Lifecycle](firmware-update-lifecycle.md) - 固件更新生命周期
-- [Controller Migration](controller-migration.md) - 控制器迁移
-- [Controller Memory Windows](controller-memory-windows.md) - 控制器内存窗口
-
-[PDF pp. 388-390](../_source/pages/page-388.md)
-
-### 对比：Format NVM
-
-- [Format NVM Lifecycle](format-nvm-lifecycle.md) - 定义命名空间级别的格式化安全擦除。**重要区别**：Format NVM 是针对单个命名空间的操作，而 Sanitize 是覆盖整个子系统范围的清除操作，两者是不同的概念。[PDF pp. 218-220](../_source/pages/page-218.md)
-
-## 规范引用
-
-以下是本文档引用的 NVMe 规范页面清单：
-
-### 命令与基本流程
-- [Sanitize 范围、操作类型、后台阶段与能力门控，PDF p. 387](../_source/pages/page-387.md)
-- [介质验证转换与序列化门控，PDF p. 388](../_source/pages/page-388.md)
-- [命令启动原子性与选项字段，PDF p. 389](../_source/pages/page-389.md)
-- [操作值、CQE/日志顺序与状态，PDF p. 390](../_source/pages/page-390.md)
+- [sanitize-operation-status.md](sanitize-operation-status.md) - 进度与结果的观察口
+- [log-page-retrieval.md](log-page-retrieval.md) - LID 81h 的读取接口
+- [format-nvm-lifecycle.md](format-nvm-lifecycle.md) - 同类的破坏性操作对照
+- [persistent-event-log.md](persistent-event-log.md) - 配对的开始/完成事件流

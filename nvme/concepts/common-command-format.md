@@ -1,177 +1,122 @@
 # 通用命令格式（Common Command Format）
 
-## 概述
+## 一句话说明
 
-通用命令格式是 NVMe 协议中所有命令的基础数据结构。无论是管理命令（Admin Command）还是各种 I/O 命令集（I/O Command Set）中的 I/O 命令，都共享这个 64 字节的提交队列条目（Submission Queue Entry, SQE）格式。
+NVMe 规定所有管理命令和 I/O 命令的提交队列条目（SQE）都用同一套 64 字节布局，区别只在"命令特定字段"那 24 字节，控制器靠 `CDW0` 里的操作码和传输方向决定怎么解释。
 
-这个统一的格式定义了以下关键字段的位置：
-- 命令标识信息
-- 命名空间标识符（Namespace ID）
-- 元数据指针（Metadata Pointer）
-- 数据指针（Data Pointer）
-- 命令特定字段（Command-Specific Fields）
+## 生活化类比
 
-[规范参考：PDF pp. 155-158](../_source/pages/page-155.md)
+把通用命令格式想成**统一的快递面单**：
 
-## 结构示意图
+- **64 字节固定大小** = 顺丰/中通/EMS 用同一张面单，只是"内容字段"由各家业务自填。
+- **CDW0** = 面单上的"服务类型 + 是否需要签收"标签，搬运中心一看就知道怎么走流程。
+- **NSID 字段** = "收件人 ID"，标明这个快件要送到哪个货架/房间。
+- **PRP / SGL 指针** = "取件地址"，PRP 是按页算的固定地址，SGL 是任意分散地址清单。
+- **CDW10-15** = 各家自填的备注栏：普通快递填重量，顺丰生鲜填温度，NVMe 里填 LBA、长度、命令特定标志。
 
-为了帮助理解，我们可以将 64 字节的命令格式想象成以下布局：
-
-```text
-字节偏移  0       4       8      16      24              40              64
-        +-------+-------+-------+-------+---------------+---------------+
-        | CDW0  | NSID  |CDW2/3 | MPTR  | DPTR          | CDW10..CDW15  |
-        +-------+-------+-------+-------+---------------+---------------+
-        | 操作码| 命名  |       | 元数据| PRP1+PRP2     | 命令特定字段  |
-        | 等控制| 空间ID|       | 指针  | 或 SGL1       |               |
-        +-------+-------+-------+-------+---------------+---------------+
-```
-
-**说明：**
-- 这是对规范 Figure 92 的简化表示
-- 指针的具体含义取决于 `CDW0.PSDT` 字段的值
-- CDW 表示 Command Dword（命令双字），每个双字为 4 字节
-
-[规范参考：PDF pp. 156-158](../_source/pages/page-156.md)
-
-## 命令双字 0（Command Dword 0）详解
-
-命令双字 0 包含了命令的核心控制信息，其各个位段的定义如下：
-
-| 位域 | 字段名称 | 说明 |
-|------|----------|------|
-| `31:16` | **CID**<br>（Command Identifier，命令标识符） | 与提交队列标识符共同唯一标识一条命令；应避免使用 `FFFFh`（该值在错误信息日志中有特殊含义） |
-| `15:14` | **PSDT**<br>（PRP or SGL for Data Transfer） | 数据传输方式选择器：<br>• `00b` - 使用 PRP（Physical Region Page）<br>• `01b` - 使用 SGL，`MPTR` 为缓冲区地址<br>• `10b` - 使用 SGL，`MPTR` 为单描述符段<br>• `11b` - 保留 |
-| `09:08` | **FUSE**<br>（Fused Operation） | 融合操作标识：<br>• `00b` - 普通命令<br>• `01b` - 融合操作的第一条命令<br>• `10b` - 融合操作的第二条命令<br>• `11b` - 保留 |
-| `07:02` | **OPC.FN**<br>（Opcode Function） | 命令功能码 |
-| `01:00` | **OPC.DTD**<br>（Data Transfer Direction） | 数据传输方向：<br>• 无传输<br>• 主机到控制器<br>• 控制器到主机<br>• 双向传输 |
-
-[规范参考：PDF pp. 155-156](../_source/pages/page-155.md)
-
-### 传输方式的差异
-
-**PRP vs SGL：**
-- **PRP（Physical Region Page）**：基于物理页的传输方式，主要用于 PCIe 传输
-- **SGL（Scatter Gather List）**：分散-聚集列表，更加灵活，支持非连续内存区域
-
-**传输协议约束：**
-- **NVMe over PCIe**：管理命令使用 PRP，**不得**使用 SGL
-- **NVMe over Fabrics**：管理命令和 I/O 命令使用 `PSDT=01b` 的 SGL，具体支持的值受传输层限制
-
-## 命名空间与指针约定
-
-### 命名空间标识符（NSID）的使用规则
-
-| 值 | 含义 | 使用场景 |
-|---|------|----------|
-| `0` | 未使用 | 不需要指定命名空间的命令 |
-| `1` ~ `FFFFFFFEh` | 具体的命名空间 ID | 针对特定命名空间的操作 |
-| `FFFFFFFFh` | 广播标识 | 仅在命令明确支持时使用，表示对所有相关命名空间执行操作 |
-
-**错误处理：**
-- 对非活跃（inactive）的 NSID：通常返回 `Invalid Field in Command`
-- 对无效的 NSID：返回 `Invalid Namespace or Format`
-- 对不使用 NSID 的命令，如果提供了非零 NSID：返回 `Invalid Field in Command`
-
-[规范参考：PDF p. 156](../_source/pages/page-156.md)
-
-### 指针布局根据 PSDT 的变化
-
-不同的 `PSDT` 值决定了元数据指针（`MPTR`）和数据指针（`DPTR`）的解释方式：
-
-| PSDT 值 | MPTR（字节 16:23） | DPTR（字节 24:39） |
-|---------|--------------------|--------------------|
-| `00b`<br>（PRP 模式） | 双字（dword）对齐的连续元数据缓冲区地址 | `PRP1` 加上 `PRP2`<br>（根据页边界跨越情况，`PRP2` 可能是：保留位、第二页地址或 PRP 列表指针） |
-| `01b`<br>（SGL 缓冲区地址） | 按 Identify Controller 指定对齐的连续元数据缓冲区 | 第一个 SGL 段（`SGL1`） |
-| `10b`<br>（SGL 描述符） | 四字（qword）对齐的段，仅包含一个元数据 SGL 描述符 | 第一个 SGL 段（`SGL1`） |
-
-**PRP 模式的 PRP2 使用规则：**
-- 未跨越页边界时：`PRP2` 为保留位
-- 跨越一个页边界时：`PRP2` 指向第二页
-- 跨越多个页边界时：`PRP2` 指向 PRP 列表
-
-**SGL 模式的描述符规则：**
-- 数据块描述符可以描述整个传输
-- 否则，第一个描述符链接到下一个段（Segment）或最后一个段（Last Segment）
-
-[规范参考：PDF pp. 157-158](../_source/pages/page-157.md)
-
-## 格式边界与扩展
-
-### 命令特定字段（字节 40:63）
-
-字节 40 至 63 的 24 字节空间对应命令双字 10 至双字 15（CDW10 ~ CDW15），由各个具体命令自行定义使用。
-
-### 可选的厂商特定命令格式
-
-对于可选的厂商特定（Vendor-Specific）命令，可以采用以下布局：
-- **双字 10 和 11** 用作传输长度字段
-- 保留公共指针的布局
-
-这种设计在保持标准指针结构的同时，允许厂商自定义传输语义。
-
-[规范参考：PDF pp. 156, 158-159](../_source/pages/page-156.md)
-
-### 未来扩展性
-
-需要注意的是，未来的 I/O 命令集可能会定义不同的命令大小或格式，因此当前的通用命令格式是"通用"（common）而非"普适"（universal）的——它是当前最广泛使用的格式，但不是唯一可能的格式。
-
-## Fabrics 命令的通用格式
-
-NVMe over Fabrics 使用一种不同的 64 字节布局，称为 **Fabrics Command Common SQE**：
+## 工作流程
 
 ```text
-字节偏移  0       4   5                 24              40              64
-        +-------+---+-----------------+---------------+---------------+
-        | CDW0  |TYP| 保留            | SGL1          | FCTS          |
-        +-------+---+-----------------+---------------+---------------+
-        |OPC=7Fh|FCTYPE               | 完整传输      | 类型特定字段  |
-        +-------+---+-----------------+---------------+---------------+
+  SQE 通用布局（64 字节，Figure 92）
+
+  字节偏移  0       4       8      16      24              40              64
+          +-------+-------+-------+-------+---------------+---------------+
+          | CDW0  | NSID  |CDW2/3 | MPTR  | DPTR          | CDW10..CDW15  |
+          +-------+-------+-------+-------+---------------+---------------+
+          | OPC   | 命名  |       | 元数据| PRP1+PRP2     | 命令特定字段  |
+          | FUSE  | 空间ID|       | 指针  | 或 SGL1       |               |
+          | PSDT  |       |       |       |               |               |
+          +-------+-------+-------+-------+---------------+---------------+
+
+  CDW0 关键位（Figure 91）：
+    bit 31:16  CID    命令 ID（与 SQ ID 联合唯一）
+    bit 15:14  PSDT   PRP/SGL 选择
+    bit 13:10  保留
+    bit 09:08  FUSE   融合操作位置
+    bit 07:02  OPC.FN opcode 功能码
+    bit 01:00  OPC.DTD 传输方向
 ```
 
-**字段说明：**
-- **字节 4**：`FCTYPE`（Fabrics Command Type），由 6 位功能码和 2 位传输方向组成
-- **字节 5:23**：保留
-- **字节 24:39**：包含一个传输（Transport）或键控（Keyed）SGL 描述符，用于完整的数据传输
-- **字节 40:63**：Fabrics 命令类型特定字段
+## 初学者案例
 
-**Fabrics 命令的特点：**
-- 使用操作码 `7Fh`
-- 没有融合操作形式
-- 使用 SGL 进行数据传输
-- `PSDT=10b` 显式标记一次传输
-- `PSDT=00b` 表示无传输值，但在需要传输的命令中仍接受 SGL
+**场景：写命令主机把数据放到 PRP1，但控制器回"PRP 越界"。**
 
-[规范参考：PDF pp. 159-160](../_source/pages/page-159.md)
+1. 你提交一条 NVM Write（OPC=`01h`，DTD=`10b` 主机→控制器）。
+2. PRP1 指向主机内存第一页（4KB），PRP2 写的是第二页地址。
+3. 命令长度是 8KB，跨两个 4KB 页，按规范 PRP2 应该指向**第二页**。
+4. 但你的 PRP2 实际指向第三页（越过了第二页末尾），控制器回 `Invalid Field in Command`。
+5. 检查 host 端 PRP 拆解逻辑，确保 PRP2 是"刚好跨一个页"时填第二页、跨多页时填 PRP List 指针。
+6. 同样在 Fabrics 模式，所有 Admin/I/O 命令强制用 SGL（`PSDT=01b`），不能再用 PRP。
 
-## 字段关系总结
+> 排错提示：`PRP2` 跨 1 页 vs PRP List 是 SQE 阶段最容易混淆的，按命令长度 / 起始页偏移严格判断。
 
-理解通用命令格式中各字段的相互关系，有助于掌握 NVMe 命令的执行机制：
+## 必须记住的规则
 
-### 命令标识与完成匹配
-- **CID（命令标识符）** 与 **提交队列标识符（Submission Queue ID）** 共同组成命令的唯一标识
-- 控制器使用这个组合将命令与其对应的完成队列条目（Completion Queue Entry）关联起来
+| 规则 | 要点 |
+|------|------|
+| 固定大小 | 64 字节（4 个 dword 头 + 8 字节 MPTR + 16 字节 DPTR + 6 个 dword 命令特定） |
+| 共同字段 | CDW0、NSID、MPTR、PRP1、PRP2、SGL1、Metadata SGL Segment Pointer |
+| 命令特定 | 字节 40-63（即 CDW10-CDW15）由具体命令规范定义 |
+| PSDT 编码 | `00b`=PRP；`01b`=SGL（MPTR 为缓冲区地址）；`10b`=SGL（MPTR 为单描述符段）；`11b`=保留 |
+| PSDT 协议约束 | PCIe 上 Admin 命令**必须**用 PRP；Fabrics 上 Admin/I/O **必须**用 SGL (`01b`) |
+| FUSE 编码 | `00b`=普通；`01b`=融合第一条；`10b`=融合第二条；`11b`=保留 |
+| DTD 编码 | `00b`=无传输；`01b`=主机→控制器；`10b`=控制器→主机；`11b`=双向 |
+| NSID 取值 | 0=未用；1-FFFFFFFEh=具体 NS；FFFFFFFFh=广播（仅在命令明确支持时） |
+| NSID 错误 | 对非活跃 NS→`Invalid Field in Command`；对不存在 NS→`Invalid Namespace or Format` |
+| CID 警告 | 避免 FFFFh——错误信息日志用此值表示"无对应命令" |
+| PRP2 用法 | 未跨页=保留；跨 1 页=第二页地址；跨多页=PRP List 指针 |
+| 厂商命令 | 可选：CDW10-11 用作传输长度字段，保留公共指针布局 |
+| Fabrics SQE | 操作码固定 `7Fh`；FCTYPE 占字节 4；用 SGL；没有融合形式 |
+| Fabrics PSDT | `10b` 显式标记"一次传输"；`00b` 表示无传输 |
 
-[规范参考：PDF p. 155](../_source/pages/page-155.md)
+## 容易混淆的地方
 
-### 融合操作的标识
-- **FUSE 字段** 将融合操作（Fused Operation）的位置信息嵌入通用提交队列条目中
-- 融合操作允许两条命令作为一个原子单元执行
+| 容易混 | 实际区别 |
+|--------|----------|
+| PRP vs SGL | PRP 是按 4KB 页地址描述；SGL 是任意分散描述符链 |
+| MPTR 三种含义 | 取决于 PSDT：禁用/连续地址/单描述符段 |
+| DPTR 两种含义 | 取决于 PSDT：PRP1+PRP2 / SGL1 |
+| FUSE vs PSDT | FUSE 在位 8-9（融合）；PSDT 在位 14-15（传输方式选择） |
+| CDW0 vs CDW2/3 | CDW0 全局定义；CDW2/3 由命令/命令集定义 |
+| Admin 命令 vs I/O 命令 | 共享 64 字节布局；Admin 走 Admin SQ，I/O 走 I/O SQ；传输方式约束不同 |
+| 通用 SQE vs Fabrics SQE | 通用 64 字节布局相同，但 Fabrics 用 `OPC=7Fh`+FCTYPE 二次分派 |
+| 字节偏移 8-15 vs 16-23 | 字节 8-15 = CDW2/CDW3（命令相关）；字节 16-23 = MPTR |
 
-[规范参考：PDF p. 155](../_source/pages/page-155.md)
+## 进阶细节
 
-### 指针类型的联动选择
-- **PSDT 字段** 同时控制元数据指针和数据指针的解释方式
-- 该字段的有效值受传输协议（PCIe 或 Fabrics）的约束
-- 这种联动设计确保了元数据和数据的传输方式保持一致
-
-[规范参考：PDF pp. 155-158](../_source/pages/page-155.md)
+- **CDW0 完整布局**（规范 4.1.1，Figure 91）：
+  - `31:16` CID
+  - `15:14` PSDT
+  - `13:10` 保留
+  - `09:08` FUSE
+  - `07:02` OPC.FN
+  - `01:00` OPC.DTD
+- **SGL 对齐**：`PSDT=01b` 时 MPTR 对齐要求见 Identify Controller `SGLS.MBA`（Metadata Buffer Alignment）。
+- **SGL 段**：`PSDT=10b` 时 MPTR 是 qword 对齐、含恰好一个 SGL 描述符的段地址。
+- **传输层支持值**：具体传输可能仅支持 PSDT 子集，参见对应 NVMe Transport binding 规范。
+- **PRP List**：跨多页时 PRP2 指向 PRP List 物理地址（PRP Entry 数组，最后一项目的位 0 = 1）。
+- **CDW2/CDW3 用途**：常为数据块数 / LBA 低位（如 Read/Write）；由具体命令定义。
+- **厂商特定命令**：可选扩展方式——用 CDW10/CDW11 当传输长度，保持公共指针布局，简化兼容。
+- **未来扩展性**：新 I/O 命令集可能定义**非通用**的 SQE 格式；当前 Common 格式是"当前最广用"而非"唯一"。
+- **Fabrics SQE 字段**：
+  - 字节 0-3：CDW0（`OPC=7Fh`）
+  - 字节 4：`FCTYPE`（6 位功能码 + 2 位传输方向）
+  - 字节 5-23：保留
+  - 字节 24-39：传输 / 键控 SGL 描述符（一次完整传输）
+  - 字节 40-63：Fabrics 命令类型特定字段
+- **完成匹配**：CID + SQID 在 CQ 条目里复现，控制器借此把命令和完成条目配对。
+- **错误信息日志**：`CID=FFFFh` 在 Error Information log 中表示"非特定命令错误"。
 
 ## 规范依据
 
-本文档基于以下 NVMe 规范内容整理：
+- [通用 SQE 概述与 Figure 91 CDW0，PDF 第 155 页](../_source/pages/page-155.md)
+- [Figure 92 SQE 完整布局，PDF 第 156-158 页](../_source/pages/page-156.md)
+- [PRP2 使用规则与 SGL 描述符，PDF 第 157-158 页](../_source/pages/page-157.md)
+- [Fabrics SQE 布局 Figures 94-95，PDF 第 159-160 页](../_source/pages/page-159.md)
 
-- [Figure 91: Command Dword 0 详细定义，PDF pp. 155-156](../_source/pages/page-155.md)
-- [Figure 92: Common Command Format 完整布局，PDF pp. 156-158](../_source/pages/page-156.md)
-- [Figures 93-94: 格式边界说明，PDF p. 159](../_source/pages/page-159.md)
-- [Figures 94-95: Fabrics SQE 与 CDW0 定义，PDF pp. 159-160](../_source/pages/page-159.md)
+## 相关阅读
+
+- [数据指针布局](data-pointer-layouts.md) - DPTR 字段按 PSDT 切 PRP/SGL
+- [完成队列条目与状态](completion-queue-entry-and-status.md) - SQE 与 CQE 通过 CID 配对
+- [命令排序与仲裁](command-ordering-and-arbitration.md) - FUSE 位影响命令原子性
+- [识别命令模型](identify-command-model.md) - Identify 也用通用 SQE 格式

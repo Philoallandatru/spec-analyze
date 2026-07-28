@@ -1,269 +1,202 @@
-# Identify Command Model
+# 识别命令模型（Identify Command Model）
 
-Identify is the Admin read operation that selects a 4,096-byte description of an NVM subsystem, Domain, controller, namespace, or related inventory. Its `CNS` selector chooses the returned structure; `NSID`, `CNTID`, `CSI`, `CNSSID`, and optional UUID index qualify only the operations that define them. [PDF pp. 317-319](../_source/pages/page-317.md)
+## 一句话说明
 
-## Mental model
+Identify 是 NVMe 的"通用只读接口"：主机用一个 4 KiB 命令读出子系统、控制器、命名空间或资源目录等数据；`CNS` 选大类，`NSID`/`CNTID`/`CSI`/`CNSSID`/`UIDX` 按 `CNS` 规则细化选择器，返回值统一 4 KiB。
 
-```text
-Identify command
-    |
-    +-- CNS ---------> which structure or list?
-    +-- NSID --------> which namespace?       (CNS-dependent)
-    +-- CNTID -------> which controller?      (CNS-dependent)
-    +-- CSI ----------> which I/O command set? (CNS-dependent)
-    +-- CNSSID -------> selector defined by that CNS
-    `-- UIDX ---------> UUID-qualified view, when supported
-                         |
-                         v
-                  4,096-byte result
-```
+## 生活化类比
 
-This explanatory selector tree condenses Figures 306-310 without reproducing the full CNS value table. [PDF pp. 317-319](../_source/pages/page-317.md)
+把 Identify 想成**"政府信息公开窗口"**：
 
-## Contract and invariants
+- **CNS = 你要查什么档案**（00h=某个 NS 的身份证，01h=控制器的营业执照，02h=所有 NS 列表……）。
+- **NSID = 查几号窗口的档案**（按需）。
+- **CNTID = 查哪个子公司**（按需）。
+- **CSI = 查哪个业务口**（NVM / KV / Zoned / SLM / CP）。
+- **UIDX = 查"带 UUID 后缀"的版本**（按需）。
+- **结果 = 一份 4 KiB 的标准表格**，多余字段填 0。
 
-| Concern | Contract |
-|---|---|
-| Result size | Every Identify operation returns a 4,096-byte data structure; unused entries/space are zero-filled. |
-| Data pointer | With PRPs, the data pointer is not a PRP List pointer because the buffer crosses at most one page boundary. |
-| Unused selectors | An unused `CNTID` is cleared by the host and ignored by the controller; unused `CSI` is cleared to zero. |
-| Unsupported selection | Unsupported `CNS` fails with `Invalid Field in Command`; an incompatible namespace command-set association fails with `Invalid I/O Command Set`. |
-| Transport partition | Common structures, memory-based-only structures, and message-based-only structures are defined in separate Identify subsections. |
-
-These rules summarize the rendered command format and selection behavior. [PDF pp. 317-319](../_source/pages/page-317.md)
-
-## Selector families
-
-| Family | Representative results | Selector pattern |
-|---|---|---|
-| Active namespace management | controller data, active NSID lists, namespace descriptors, NVM Set list | `CNS 00h-0Ah`; namespace and CSI selectors vary by result |
-| Controller/namespace management | allocated NSID lists, controller lists, primary/secondary controller data, UUID list | `CNS 10h-17h`; support is capability-dependent |
-| Resource and command-set inventory | Domain, Endurance Group, I/O Command Set, underlying namespace/ports | `CNS 18h-1Eh`; `CNS 1Dh` is prohibited when any controller uses a memory-based transport |
-| Allocated namespace and controller-state views | allocated command-set-specific namespace data, independent namespace data, controller state formats | `CNS 1Ah-20h`; support remains capability- and revision-dependent |
-
-The full `CNS` matrix is intentionally not duplicated here: it is an exact cross-page table with mandatory/optional conditions and per-selector applicability. The `CSI` namespace contains standardized command sets at `00h`-`04h`, vendor-specific values at `30h`-`3Fh`, and reserved ranges elsewhere. [PDF pp. 319-320](../_source/pages/page-319.md)
-
-## Identify Controller capability profile
-
-The I/O Command Set Independent Identify Controller structure describes the controller processing the command. Its leading region combines subsystem identity, controller identity, transfer limits, asynchronous-event support, and capability flags rather than defining one capability per structure. [PDF pp. 321-326](../_source/pages/page-321.md)
+## 工作流程
 
 ```text
-Identify Controller (CNS 01h), leading capability region
-
-bytes 0..75    identity + active firmware + arbitration recommendation
-      76       topology / sharing capability (CMIC)
-      77       host-memory transfer ceiling (MDTS)
-      78..91   controller identity, version, Runtime D3 latencies
-      92..95   optional asynchronous-event support (OAES)
-      96..99   cross-cutting controller attributes (CTRATT)
-     100..101  supported read-recovery levels (RRLS)
+  Identify 命令（Admin OPC=06h）
+  CDW10: CNTID(31:16) | CNS(7:0)
+  CDW11: CSI(31:24)   | CNSSID(15:0)
+  CDW14: UIDX(6:0)
+       |
+       v
+  控制器按 CNS 选数据结构：
+    00h  Identify Namespace（按 NSID/CSI）
+    01h  Identify Controller
+    02h  Active NSID list
+    03h  NS Identification Descriptors
+    04h  NVM Set list（按 CNSSID.NVMSETID）
+    05h/06h  CSI-specific NS/Controller
+    07h  CSI-filtered active NSID list
+    08h  CSI-independent NS
+    0Ah  Allocated NSID list
+    10h/11h  Allocated NSID list/NS data
+    12h/13h  Attached/I/O Controller list
+    14h/15h  Primary/Secondary Controller
+    16h/17h  NS Granularity/UUID list
+    18h/19h  Domain/Endurance Group list
+    1Ah/1Bh  CSI-allocated NSID list/NS data
+    1Ch       I/O Command Set 数据（按 CNTID）
+    1Dh       Underlying NS list（仅 Fabrics；PCIe 禁止）
+    1Eh       Ports list
+    1Fh       I/O CS Independent Allocated NS data
+    20h       Supported Controller State Formats
+       |
+       v
+  返回 4 KiB 数据结构（未用字段填 0）
 ```
 
-This explanatory byte-range map is reconstructed from the opening portion of Figure 312; it is not a replacement for the normative field layout. [PDF pp. 321-326](../_source/pages/page-321.md)
+## 初学者案例
 
-| Capability cluster | Key contract |
-|---|---|
-| Identity and topology | `SN` and `MN` identify a non-Discovery subsystem; `CNTLID` is unique within that subsystem; `CMIC` reports multiple ports/controllers, SR-IOV function association, and ANA reporting support. |
-| Transfer limit | Non-zero `MDTS` is `2^n` minimum-memory-pages. Exceeding it is an invalid field; `CTRATT.MEM` decides whether interleaved metadata counts, and destination Bit Bucket lengths count. |
-| Event advertisement | `OAES` advertises optional event families, but host software must enable a family before the controller sends it. |
-| Cross-capability constraints | `CTRATT.FDPS` and `CTRATT.FCM` are mutually exclusive; namespace granularity requires Namespace Management; the traffic-based Keep Alive bit selects that watchdog mode. |
-| Recovery levels | If read-recovery levels are supported, both Fast Fail level 15 and Default level 4 are mandatory supported bits. |
+**场景：想看自己 SSD 支持多大的 HMB，但读出来 HMPRE=0。**
 
-These clusters preserve the capability dependencies while avoiding a field-by-field page split. [PDF pp. 321-326](../_source/pages/page-321.md)
+1. `nvme id-ctrl` 走 CNS=`01h`、CNTID=0、CSI=0。
+2. 看 `HMPRE` 字段（byte 262-263 附近）= 0。
+3. 含义：HMPRE=0 是"advertise 无 HMB"，**不是**"HMB 不可用"；再查 `HMMIN`（byte 278 附近）= 0 表示任意可行。
+4. 但因为 `HMPRE=0`，**没有 HMB 能力**，driver 就不应尝试 Set Features `0Dh`（EHM）。
+5. 同时检查 `CTRATT.HMBR`（byte 96-99）= 0，说明"非操作态访问限制"也不支持，HMNARE 写 1 必报 `Invalid Field in Command`。
+6. 排错：HMB 必须看多个字段（`HMPRE`+`HMMIN`+`CTRATT.HMBR`），不能只看一个。
 
-## Capability advertisement and dependency gates
+> 排错提示：Identify Controller 是 4 KiB 的"能力目录"，**单字段 0 不一定 = 不可用**——必须看周围的能力位和关联字段。
 
-The middle of the I/O Command Set Independent Identify Controller structure is a capability directory: it advertises controller type and management surfaces, then gates optional Admin commands, logs, firmware behavior, power/thermal features, host memory, capacity reporting, and protected memory. A set bit does not replace the detailed command or Feature contract; it tells the host which contract may be used. [PDF pp. 327-334](../_source/pages/page-327.md)
+## 必须记住的规则
 
-```text
-Identify Controller capability directory (Figure 312, bytes 102..315)
+| 规则 | 要点 |
+|------|------|
+| 命令 | Admin 命令，OPC=`06h`（Identify） |
+| 返回大小 | 固定 4 KiB |
+| 缓冲 | PRP 至多跨 1 个页边界；**不是** PRP List 指针 |
+| CNS 选择器 | 8-bit（CDW10 `07:00`） |
+| CNTID | 16-bit（CDW10 `31:16`），不用的 `CNS` 必须置 0；`CNTID=0` 是合法值 |
+| CSI | 8-bit（CDW11 `31:24`），不用的 `CNS` 置 0 |
+| CNSSID | 16-bit（CDW11 `15:0`），由 `CNS` 决定含义 |
+| UIDX | 7-bit（CDW14 `6:0`），需控制器支持 UUID 选择 |
+| 不支持的 CNS | 回 `Invalid Field in Command` |
+| 命令集不匹配 | `Invalid I/O Command Set`（NS 关联的 I/O CS 与 `CNS` 要求不一致时） |
+| CSI 编码 | `00h`=NVM；`01h`=KV；`02h`=Zoned；`03h`=SLM；`04h`=Computational；`05h-2Fh`=保留；`30h-3Fh`=Vendor；`40h-FFh`=保留 |
+| 传输分区 | 通用结构 / 仅内存传输 / 仅消息传输三组分别定义 |
+| 1.0/1.1 控制器 | 主机只发该版本定义的 `CNS`，其他结果未定义 |
+| Discovery 控制器 | 部分身份/能力字段保留或条件性，I/O/Admin 列不能假设 |
+| CNS 列表规范 | Active NS(00-0Ah) / Mgmt(10-17h) / Inventory(18-1Eh) / Views(1Ah-20h) |
+| 命名空间识别描述符 | 变长；以 `NIDL=0` 结束；每类型不重复；至少含一种全球唯一标识（EUI64/NGUID/UUID） |
+| NSID 列表分页 | 最多 1024 个递增 NSID，**严格大于**输入 NSID |
+| NVM Set 列表分页 | 最多 31 个 128 字节条目，**大于等于**输入 NVM Set ID |
+| Controller 列表分页 | 最多 2047 个，**大于等于**输入 CNTID |
+| Capability-only 模板 | `NSID=FFFFFFFFh` 时返回能力模板（仅能力字段，非能力字段清 0） |
+| Inactive NS | 返回全 0 的 NS 结构 |
 
-102..134   platform + identity + reachability
-     |
-253..255   subsystem / management-interface presence
-     |
-256..262   Admin commands, AER, firmware, log attributes
-     |
-263..271   power states, temperature, activation time
-     |
-272..311   host-memory request + accessible/unallocated capacity
-     `---- 312..315 protected-memory capabilities (RPMB)
-```
+## 容易混淆的地方
 
-This explanatory range map was reconstructed from the rendered continuation of Figure 312; reserved gaps are omitted and the normative byte/bit layout remains in the source table. [PDF pp. 327-334](../_source/pages/page-327.md)
+| 容易混 | 实际区别 |
+|--------|----------|
+| Active NSID vs Allocated NSID | Active = 创建后已 Attach；Allocated = 已分配（无论是否 Attach） |
+| `CNS 00h` vs `CNS 05h` vs `CNS 08h` | 00h=NVM 命令集特定；05h=CSI 特定；08h=CS 无关 |
+| `CNS 02h` vs `CNS 0Ah` vs `CNS 10h` | 02h=Active；0Ah=Allocated 基线；10h=Allocated 详细 |
+| `MDTS=0` vs `MDTS` 大 | 0 = "无上限"；非 0 = 2^n 内存页数上限 |
+| `NN` vs `MNAN` | NN = 最大 NSID（不一定是 NS 数量）；MNAN = 支持的 NS 数量上限 |
+| `MAXCMD` vs SQ size | MAXCMD = 单条 SQ 同时可处理命令数；可大于 SQ 大小 |
+| `SGLS=00b` vs `SGLS` 位 | 00b 禁用 SGL（无论其他位）；位 1+ 仅 00b 后才解读 |
+| `FNA.FNVMBS=1` 含义 | "广播 Format 不支持"，且强制其他 format/erase scope 位清 0 |
+| `HMPRE=0` 含义 | "不广告 HMB 能力"，**不**是"HMB 不可用" |
+| `CTRATT.HMBR=0` | 不支持 HMB 非操作态访问限制；`HMNARE=1` 必报错 |
+| Discovery 控制器 vs 普通控制器 | Discovery 许多身份字段保留；`SN`/`MN` 不可用于构造唯一标识 |
 
-| Capability cluster | Dependency or invariant |
-|---|---|
-| Controller and FRU identity | Revision 1.4-or-later controllers report a non-zero controller type; a non-zero `FGUID` is stable for the FRU and identical across its controllers. |
-| Optional Admin surface | `OACS` gates command families. Lockdown support is subsystem-consistent, Host Managed Live Migration is not advertised by secondary controllers, and a non-zero `ACL`/`AERL` value is zero-based. |
-| Firmware and logs | `FRMW` reports Domain firmware slots and activation/overlap behavior; `LPA` separately gates telemetry areas, Persistent Event, extended Get Log Page fields, effects logs, and per-namespace SMART. |
-| Power and thermal | `NPSS` is zero-based with at least power state 0; `APSTA` gates autonomous transitions; warning and critical temperature thresholds are reported independently. |
-| Host memory and migration | `HMPRE` non-zero advertises Host Memory Buffer support and must be at least `HMMIN`; if any subsystem controller advertises Host Managed Live Migration, `HMPRE` is zero. |
-| Capacity and protected memory | `TNVMCAP`/`UNVMCAP` are required with Namespace or Capacity Management support. Non-zero RPMB count requires Security Send/Receive, and all reported RPMB targets share the encoded capabilities. |
+## 进阶细节
 
-The table groups dependencies that are easy to miss when reading Figure 312 field-by-field. [PDF pp. 328-334](../_source/pages/page-328.md)
+- **CDW10 位定义**（Figure 307）：`31:16` CNTID；`07:00` CNS。
+- **CDW11 位定义**（Figure 308）：`31:24` CSI；`15:00` CNSSID。
+- **CDW14 位定义**（Figure 309）：`06:00` UIDX。
+- **Figure 310 CNS 表**（部分）：
+  - `00h` M Identify Namespace（NSID=Y, CNTID=N, CSI=N8）
+  - `01h` M Identify Controller（NSID=N, CNTID=N, CSI=N）
+  - `02h` M Active NSID list（NSID=Y, CNTID=N, CSI=N）
+  - `03h` M NS Identification Descriptor list（NSID=Y）
+  - `04h` O NVM Set list（NSID=Y, CNSSID=NVMSETID）
+  - `05h` M1 CSI-specific NS（NSID=Y, CSI=Y）
+  - `06h` O1 CSI-specific Controller（CSI=Y）
+  - `07h` O1 CSI-filtered Active NSID list（NSID=Y, CSI=Y）
+  - `08h` O1 CSI-independent NS（NSID=Y）
+  - `09h-0Bh` O/M 各种 NS 列表与描述符
+  - `0Ch/0Dh/0Eh` O 大型 NSID/UUID/NVM Set 列表
+  - `10h/11h` O/M Allocated NSID list/NS data
+  - `12h/13h` O Attached/I/O Controller list（CNTID=Y）
+  - `14h/15h` O Primary/Secondary Controller
+  - `16h/17h` O NS Granularity/UUID list
+  - `18h/19h` O Domain/Endurance Group list
+  - `1Ah/1Bh` O CSI-allocated NSID list/NS data
+  - `1Ch` O I/O Command Set data（CNTID=Y）
+  - `1Dh` O Get Underlying NS list（**仅 Fabrics**；PCIe 禁止）
+  - `1Eh` O Get Ports list
+  - `1Fh` O I/O CS Independent Allocated NS data
+  - `20h` O Supported Controller State Formats
+  - `21h-FFh` 保留
+- **Capability 关键字段**：
+  - 0-75：身份、固件、仲裁推荐
+  - 76：CMIC（拓扑/多端口/ANA 报告）
+  - 77：MDTS（最大数据传输）
+  - 78-91：控制器身份、版本、Runtime D3 延迟
+  - 92-95：OAES（可选异步事件）
+  - 96-99：CTRATT（跨能力属性）
+  - 100-101：RRLS（读取恢复等级）
+  - 102-262：能力目录（管理、命令、日志等）
+  - 263-271：电源/温度/激活时间
+  - 272-311：HMB + 容量报告
+  - 312-315：RPMB
+  - 316-523：自检、固件、热、Sanitize、ANA、KPIOC、CQT
+  - 524-535：Format/缓存/原子/写保护/Copy
+  - 536-539：SGL 能力位图
+  - 540-587：NS 附件 + refresh + 变更跟踪 + CDQ
+  - 768-1023：子系统 NQN
+  - 1792-1806：Fabrics capsule/连接/Discovery 属性
+  - 2048-3071：电源状态描述符开始
+- **重要字段定义**：
+  - `MDTS=0` 含义是"无上限"；非 0 = `2^n` 内存页数
+  - `MAXCMD` 可超过 SQ 大小；Fabrics 必报，PCIe 可选
+  - `NN` = 最大 NSID（不=NS 数量）
+  - `MNAN` = 支持 NS 数量上限；`MNAN=0` 时回退为 ≤ NN
+  - `NPSS` = 支持的 PS 数，0-based，至少有 PS 0
+  - `HMPRE` 非 0 时必须 ≥ `HMMIN`；为 0 时 HMB 不可用
+  - `SANICAP` 非 0 时支持 Sanitize 命令
+  - `KPIOC` 区分子系统范围 vs 单 NS 启用
+  - `CQT` = 0 表示"未报告"；如要标 1ms 即 1
+  - `DSTO.HIRS` 需要 Device Self-test 支持
+  - `DSTO.SDSO` 选子系统单操作 vs 每控制器单操作
+  - `MNTMT`/`MXTMT` 限制 HCTM 阈值范围
+  - `VWC` 单独报告缓存存在和 broadcast Flush 是否合法
+  - `AWUN`/`AWUPF`/`ACWU` 仅适用于逻辑块命令集
+  - `CDFS` 枚举支持的 Copy 描述符格式
+  - `SGLS` 0=禁用；位 1+ 在 00b 后才解读
+- **NS 识别描述符**（CNS `03h`）：变长；以 `NIDL=0` 结束；每类型不重复；至少一个 EUI64/NGUID/UUID；多 CS 时含 CSI；跨 reset/format 持久。
+- **I/O Command Set Combination**（CNS `1Ch`）：每个组合是"一组同时可用的 CS 向量"；索引 0 保留；Feature `19h` 选当前活跃组合；未选中的 CS 视为不支持。
+- **Supported Controller State Formats**（CNS `20h`）：迁移目录，两部分：标准版本 + 厂商 UUID；Migration Receive/Send 用此索引。
+- **特殊边界**：
+  - `CNS 1Dh` 在任何控制器用内存传输的子系统中**禁止**
+  - `FNA.FNVMBS=1` ⇒ broadcast Format 不支持
+  - `HMPRE=0` ⇒ 无 HMB；`HMPRE`>0 ⇒ 必有 HMB 能力
+  - 任何 `CNS` 不支持时 `Invalid Field in Command`
 
-## Operational and I/O capability envelope
+## 规范依据
 
-The next portion of the same structure connects advertised features to their operating limits and then defines the controller's common I/O envelope. Self-test, firmware, thermal, Sanitize, ANA, Key Per I/O, and command-quiesce attributes are controller or subsystem capability gates; queue entry sizes, outstanding-command guidance, namespace range, optional-command support, and fused-operation support constrain the I/O interface exposed after discovery. [PDF pp. 335-342](../_source/pages/page-335.md)
+- [Identify 概述与 Data Pointer，PDF 第 317 页](../_source/pages/page-317.md)
+- [CDW10/CDW11/CDW14 + 选择错误规则 Figures 307-309，PDF 第 318 页](../_source/pages/page-318.md)
+- [CNS 值矩阵 Figure 310，PDF 第 319-320 页](../_source/pages/page-319.md)
+- [CSI 值 Figure 311，PDF 第 320 页](../_source/pages/page-320.md)
+- [Identify Controller 身份与拓扑 Figure 312，PDF 第 321-326 页](../_source/pages/page-321.md)
+- [能力目录中段，PDF 第 327-334 页](../_source/pages/page-327.md)
+- [Operational / I/O envelope Figure 312 续，PDF 第 335-342 页](../_source/pages/page-335.md)
+- [Format/缓存/SGL/CDQ/Fabrics 末段，PDF 第 343-350 页](../_source/pages/page-343.md)
+- [Power-state 描述符开始 + CNS 02h-04h 资源列表，PDF 第 351-355 页](../_source/pages/page-351.md)
+- [CSI-specific + Independent NS 视图，PDF 第 355-360 页](../_source/pages/page-355.md)
+- [Allocated / Controller / UUID / Domain / EG 目录，PDF 第 361-366 页](../_source/pages/page-361.md)
 
-```text
-Identify Controller, bytes 316..523
+## 相关阅读
 
-316..387  operational capability gates
-   |       self-test | firmware | thermal | sanitize | ANA
-   |       host memory | storage hierarchy | Key Per I/O | quiesce
-   v
-512..519  I/O queue + namespace envelope
-   |       SQ/CQ entry sizes | per-queue MAXCMD | maximum valid NSID
-   v
-520..523  aggregate optional-command + fused-operation support
-```
-
-This explanatory range map is reconstructed from Figure 312. Reserved gaps and exact bit positions are intentionally omitted; the normative layout remains in the source table. [PDF pp. 335-342](../_source/pages/page-335.md)
-
-| Capability cluster | Dependency or invariant |
-|---|---|
-| Self-test and firmware | `DSTO.HIRS` requires Device Self-test support; `DSTO.SDSO` chooses subsystem-wide single-operation versus one operation per controller. `FWUG` describes download granularity/alignment, while revision 2.1 controllers supporting activation without reset report a non-zero `MPTFAWR`. |
-| Thermal and Sanitize | Host-controlled thermal management requires Set/Get Features support for FID `10h`, with requested thresholds bounded by `MNTMT` and `MXTMT`. A supported Sanitize command requires non-zero `SANICAP`; its operation bits and no-deallocate policy gate the detailed Sanitize state machine. |
-| ANA topology | ANA support requires non-zero transition time, maximum ANA Group Identifier, and controller group count; `NANAGRPID` does not exceed `ANAGRPMAX`. `ANACAP` separately advertises reportable states and whether namespace management may assign or change group IDs while attached. |
-| Runtime bounds | `KPIOC` distinguishes subsystem-wide from per-namespace Key Per I/O enablement. `CQT` is the worst-case interval to satisfy Immediate Abort after Keep Alive timeout or communication loss; zero means unreported, while an implementation needing no time should report 1 ms. |
-| Queue and namespace envelope | NVM I/O SQ entries have a required 64-byte minimum and CQ entries a required 16-byte minimum. `MAXCMD` is per queue and may exceed SQ size; it is mandatory for Fabrics and optional for PCIe. `NN` is the maximum valid NSID, not the number of supported namespaces. |
-| Optional I/O behavior | `ONCS` aggregates command support across supported or inherited I/O Command Sets; the Commands Supported and Effects log resolves support for one specific command set. `FUSES` separately advertises Compare-and-Write, with Compare first. |
-
-These rows summarize cross-field contracts verified against the rendered table; they do not reproduce the exact bit-field encodings. [PDF pp. 335-342](../_source/pages/page-335.md)
-
-## Data-path, migration, and Fabrics envelope
-
-The final controller region extends the I/O envelope from command availability to data integrity, cache behavior, namespace protection, transfer descriptors, attachment limits, migration tracking, and Fabrics capsule geometry. [PDF pp. 343-350](../_source/pages/page-343.md)
-
-```text
-Identify Controller, bytes 524..2047
-
-524..535   Format/cache/atomic/write-protect/Copy attributes
-536..539   SGL capability matrix
-540..587   namespace attachments + refresh + change tracking/CDQ limits
-768..1023  subsystem NQN
-1792..1806 Fabrics capsule/connection/Discovery attributes
-2048..3071 power-state descriptors begin
-```
-
-This explanatory range map omits reserved gaps and exact bit positions. It was checked against the rendered continuation of Figure 312. [PDF pp. 343-350](../_source/pages/page-343.md)
-
-| Capability cluster | Dependency or invariant |
-|---|---|
-| Format and cache | `FNA` separates broadcast acceptance from format and secure-erase scope; `VWC` separately reports cache presence and whether broadcast Flush is legal. |
-| Atomicity and protection | `AWUN`, `AWUPF`, and `ACWU` apply only to logical-block command sets. Namespace write protection requires the base No-Write-Protect/Write-Protect pair before power-cycle or permanent states may be advertised. |
-| Copy and SGL | `CDFS` enumerates supported Copy descriptor formats. `SGLS` gates base SGL support and then independently advertises keyed, bit-bucket, metadata-pointer, offset, transport, length, and alignment behaviors. |
-| Namespace and refresh limits | `MNAN` is a supported-namespace count ceiling distinct from maximum valid NSID `NN`; Domain/controller attachment limits may be unreported. Refresh interval/time fields are zero unless Host-Initiated Refresh is supported. |
-| Change tracking and migration | Memory-range descriptor/granularity limits depend on host-memory tracking support; User Data Migration Queue maxima depend on user-data tracking support. Controller and subsystem CDQ range limits are reported separately. |
-| Fabrics | Capsule/response sizes use 16-byte units; `ICDOFF` begins after the 64-byte SQE. Fabrics attributes report NVM Set selection, controller model, capsule SGL count, optional Disconnect, and Discovery controller type. |
-
-These dependencies prevent hosts from treating non-zero limits as independent features. [PDF pp. 343-350](../_source/pages/page-343.md)
-
-The NVM subsystem NQN is mandatory from revision 1.2.1 onward. Discovery controllers return either their unique Discovery Service NQN or the well-known discovery NQN. Power-state descriptors follow the Fabrics region and define up to 32 states, beginning with mandatory state 0. [PDF pp. 349-350](../_source/pages/page-349.md)
-
-## Namespace and command-set views
-
-```text
-CNS 02h  active NSIDs after cursor
-CNS 03h  durable namespace identifier descriptors
-CNS 04h  NVM Set attributes after NVMSETID cursor
-CNS 05h  CSI-specific namespace data
-CNS 06h  CSI-specific controller data
-CNS 07h  CSI-filtered active NSIDs after cursor
-CNS 08h  command-set-independent namespace data
-```
-
-The list selectors are paginated rather than snapshot-all operations: Active Namespace lists return up to 1,024 increasing NSIDs greater than the input NSID, while the NVM Set list returns up to 31 ordered 128-byte entries starting at or after a selected NVM Set Identifier. [PDF pp. 353-356](../_source/pages/page-353.md)
-
-Namespace Identification Descriptors are variable-length and end when `NIDL=0`. A list contains no duplicate type, includes at least one durable identity (`EUI64`, `NGUID`, or UUID), and includes the namespace's Command Set Identifier when multiple I/O Command Sets are enabled. Identity descriptors survive reset and format for the namespace lifetime. [PDF pp. 353-354](../_source/pages/page-353.md)
-
-CSI-specific Namespace/Controller views fail for unsupported command sets, while a supported command set with no defined controller structure returns zeroes. Inactive namespaces return a zero-filled Namespace structure. With `NSID=FFFFFFFFh`, capability-only views may be returned for namespace creation/formatting: reported/common capabilities remain and non-capability fields are zero. [PDF pp. 355-357](../_source/pages/page-355.md)
-
-The command-set-independent Namespace view begins with per-namespace cache override, rotational-media and durable-ID-reuse attributes, private/shared/dispersed access, and reservation-type support. Its “Reported” column distinguishes fields valid in the broadcast capability template from fields meaningful only for one namespace. [PDF pp. 357-359](../_source/pages/page-357.md)
-
-## Namespace runtime state and resource membership
-
-The independent Namespace view continues from static capabilities into current state and storage-resource membership. Format progress is meaningful only when its support bit is set; namespace status separately reports readiness and whether I/O performance degradation is reported or active. Key Per I/O has distinct supported and enabled bits, and its maximum key tag is valid only when the capability is enabled. [PDF pp. 359-360](../_source/pages/page-359.md)
-
-```text
-namespace capability + current state
-        |
-        +-- FPI ------ format-progress support / remaining percentage
-        +-- NSTAT ---- ready + I/O performance impact
-        +-- KPIOS ---- Key Per I/O supported / enabled -> MAXKT
-        `-- membership
-             +-- ANAGRPID / RGRPID  access and reachability groups
-             `-- NVMSETID / ENDGID storage allocation hierarchy
-```
-
-This relationship diagram groups the fields by host decision rather than byte position. Group identifiers are cleared when their reporting mechanism is unsupported; NVM Set and Endurance Group identifiers are also cleared for namespaces without formatted storage. A changed ANA or Reachability Group identifier produces its corresponding change notice only when that notice mechanism is supported and enabled. [PDF pp. 359-360](../_source/pages/page-359.md)
-
-## Allocated, topology, and resource directories
-
-| `CNS` | Result | Cursor and boundary contract |
-|---|---|---|
-| `10h` | allocated NSID list | up to 1,024 increasing NSIDs greater than the input NSID |
-| `11h` | allocated namespace data | zero-filled for an unallocated NSID; invalid command set if the namespace has no logical blocks |
-| `12h` / `13h` | attached-controller / I/O-controller list | up to 2,047 controller IDs greater than or equal to `CNTID` |
-| `16h` / `17h` | namespace granularity / UUID list | command-set-specific granularity; UUID entries terminate at the first zero entry |
-| `18h` / `19h` | Domain / Endurance Group list | ordered resource entries starting at or after the supplied resource identifier |
-| `1Ah` / `1Bh` | CSI-filtered allocated list / namespace data | allocated namespace view constrained by the selected I/O Command Set |
-| `1Ch` | I/O Command Set combinations | up to 512 vectors; the selected profile enables only sets present in its vector |
-| `1Fh` / `20h` | independent allocated namespace / controller-state formats | allocated independent view; migration format-version and vendor-UUID directories |
-
-These selectors are related directories, not interchangeable snapshots. UUID entries carry an association of none, PCI Vendor ID, or PCI Subsystem Vendor ID, and a zero entry ends the list. Domain entries report total, unallocated, and optional maximum single-Endurance-Group capacity; an Endurance Group cursor greater than `ENDGIDMAX` succeeds with an empty list. [PDF pp. 361-364](../_source/pages/page-361.md)
-
-An **I/O Command Set Combination** is one vector of simultaneously usable command sets. Combination zero has index zero, later supported combinations occupy successive indices, and the I/O Command Set Profile Feature selects which vector is active; unselected command sets are treated as unsupported. The standardized vector bits represent NVM, Key Value, Zoned Namespace, Subsystem Local Memory, and Computational Programs command sets. [PDF pp. 364-365](../_source/pages/page-364.md)
-
-The Supported Controller State Formats result is a two-part migration directory: one indexed list names supported NVMe Controller State structure versions and a second indexed list names vendor-specific state formats by UUID. Migration Receive and Migration Send use those indices when getting controller state. The vendor-specific payload format itself remains outside this specification. [PDF pp. 365-366](../_source/pages/page-365.md)
-
-## Relationships
-
-- [Identity, Name, and List Formats](identity-name-and-list-formats.md) defines the identifiers carried by several Identify results. [PDF p. 318](../_source/pages/page-318.md)
-- [Namespace Identifiers](namespace-identifiers.md) distinguishes active and allocated NSID views selected by different `CNS` values. [PDF p. 319](../_source/pages/page-319.md)
-- [Command Sets](command-sets.md) defines the I/O Command Set association that controls whether CSI-qualified Identify operations are valid. [PDF pp. 318-319](../_source/pages/page-318.md)
-- [Firmware Update Lifecycle](firmware-update-lifecycle.md), [Log Page Retrieval](log-page-retrieval.md), and [NVM Capacity Model](nvm-capacity-model.md) define the behaviors merely advertised by `FRMW`, `LPA`, and the capacity fields. [PDF pp. 331-334](../_source/pages/page-331.md)
-- [Device Self-test](device-self-test.md), [Sanitize Operation Status](sanitize-operation-status.md), and [Namespace Access Models](namespace-access-models.md) define the operations and state views advertised by `DSTO`, `SANICAP`, and the ANA fields. [PDF pp. 335-338](../_source/pages/page-335.md)
-- [Queue Pair](queue-pair.md), [Command Sets](command-sets.md), and [Commands Supported and Effects](command-effects-and-support.md) explain the queue geometry and per-command-set support behind `SQES`, `CQES`, `MAXCMD`, and aggregate `ONCS`. [PDF pp. 340-342](../_source/pages/page-340.md)
-- [Data Pointer Layouts](data-pointer-layouts.md), [Controller Data Queues](controller-data-queues.md), and [Fabrics Discovery and Authentication](fabrics-discovery-and-authentication.md) define the SGL, migration/CDQ, and Fabrics behaviors advertised in the final controller region. [PDF pp. 346-350](../_source/pages/page-346.md)
-- [Namespace Identifiers](namespace-identifiers.md), [NVM Sets and Endurance Groups](nvm-sets-and-endurance-groups.md), and [Power State Descriptors](power-state-descriptors.md) define the paginated resource views and power policy structures selected after Identify Controller. [PDF pp. 350-358](../_source/pages/page-350.md)
-
-## Edge cases
-
-- `CNTID=0h` is a valid controller identifier even though hosts clear an unused `CNTID` to zero; whether it is meaningful is determined by `CNS`, not its numeric value. [PDF p. 318](../_source/pages/page-318.md)
-- Hosts talking to revision 1.0 or 1.1 controllers should issue only CNS values defined by that revision; other results are indeterminate. [PDF p. 318](../_source/pages/page-318.md)
-- `MDTS=0h` means that this field imposes no maximum, not that transfers are forbidden; commands without host-accessible-memory transfer are outside this limit. [PDF p. 322](../_source/pages/page-322.md)
-- Discovery controllers reserve or conditionally expose several identity/capability fields, so the I/O/Admin support columns in Figure 312 cannot be assumed for Discovery. [PDF pp. 321-326](../_source/pages/page-321.md)
-- A zero in a capability field is not uniformly “unsupported”: `NSSL=0` means latency is unreported, `HMMIN=0` requests any feasible amount up to `HMPRE`, and zero-based limits/counts encode one supported entry where their enclosing capability is present. [PDF pp. 327, 330-334](../_source/pages/page-327.md)
-- `MAXCMD` is not a Submission Queue depth limit, `NN` is not a namespace count, and aggregate `ONCS` is not sufficient to prove support in one selected I/O Command Set. [PDF pp. 340-342](../_source/pages/page-340.md)
-- A set `FNA.FNVMBS` means broadcast Format is *not* supported; it also forces the separate format and secure-erase scope bits clear. [PDF p. 343](../_source/pages/page-343.md)
-- `SGLS=00b` disables SGL use regardless of individual descriptor bits, and `MNAN=0` does not mean zero namespaces—it falls back to a count no greater than `NN`. [PDF pp. 346-347](../_source/pages/page-346.md)
-- The allocated-list cursors are not uniform: NSID lists use strictly greater-than, controller lists use greater-than-or-equal, and Domain/Endurance Group lists start at or after their resource cursor. [PDF pp. 361-364](../_source/pages/page-361.md)
-
-## Evidence
-
-- [Identify overview and data pointer, PDF p. 317](../_source/pages/page-317.md)
-- [Command dwords and selection/error rules, PDF p. 318](../_source/pages/page-318.md)
-- [CNS selector matrix start, PDF p. 319](../_source/pages/page-319.md)
-- [CNS selector matrix continuation, adjacent PDF p. 320](../_source/pages/page-320.md)
-- [Identify Controller identity and topology fields, PDF p. 321](../_source/pages/page-321.md)
-- [Transfer limit and optional-event support, PDF pp. 322-323](../_source/pages/page-322.md)
-- [Controller attributes and read-recovery levels, PDF pp. 324-326](../_source/pages/page-324.md)
-- [Boot, shutdown, power-loss, identity, retry, and reachability capabilities, PDF pp. 327-328](../_source/pages/page-327.md)
-- [Management and optional Admin command capabilities, PDF pp. 329-330](../_source/pages/page-329.md)
-- [Asynchronous-event, firmware, and log attributes, PDF pp. 331-332](../_source/pages/page-331.md)
-- [Power, thermal, host-memory, capacity, and RPMB capabilities, PDF pp. 333-334](../_source/pages/page-333.md)
-- [Self-test, firmware, thermal, Sanitize, host-memory, and ANA capabilities, PDF pp. 335-338](../_source/pages/page-335.md)
-- [Key Per I/O, firmware activation, capacity, hysteresis, and quiesce limits, PDF p. 339](../_source/pages/page-339.md)
-- [I/O queue, namespace, optional-command, and fused-operation attributes, PDF pp. 340-342](../_source/pages/page-340.md)
-- [Format, cache, atomicity, write-protection, Copy, and SGL attributes, PDF pp. 343-346](../_source/pages/page-343.md)
-- [Namespace/attachment, refresh, tracking, migration, and CDQ limits, PDF pp. 347-348](../_source/pages/page-347.md)
-- [Subsystem NQN, Fabrics attributes, and power-state descriptor boundary, PDF pp. 349-350](../_source/pages/page-349.md)
-- [Power-state descriptor completion and CNS 02h–04h resource lists, PDF pp. 351-355](../_source/pages/page-351.md)
-- [CSI-specific and independent Namespace/Controller views, PDF pp. 355-358](../_source/pages/page-355.md)
-- [Independent Namespace runtime state and resource membership, PDF pp. 359-360](../_source/pages/page-359.md)
-- [Allocated, controller, UUID, Domain, and Endurance Group directories, PDF pp. 361-363](../_source/pages/page-361.md)
-- [CSI-allocated views and I/O Command Set combinations, PDF pp. 364-365](../_source/pages/page-364.md)
-- [Supported Controller State Formats and memory-transport boundary, PDF p. 366](../_source/pages/page-366.md)
+- [身份名称与列表格式](identity-name-and-list-formats.md) - 读出的内容字段定义
+- [通用命令格式](common-command-format.md) - Identify 是 Admin SQE 命令
+- [电源状态描述符](power-state-descriptors.md) - Identify Controller 含 PSD 数组
+- [控制器属性](controller-properties.md) - 控制器属性由 Identify 报告
+- [NVM 集与耐久度组](nvm-sets-and-endurance-groups.md) - Identify 列出 EG/Set 列表

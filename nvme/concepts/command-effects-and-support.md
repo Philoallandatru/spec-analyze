@@ -1,164 +1,123 @@
-# 命令效果与支持
+# 命令效果与支持（Commands Supported and Effects）
 
-## 概述
+## 一句话说明
 
-在 NVMe 系统中，控制器（Controller）需要告知主机（Host）软件两个关键信息：
+"命令支持与效果日志"（Commands Supported and Effects Log, LID=05h）是一个 4096 字节的结构，每个 Admin 操作码（Opcode）和每个 I/O 操作码对应一个 32 位描述符，告诉主机"这个命令支不支持 + 它可能影响哪些资源"。
 
-1. **哪些命令受支持**：控制器实际支持哪些管理命令（Admin Command）和 I/O 命令
-2. **命令会产生什么效果**：每个命令可能对子系统（Subsystem）状态产生哪些影响
+## 生活化类比
 
-NVMe 规范通过 **Commands Supported and Effects Log**（命令支持与效果日志）来提供这些信息。这是一个 4,096 字节的日志结构，其中包含：
+把命令效果日志想成**餐厅的菜单副作用说明**：
 
-- 每个管理操作码（Admin Opcode）对应一个 32 位描述符（Descriptor）
-- 所选 I/O 命令集（I/O Command Set）中每个 I/O 操作码也对应一个 32 位描述符
+- **每一道菜** = 一个命令（Read / Write / Format NVM / Create Namespace …）
+- **菜名旁的小字** = 描述符的 Scope（影响范围：包间？楼层？整栋楼？）
+- **"本菜可能临时停水"** = Capability Change（能力变更）
+- **"本菜可能换桌布"** = Data Change（数据变更）
+- **"本菜需要整层楼暂停"** = Command Submission and Execution（提交与执行建议）
+- **"已售罄"** = CSUPP = 0（不支持）
 
-通过这个日志，主机软件可以了解每个命令的支持情况及其可能的副作用，从而进行合理的命令调度和状态管理。
+服务员（主机）点单前先扫一眼副作用说明，避免在婚宴上突然下单"全场灯光改造"（控制器能力变更）这种大动静。
 
-> **规范参考**：[PDF p. 236](../_source/pages/page-236.md)
-
-## 工作机制
-
-### 信息流程
+## 工作流程
 
 ```text
-操作码（Opcode）
-    ↓
-是否支持？
-    ↓
-可能的效果
-    ├─ 影响范围（Scope）
-    ├─ 能力变更（Capability Change）
-    └─ 数据变更（Data Change）
-    ↓
-主机协调策略
-    ├─ 暂停冲突操作
-    ├─ 等待命令完成
-    └─ 重新枚举/重新识别
+主机拿日志（Get Log Page, LID=05h, 长度 4096）
+              |
+              v
++---------------------------------------------+
+| 字节 3:0    ACS0   (Admin Opcode 0 描述符)  |
+| 字节 7:4    ACS1   (Admin Opcode 1 描述符)  |
+| ...                                         |
+| 字节 1023:1020  ACS255                       |
+| 字节 1027:1024 IOCS0  (I/O Opcode 0 描述符) |
+| ...                                         |
+| 字节 2043:2040  IOCS255                     |
+| 字节 4095:2048  保留                         |
++---------------------------------------------+
+              |
+              v
+按描述符做协调决策:
+  - 暂停相关 Namespace 操作
+  - 等待命令完成
+  - 必要时重新 Identify / 重新枚举
 ```
 
-这个流程说明了该日志的核心价值：它不仅仅是一个简单的操作码列表，而是包含了**操作元数据**（Operational Metadata），帮助主机软件做出正确的协调决策。
+简化说明：日志描述的是"命令**可能**的总体效果"，包括可选行为；主机应保守对待所有被设置的位。
 
-> **规范参考**：[PDF pp. 236-238](../_source/pages/page-236.md)
+## 初学者案例
 
-## 描述符字段详解
+**场景：Format NVM 之前，主机要不要做协调？**
 
-每个命令的 32 位描述符包含多个字段组，用于描述命令的支持状态和效果特征。
+1. 主机想对 NSID=1 调用 Format NVM。
+2. 主机先 `nvme get-log /dev/nvme0 -i 5 -l 4096` 读 Commands Supported and Effects。
+3. 找到 IOCS 对应 Format NVM 描述符（按当前 I/O Command Set 解释）。
+4. 描述符位指示：Scope = Namespace；Capability Change = 单个 NS 能力变更；CSE = 命名空间内串行化。
+5. 主机执行协调动作：
+   - 暂停对 NSID=1 的所有 I/O；
+   - 排空 SQ；
+   - 提交 Format NVM；
+   - 等待 CQE；
+   - 重新发 Identify 检查 NSID=1 的新容量/格式化参数。
+6. 继续恢复业务。
 
-### 字段组说明
+> 速查：多控制器共享同一 Namespace 时，所有关联主机都需要参考 CSE 字段做协调。
 
-| 字段组 | 含义说明 |
+## 必须记住的规则
+
+| 规则 | 要点 |
+|------|------|
+| 日志长度 | 固定 4096 字节（256 个 Admin + 256 个 I/O + 2048 字节保留） |
+| 每条目 32 位 | Admin Opcode 0..255 与 I/O Opcode 0..255 各对应一个描述符 |
+| CSUPP=0 即"不支持" | 描述符其他所有位全为 0 |
+| 描述"可能的"效果 | 含可选行为；主机应保守对待所有被设置的位 |
+| I/O 部分按命令集解释 | 由 `CC.CSS` 选定；`CC.CSS=110b` 时由 CDW14 的 CSI 动态选择 |
+| 范围多选 | 命令效果日志的 Scope 可同时设多个位（NS / Controller / NVM Set / EG / Domain / Subsystem） |
+| 串行化建议 | CSE/CSER 提示主机在 NS 范围或全局范围串行化；非零放宽策略会覆盖 CSE |
+| 能力变更后 | 主机应暂停相关操作 → 等待 CQE → 重新 Identify / 重新枚举 |
+| 多控制器共享 NS | 各主机应协调命令提交，满足 CSE 字段要求 |
+
+## 容易混淆的地方
+
+| 容易混 | 实际区别 |
 |--------|----------|
-| **CSUPP**<br>命令支持位 | 该操作码受控制器支持。<br>当此位清零时，描述符中的所有其他字段均为零。 |
-| **Scope**<br>影响范围 | 命令可能影响的范围，包括：<br>- 命名空间（Namespace）<br>- 控制器（Controller）<br>- NVM 集合（NVM Set）<br>- 耐久性组（Endurance Group）<br>- 域（Domain）<br>- 整个 NVM 子系统<br><br>**注意**：多个范围位可以同时被设置。 |
-| **USS**<br>UUID 选择支持 | 该命令支持 UUID（通用唯一标识符）选择功能。<br>主机可以通过 UUID 来指定命令作用的特定对象。 |
-| **CSE / CSER**<br>提交与执行建议 | 提供命令串行化建议，用于避免冲突：<br>- 在命名空间范围内串行化命令<br>- 在全局范围内串行化命令<br><br>如果支持非零的放宽策略（Relaxation），则该策略会取代 CSE 字段的值。 |
-| **Capability Effects**<br>能力效果标志 | 指示命令可能产生的变更类型：<br>- 控制器能力变更<br>- 命名空间清单变更<br>- 单个命名空间能力变更<br>- 逻辑块内容变更 |
+| 命令效果日志 vs 特性效果日志 | 前者按 Opcode 索引；后者按 FID / NVMe-MI Opcode 索引 |
+| 范围位可多选 vs 范围位唯一 | 命令效果日志 Scope 可多选；特性/MI 效果范围只能"恰好一位为 1"（含 CDQ） |
+| CSUPP=0 vs 字段=0 | CSUPP=0 = 不支持；CSUPP=1 时其余字段也可为 0（表示"无效果"） |
+| CSE vs CSER | CSE 是默认串行化建议；CSER 是放宽策略，非零时取代 CSE |
+| Scope vs Capability Effects | Scope 指"影响哪类资源"；Capability Effects 指"资源发生什么变化"（能力/数据） |
+| CC.CSS vs CDW14.CSI | `CC.CSS=110b` 时由 CDW14 动态指定；其他值由 `CC.CSS` 选定 |
 
-### 重要说明
+## 进阶细节
 
-1. **保守原则**：控制器描述的是命令**可能**产生的所有效果，包括可选的命令行为。因此，主机软件应该保守地对待所有被设置的标志位。
+- **描述符字段（Figure 210 概括）**：
+  - `CSUPP`（bit 0）：命令支持位；=0 时其他位全 0。
+  - `Scope`（多位可设）：Namespace / Controller / NVM Set / Endurance Group / Domain / NVM Subsystem。
+  - `USS`（UUID Selection Support）：是否支持按 UUID 选择。
+  - `CSE` / `CSER`：命令提交与执行建议（串行化级别、放宽策略）。
+  - Capability Effects 标志：控制器能力变更、命名空间清单变更、单个 NS 能力变更、用户数据变更。
+- **Feature Identifiers Supported and Effects Log**（接口特定）：
+  - 同样长度，每条目一个 FID 或 NVMe-MI Opcode。
+  - Scope 非零时**恰好一位**为 1（额外含 CDQ）。
+  - 区分接口实例：Admin Queue / PCIe VDM Endpoint / 2-Wire Endpoint。
+  - 还报告 Get/Set Features 是否接受 UUID 选择。
+- **主机协调流程模板**：
+  1. 解析描述符；
+  2. 若涉及 NS 能力/清单变更，暂停相关 NS 的 I/O；
+  3. 提交命令并等待 CQE；
+  4. 重新 Identify / 重新枚举；
+  5. 恢复业务。
+- **NVMe-MI 操作码效果**：结构与 FID 效果日志类似，区别在于条目索引是 MI Opcode 而非 FID。
 
-2. **字段组合**：多个字段可以同时有效，主机需要综合考虑所有标志位来决定命令协调策略。
+## 规范依据
 
-3. **完整定义**：上表是对规范 Figure 210 的概括性总结，省略了保留位（Reserved bits）的详细说明。完整的位定义请参考规范文档。
+- [Commands Supported and Effects Log Page 布局（Figure 209），PDF 第 236 页](../_source/pages/page-236.md)
+- [描述符字段定义 Scope/CSE（Figure 210），PDF 第 237 页](../_source/pages/page-237.md)
+- [放宽策略与能力/数据变更标志，PDF 第 238 页](../_source/pages/page-238.md)
+- [Feature Identifiers Supported and Effects（接口特定），PDF 第 281 页](../_source/pages/page-281.md)
+- [NVMe-MI 操作码效果日志，PDF 第 283 页](../_source/pages/page-283.md)
 
-> **规范参考**：[PDF pp. 237-238](../_source/pages/page-237.md)
+## 相关阅读
 
-## 主机软件使用指南
-
-### 命令执行后的处理流程
-
-当主机执行可能修改控制器能力或命名空间清单（Namespace Inventory）的命令后，需要按以下步骤处理：
-
-1. **暂停相关操作**：暂停对受影响命名空间的访问
-2. **等待命令完成**：确保命令已经完全执行完毕
-3. **更新系统视图**：
-   - 重新枚举（Re-enumerate）命名空间
-   - 重新发出 Identify 命令获取最新状态
-
-### 多控制器场景下的协调
-
-当一个命名空间连接到多个控制器时，主机软件需要在这些控制器之间协调命令提交，以满足描述符中的执行建议。这样可以避免并发命令产生冲突。
-
-例如：
-- 如果命令建议在命名空间范围内串行化，主机需确保不会同时向该命名空间发送冲突命令
-- 如果命令建议在全局范围内串行化，主机需要更严格的全局协调
-
-### 命令集选择
-
-该日志的 I/O 命令部分需要根据当前激活的命令集进行解释：
-
-- **标准情况**：由控制器配置寄存器中的 `CC.CSS` 字段选定命令集
-- **动态选择**：当 `CC.CSS=110b` 时，使用命令双字 14（Command Dword 14）中的命令集标识符（Command Set Identifier）来动态选择具体的命令集
-
-> **规范参考**：[PDF p. 236](../_source/pages/page-236.md)
-
-## 特性与管理命令效果
-
-### 特性标识符支持与效果日志
-
-除了命令支持与效果日志外，NVMe 还提供了 **Feature Identifiers Supported and Effects Log**（特性标识符支持与效果日志），用于描述各种特性和管理命令的支持情况。
-
-```text
-接口实例 + 选定的命令集 / UUID
-    ↓
-    ├─ FID 00h..FFh → 是否支持 + 影响范围 + 效果
-    └─ MI opcode 00h..FFh → 是否支持 + 影响范围 + 效果
-```
-
-### 接口实例特性
-
-**重要特点**：特性标识符日志是**接口实例特定**的（Interface-Instance-Specific），这意味着不同接口可能暴露不同的特性集合：
-
-- 管理队列（Admin Queue）
-- PCIe VDM 端点（PCIe VDM Endpoint）
-- 2-Wire 端点（2-Wire Endpoint）
-
-对于 I/O 控制器，选定的或由配置文件指定的 I/O 命令集也会过滤支持范围。当系统通告支持 UUID 选择时，`UIDX` 字段可以进一步选择所报告的 FID 命名空间。
-
-> **规范参考**：[PDF p. 281](../_source/pages/page-281.md)
-
-### 效果日志对比
-
-| 日志类型 | 每条目的支持字段 | 影响范围规则 | 通用变更标志 |
-|----------|------------------|--------------|--------------|
-| **特性标识符** | `FSUPP`：不支持时所有其他位为零 | 零表示未报告<br>非零时在以下范围中**恰好一个**位为 1：<br>- 命名空间<br>- 控制器<br>- NVM 集合<br>- 耐久性组<br>- 域<br>- 子系统<br>- CDQ | - 用户数据变更<br>- 单个命名空间能力变更<br>- 命名空间清单变更<br>- 控制器能力变更 |
-| **NVMe-MI 操作码** | `CSUPP`：不支持时所有其他位为零 | 零表示未报告<br>非零时在以下范围中**恰好一个**位为 1：<br>- 命名空间<br>- 控制器<br>- NVM 集合<br>- 耐久性组<br>- 域<br>- 子系统 | - 用户数据变更<br>- 单个命名空间能力变更<br>- 命名空间清单变更<br>- 控制器能力变更 |
-
-### 理解要点
-
-1. **可能性描述**：这些日志描述的是命令或特性**可能**产生的总体效果，包括可选行为，而不是某一次具体调用的实际效果。
-
-2. **范围规则差异**：
-   - 命令效果日志：多个范围位可以同时设置
-   - 特性标识符和 NVMe-MI 日志：只能有一个范围位设置
-
-3. **UUID 选择支持**：特性日志还额外报告 Get Features 和 Set Features 命令是否接受 UUID 选择功能。
-
-4. **规范核查**：上述对比表已与规范中的 Figures 261–264 核对确认。
-
-> **规范参考**：[PDF pp. 282-284](../_source/pages/page-282.md)
-
-## 相关概念
-
-### 命令排序与仲裁
-
-[Command Ordering and Arbitration](command-ordering-and-arbitration.md)（命令排序与仲裁）机制负责从提交队列中选择待执行的命令。而命令效果元数据则告知主机软件在哪些场景下建议进行额外的串行化处理，两者配合确保命令的正确执行顺序。
-
-> **规范参考**：[PDF pp. 120-123, 237-238](../_source/pages/page-120.md)
-
-### 命名空间标识符
-
-[Namespace Identifiers](namespace-identifiers.md)（命名空间标识符）提供了命名空间清单信息。某些命令可能使这些清单失效，或者要求主机重新发现命名空间配置。命令效果日志帮助主机识别这些情况并采取相应的更新措施。
-
-> **规范参考**：[PDF pp. 235-238](../_source/pages/page-235.md)
-
-## 规范引用
-
-本文档基于以下 NVMe 规范页面编写：
-
-- **日志布局、命令集选择与主机协调**：[PDF p. 236](../_source/pages/page-236.md)
-- **影响范围与命令提交字段**：[PDF p. 237](../_source/pages/page-237.md)
-- **放宽策略与能力/数据变更标志**：[PDF p. 238](../_source/pages/page-238.md)
-- **接口特定的特性支持与效果**：[PDF pp. 281-283](../_source/pages/page-281.md)
-- **NVMe-MI 命令支持、范围与效果**：[PDF pp. 283-284](../_source/pages/page-283.md)
+- [admin-command-model.md](admin-command-model.md) - 命令 opcode 与命令集分类
+- [command-and-feature-lockdown.md](command-and-feature-lockdown.md) - 动态权限层补充静态能力
+- [format-nvm-lifecycle.md](format-nvm-lifecycle.md) - Format 描述符字段含义
+- [command-abort-semantics.md](command-abort-semantics.md) - Abort 描述符字段含义

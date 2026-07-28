@@ -1,194 +1,113 @@
 # Keep Alive（保活机制）
 
-Keep Alive 是 NVMe 协议中的一项重要机制，用于检测主机（Host）与控制器（Controller）之间的通信故障。它的工作原理类似于看门狗定时器（Watchdog Timer），每个控制器独立维护一个定时器来监控通信状态。
+## 一句话说明
 
-## 核心概念
+Keep Alive 是 NVMe 控制器内嵌的一种"看门狗"机制：每个控制器各自维护一个定时器，用来发现主机和控制器之间何时已经失联，并在必要时主动宣告自己进入致命状态。
 
-**KATT**（Keep Alive Timeout Time，保活超时时间）：控制器当前使用的超时时间值。
+## 生活化类比
 
-**KAS**（Keep Alive Support，保活支持）：控制器通告的一个非零值，表明该控制器支持 Keep Alive 功能。
+把 Keep Alive 想象成**物业保安的巡逻打卡**：
 
-**KATO**（Keep Alive Timeout，保活超时配置）：主机设置的超时时间配置值。
+- **巡逻岗亭** = 控制器；岗亭里有一块倒计时牌 = Keep Alive 定时器
+- **倒计时起点** = 岗亭刚刚和业主联系上
+- **每次收到业主消息**（命令或 Keep Alive 命令）= 保安按下"重置"按钮，倒计时回到设定值
+- **倒计时归零前没有任何消息** = 岗亭认定业主失联，按应急预案拉响警报（设置 `CSTS.CFS=1`）
 
-不同的传输协议（如 PCIe、RDMA、TCP）会定义各自允许的取值范围，以及该特性是否必须启用。只有通告了非零 `KAS` 值的控制器才支持 Keep Alive 定时器和 Keep Alive 命令。
+> 这个机制的关键是"双向"：主机不仅要主动发"我还活着"的信号（Command Based 模式），控制器也得在没人说话时主动判断是不是掉线了。
 
-**规范参考**：[PDF pp. 146-147](../_source/pages/page-146.md)
-
-## 工作原理
-
-### 状态转换模型
-
-下面的状态图展示了 Keep Alive 定时器的激活条件和运行流程：
+## 工作流程
 
 ```text
-未激活状态 ──┬─ 满足激活条件 ─→ 激活状态
-            │   (启用 + 就绪 + 未关闭 + KATO>0)
-            │                         │
-            │                         │ 监测活动信号
-            │                         │ (规则取决于工作模式)
-            │                         ↓
-            └─── 退出条件 ────── [监测间隔]
-                (禁用/未就绪/关闭)      │
-                                       │ 超时期间无有效活动
-                                       ↓
-                                  [超时处理流程]
++-----------------------------+       +-----------------------------+
+|        控制器侧定时器        |       |          主机侧              |
++-----------------------------+       +-----------------------------+
+        |                                       |
+   上电/复位/CC.EN 置 1                         |
+        |                                       |
+   CSTS.RDY = 1, KATO ≠ 0  -->  定时器激活     |
+        |                                       |
+   监控活动信号（命令/Keep Alive）                |
+        |                                       |
+        |        <-- Keep Alive 命令 周期发送 --|
+        |   收到命令/流量   -->  重启定时器      |
+        |                                       |
+   持续 KATT 时间无活动                          |
+        |                                       |
+   CQT 时间内：                                 |
+   1) 写错误日志 (Keep Alive Timeout Expired)   |
+   2) CSTS.CFS = 1 致命状态                      |
+   3) Fabrics: 终止关联/连接                     |
+        |                                       |
+   主机按 communication-loss 恢复流程重试        |
+        +---------------------------------------+
 ```
 
-**说明**：这是一个解释性的状态视图，综合展示了激活条件判断和两种看门狗模式，并非规范中的正式状态图。
+**模式差异**：
 
-**规范参考**：[PDF pp. 147-149](../_source/pages/page-147.md)
+| 模式 | 触发条件 | 重启依据 |
+|------|---------|----------|
+| Command Based（默认）| 收到 Keep Alive 命令并成功完成 | 仅 Keep Alive 命令 |
+| Traffic Based（`TBKAS=1`）| 一个 `KATT` 间隔内取到任意 Admin/I/O 命令 | 任意命令流量 |
 
-## 配置与激活
+## 初学者案例
 
-### 如何配置超时时间
+**场景：RDMA 链路抖动，SSD 是否会自己"认错"？**
 
-主机可以通过以下两种方式设置 `KATO` 值：
+1. 一台服务器的 NVMe-oF 目标通过 RDMA 连接主机。某条链路发生间歇性丢包。
+2. 主机可能毫不知情：本地 TCP 栈还在重传，但 NVMe 控制器一侧已经连续 `KATT` 时长（默认 120 秒）没看到命令。
+3. 控制器立即：
+   - 在 Error Information Log 写一条 "Keep Alive Timeout Expired" 记录
+   - 设置 `CSTS.CFS=1`，停止处理新命令
+   - 对 Fabrics 传输：终止 Association，释放传输连接
+4. 主机的 NVMe 驱动检测到完成队列静默、连接被远端关闭，按"通信丢失"流程重置并重试。
+5. 重试在新的 Association 上重新建立；命名空间和命名空间状态不受影响。
 
-1. **Fabrics Connect**（Fabrics 连接）：在建立 Fabrics 连接时配置
-2. **Set Features 命令**：通过特性设置命令动态配置
+> 关键收获：Keep Alive 把"链路已经死了但双方都不知道"变成"控制器主动宣告死亡并清理状态"，避免主机无限等待一个永远不会来的完成响应。
 
-### 配置规则
+## 必须记住的规则
 
-| 场景 | 行为 | 说明 |
-|------|------|------|
-| 设置值为 0 | 可能被拒绝 | 如果传输协议强制要求 Keep Alive，则无法用 0 禁用 |
-| 设置值超过上限 | 被拒绝 | 返回 "Keep Alive Timeout Invalid" 错误，控制器端的值不变 |
-| 设置值低于下限 | 自动调整 | 非零值会被提升到适用的最小值，然后向上取整到 `KAS` 粒度 |
-| 查询生效值 | Get Features | 使用 Get Features 命令可以获取实际生效的值 |
+| 规则 | 要点 |
+|------|------|
+| KAS 非零才支持 | 控制器只在 `KAS` 通告为非零值时支持 Keep Alive；零值表示不提供 |
+| KATO 单位毫秒 | Set Features 中的 `KATO` 是毫秒，必须为 `KAS` 的整数倍 |
+| 默认值随传输而异 | 不强制该机制的传输默认 0；RDMA/TCP 强制要求 120000 ms |
+| 设置值不可越界 | 低于下限被提升；超过上限返回 "Keep Alive Timeout Invalid" |
+| 激活四条件 | `CC.EN=1` ∧ `CSTS.RDY=1` ∧ `CC.SHN=00b` ∧ `CSTS.SHST=00b` ∧ `KATO≠0` |
+| 致命化超时 | 超时后写错误日志，置 `CSTS.CFS=1`，对 Fabrics 终止 Association |
+| Traffic 模式最坏 `2×KATT` | 命令在检查点后到达时，检测最坏延迟 `2×KATT` |
+| 主机预留 Admin SQ 空间 | 定时器激活期间应为 Keep Alive 命令预留 Admin SQ 槽位 |
 
-**重要提示**：
-- Set Features 命令中的 `KATO` 以**毫秒**为单位
-- 不同传输协议的默认值不同：
-  - 不要求该定时器的传输默认值为 0
-  - RDMA 和 TCP 传输的默认值为 **120,000 ms**（120 秒），会向上取整到 `KAS` 粒度
-  - 其他传输的具体要求由相应的传输绑定规范定义
+## 容易混淆的地方
 
-**规范参考**：[PDF p. 147](../_source/pages/page-147.md), [PDF p. 403](../_source/pages/page-403.md)
+| 容易混 | 实际区别 |
+|--------|----------|
+| KAS vs KATO vs KATT | `KAS` 控制器通告的支持能力；`KATO` 主机配置值；`KATT` 控制器当前生效值 |
+| Command Based vs Traffic Based | 前者只认 Keep Alive 命令；后者认任何命令流量；模式由 `TBKAS` 位决定 |
+| 控制器超时 vs 主机超时 | 控制器超时会置 CFS、写日志；主机超时只需走 communication-loss 流程 |
+| CQT vs KATT | `KATT` 是 Keep Alive 间隔；`CQT`（Completion Queue Timeout）是超时后清理宽限 |
+| `CC.SHN` vs `CSTS.SHST` | `SHN` 是主机发起的关闭通知；`SHST` 是控制器当前的关闭状态 |
 
-### 定时器激活条件
+## 进阶细节
 
-控制器的 Keep Alive 定时器只有在**同时满足**以下所有条件时才会激活：
+- **配置接口**（规范 5.28.1）：仅 Fabrics Connect 与 Set Features 可设置 `KATO`；Get Features 读取生效值。
+- **KAS 粒度**（规范 5.28.2）：所有协议强制 `KAS` 为 `100ms` 的整数倍；非零 `KATO` 必须向上对齐到 `KAS` 倍数。
+- **协议差异**（规范 Figure 87 / 88）：PCIe 默认不要求；RDMA/TCP 默认 120000 ms；其他传输按 TP 规范。
+- **Traffic Based 模式**（规范 5.28.3）：主机侧可强制走 Command Based 风格；控制器端若走 Traffic Based，则命令可能在检查点后到达，造成最坏 `2×KATT` 延迟。
+- **超时清理**（规范 5.28.4）：`CQT` 时长内必须完成"日志 + `CSTS.CFS=1` + 终止 Association"三步；Fabrics 控制器在终止 Association 后允许通过新的 Admin Connect 重建。
+- **与 Keep Alive 命令的关系**：Keep Alive 命令是一个普通 Admin 命令（Opc=18h），其提交/完成都受 Admin 队列仲裁；保持 Admin SQ 至少 1 个槽位空闲是主机责任。
+- **致命化对应用层的影响**：一旦 `CSTS.CFS=1`，现有 I/O 命令不会被完成；驱动必须等命令超时后或经 Controller Reset 重新初始化。
 
-| 寄存器/字段 | 要求值 | 含义 |
-|------------|--------|------|
-| `CC.EN` | 1 | Controller Enable，控制器已启用 |
-| `CSTS.RDY` | 1 | Controller Status Ready，控制器已就绪 |
-| `CC.SHN` | 00b | Shutdown Notification，未处于关闭过程 |
-| `CSTS.SHST` | 00b | Shutdown Status，关闭状态为正常 |
-| 生效的 KATO | 非零 | 配置的超时时间不为 0 |
+## 规范依据
 
-当定时器激活时，会将其初始化为 `KATT` 值。在定时器激活期间，主机应该为 Keep Alive 命令预留 Admin 提交队列（Admin Submission Queue）的空间。
+- [Keep Alive 能力与传输策略，PDF 第 146 页](../_source/pages/page-146.md)
+- [KAS 粒度、配置接口与激活条件，PDF 第 147 页](../_source/pages/page-147.md)
+- [Command Based 模式与主机发送建议，PDF 第 148 页](../_source/pages/page-148.md)
+- [Traffic Based 模式与最坏 `2×KATT` 时序，PDF 第 150 页](../_source/pages/page-150.md)
+- [超时清理、写错误日志与 Fabrics 终止关联，PDF 第 151 页](../_source/pages/page-151.md)
 
-**规范参考**：[PDF p. 147](../_source/pages/page-147.md)
+## 相关阅读
 
-## 工作模式
-
-Keep Alive 支持两种工作模式，由 `TBKAS`（Traffic Based Keep Alive Support）位决定：
-
-### 模式对比
-
-| 特性 | Command Based 模式<br>（基于命令，`TBKAS=0`） | Traffic Based 模式<br>（基于流量，`TBKAS=1`） |
-|------|----------------------------------------|----------------------------------------|
-| **活动证据** | Keep Alive 命令成功完成 | 在一个监测间隔内，控制器获取到任意 Admin 或 I/O 命令 |
-| **控制器截止时间** | 自上次启动/重启后经过 `KATT` 后超时 | 检查连续的 `KATT` 间隔 |
-| **主机发送频率建议** | 按 `KATT/2` 频率发送 | 按 `KATT/4` 频率检查；正常完成的流量可能抑制 Keep Alive |
-| **最坏情况延迟** | 在仅命令规则下约为 `KATT` | 最长 `2 × KATT` |
-
-### Command Based 模式（基于命令）
-
-在这种模式下：
-
-1. **控制器行为**：每当成功完成一个 Keep Alive 命令，或成功完成一个设置非零 KATO 的 Set Features 命令时，控制器会重启定时器
-2. **主机行为**：无论控制器使用哪种模式，主机都可以采用基于命令的行为
-3. **超时检测**：主机应该将"提交 Keep Alive 命令后 `KATT` 时间内未收到完成响应"视为主机端检测到的超时
-
-**规范参考**：[PDF pp. 147-149](../_source/pages/page-147.md)
-
-### Traffic Based 模式（基于流量）
-
-这种模式更加灵活，可以利用正常的命令流量来维持连接：
-
-1. **前提条件**：只有当控制器也使用 Traffic Based 模式时，主机才可以使用这种模式
-2. **监测机制**：
-   - 控制器在每个间隔边界检查是否有命令活动
-   - 如果在当前间隔内获取（fetched）到任何 Admin 或 I/O 命令，则阻止超时并开始新的间隔
-   - 如果没有命令活动，则发生超时
-3. **时序特性**：由于命令可能在检查刚结束后被获取，检测可能延迟到下一次检查，导致最长 `2 × KATT` 的延迟
-
-**规范参考**：[PDF pp. 149-150](../_source/pages/page-149.md)
-
-#### 时序示例
-
-下图展示了 Traffic Based 模式下可能出现的最坏情况：
-
-```text
-检查点 1       最后一条命令      检查点 2                检查点 3
-   |────────── KATT ──────────|────────── KATT ──────────|
-                       ↑ 被获取      ✓ 检测到流量           ✗ 无流量
-                                      继续                   超时
-```
-
-**说明**：这个精简的时序图重建自规范中的 Figure 90，保留了导致最坏情况发生的两个相邻 `KATT` 窗口。当命令在检查点 1 刚过后被获取时，需要等到检查点 2 才能检测到活动，然后在检查点 3 才检测到超时。
-
-**规范参考**：[PDF p. 150](../_source/pages/page-150.md)
-
-## 超时处理
-
-### 控制器端处理流程
-
-当控制器检测到 Keep Alive 超时后，会在 `CQT`（Completion Queue Timeout）时间内执行以下操作：
-
-1. **记录错误**：在 Error Information Log（错误信息日志）中记录一条条目，错误类型为 "Keep Alive Timeout Expired"
-2. **停止处理**：停止命令处理
-3. **设置故障状态**：将 `CSTS.CFS`（Controller Fatal Status，控制器致命状态）设置为 1
-
-### 特殊处理（基于消息的控制器）
-
-对于使用消息传递机制的控制器（如 Fabrics），还会执行额外操作：
-
-- **终止连接**：终止相关关联（Association）的传输连接
-- **断开关联**：断开该关联
-- **重新建立**：之后可以通过新的 Admin Queue Connect 建立新的关联
-
-**规范参考**：[PDF p. 151](../_source/pages/page-151.md)
-
-### 主机端处理建议
-
-如果主机在仍有未完成命令时检测到超时，应该：
-
-1. **遵循通信丢失恢复规则**：按照 communication-loss recovery 的标准流程处理
-2. **谨慎提交依赖命令**：通过另一个控制器提交依赖于先前命令的工作之前，要充分考虑先前的命令可能仍然会与后续命令产生交互
-
-**规范参考**：[PDF pp. 148, 150-151](../_source/pages/page-148.md)
-
-## 与其他功能的关系
-
-### 队列依赖
-
-Keep Alive 机制运行在控制器上，在 Command Based 模式下会使用 Admin Queue（管理队列）来发送 Keep Alive 命令。
-
-**规范参考**：[PDF pp. 146-147](../_source/pages/page-146.md)
-
-### 状态耦合
-
-定时器的激活与控制器的启用（enable）和就绪（readiness）状态紧密耦合，在控制器关闭（shutdown）期间会被抑制。
-
-**规范参考**：[PDF p. 147](../_source/pages/page-147.md)
-
-### 错误处理
-
-控制器检测到的 Keep Alive 超时会成为：
-- **致命状态事件**（fatal-status event）
-- **错误恢复触发点**（error-recovery event）
-- **关联销毁原因**（对于 Fabrics 传输）
-
-**规范参考**：[PDF p. 151](../_source/pages/page-151.md)
-
-## 规范引用
-
-本文档内容基于 NVMe 规范的以下章节：
-
-- [能力标识、传输策略、配置与激活，PDF pp. 146-147](../_source/pages/page-146.md)
-- [Command Based 控制器与主机行为，PDF pp. 147-149](../_source/pages/page-147.md)
-- [Traffic Based 行为与 Figure 90 时序图，PDF pp. 149-150](../_source/pages/page-149.md)
-- [超时清理流程，PDF p. 151](../_source/pages/page-151.md)
+- [controller-enable-shutdown-reset.md](controller-enable-shutdown-reset.md) - CFS/SHN 状态字段联动
+- [communication-loss-and-command-retry.md](communication-loss-and-command-retry.md) - 超时后的通信丢失恢复
+- [controller-initialization.md](controller-initialization.md) - Fabrics 启动与 KAS 配置
+- [asynchronous-event-reporting.md](asynchronous-event-reporting.md) - 关联终止的 AEN 上报

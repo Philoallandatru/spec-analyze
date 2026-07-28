@@ -1,135 +1,141 @@
-# Format NVM 生命周期
+# Format NVM 生命周期（Format NVM Lifecycle）
 
-## 概述
+## 一句话说明
 
-Format NVM 命令用于修改存储介质的格式属性，并可以选择性地执行用户数据擦除（User Data Erase）或加密擦除（Cryptographic Erase）。当该命令成功完成后，之前存储在受影响命名空间（Namespace）中的用户数据将无法被读取。
+Format NVM 是 NVMe 的**命名空间级**格式化命令：它修改介质的 LBA 格式（Format Index）并可选择性地执行用户数据擦除（User Data Erase）或加密擦除（Cryptographic Erase）；它**不是**后台异步操作，命令完成时格式化与擦除（在控制器能力范围内）都已生效。
 
-**规范参考：**[PDF pp. 217-220](../_source/pages/page-217.md)
+## 生活化类比
 
-## 操作流程
+把命名空间想成**一个仓库的标准货架**：
 
-Format NVM 命令的执行流程可以用以下决策模型来理解：
+- **Format NVM** = "把货架按新规格重新画线"
+- **LBA Format** = 货架上每个格子的尺寸（512 字节、4 KiB、…）
+- **User Data Erase** = 把格子里的货全清掉
+- **Cryptographic Erase** = 锁换新的——格子里的货看着还在，但密码变了打不开
+- **FNS / SENS 作用域** = "只画这间办公室"还是"画所有办公室"
+- **NSID = FFFFFFFFh** = "广播：一键全清"——但老板可能禁用（`FNVMBS=1`）
+
+> 与 Sanitize 的关键区别：Format NVM 是**单间办公室**的操作，Sanitize 是**整栋楼**的后台操作。
+
+## 工作流程
 
 ```text
-                    SES = 不擦除          SES = 安全擦除
-                           |                       |
-作用域能力 ----------+-----------------------+
-                           |
-            FNS 选择格式化作用域 / SENS 选择擦除作用域
-                           |
-              NSID 选择单个、已连接集合或子系统集合
-                           ↓
-            [格式化介质 + 可选的安全擦除]
-                           |
-                  操作完成
+                  SES = 000b (无擦除)            SES ≠ 000b (安全擦除)
+                       |                                 |
+                       v                                 v
+                FNS 控制格式作用域                SENS 控制擦除作用域
+                       |                                 |
+                       +--------------+------------------+
+                                      |
+                                      v
+                       NSID 选择：单 NS / 控制器已挂载集合 / 子系统集合
+                                      |
+                                      v
+                       [格式化介质 + 可选擦除] -- 同步/近同步完成
+                                      |
+                                      v
+                                  操作完成
 ```
 
-### 流程说明
+**端到端流程**：
 
-这个决策流程简化了规范中 Figure 188 的渲染逻辑：
+1. 主机发 Format NVM 命令；`NSID` 选择目标（单 NS / `FFFFFFFFh` 广播）。
+2. `SES` 字段决定"是否擦除"以及"擦除类型"；`FNS`/`SENS` 选择"作用域"。
+3. 控制器检查作用域是否合法（多域、PMR、写保护、广播禁用等）。
+4. 控制器执行格式化；若 `SES ≠ 000b` 且能力允许，执行擦除。
+5. CQE 返回成功；新格式由 Identify Namespace 报告。
+6. 期间发到受影响命名空间的新 I/O 可能返回 `Format in Progress`。
 
-- **FNS 字段**：仅在 `SES=000b`（无安全擦除）时生效，用于控制格式化作用域
-- **SENS 字段**：仅在 `SES` 非零时生效，用于控制擦除作用域
+## 初学者案例
 
-**规范参考：**[PDF pp. 218-220](../_source/pages/page-218.md)
+**场景：新装的 SSD 之前用 4 KiB 物理扇区，现在想换成 512 字节模拟怎么办？**
 
-## 作用域规则
+1. 工程师确认该 NS 上没有正在进行的 I/O（否则命令会 `Command Sequence Error`）。
+2. 工具用 `nvme format /dev/nvme0n1 -n 1 -l 0 -s 0`：
+   - `-n 1` = NSID 1
+   - `-l 0` = LBA Format Index 0（512 字节）
+   - `-s 0` = SES 0（无擦除）
+3. 控制器在命令返回时已经把 LBA 切到 512 字节。
+4. 工具用 `nvme id-ctrl /dev/nvme0n1` 看 `LBAFD0` 字段确认是 512。
+5. 上层重新 `mkfs`，I/O 恢复正常。
 
-Format NVM 命令可以作用于不同范围的命名空间，具体由作用域位（Scope Bit）和 NSID 参数共同决定：
+> 注意：若想"格式化的同时把数据彻底擦掉"，用 `nvme format /dev/nvme0n1 -n 1 -s 2`（`SES=2` = Cryptographic Erase）；加密擦除通常比块擦除快得多。
 
-| 作用域位 | NSID 参数值 | 受影响的命名空间范围 |
-|---------|------------|-------------------|
-| 适用作用域位为 `0` | 一个已分配的 NSID | 仅指定的单个命名空间 |
-| 适用作用域位为 `0` | `FFFFFFFFh` | 控制器（Controller）已连接的所有命名空间 |
-| 适用作用域位为 `1` | 已分配的 NSID 或 `FFFFFFFFh` | NVM 子系统（NVM Subsystem）中的所有命名空间 |
+## 必须记住的规则
 
-### 详细说明
+| 规则 | 要点 |
+|------|------|
+| 范围是命名空间级 | Format NVM 影响**所选 NS**；不存在"只擦一个 Endurance Group"的格式 |
+| `SES=000b` 看 `FNS` | 不擦除时由 `FNS` 决定格式作用域；`SENS` 字段不适用 |
+| `SES≠000b` 看 `SENS` | 擦除时由 `SENS` 决定擦除作用域；`FNS` 不适用 |
+| `NSID=FFFFFFFFh` 广播 | 当控制器能力支持（`FNVMBS=0`）时，广播作用域内的所有 NS 都被格式化 |
+| `FNVMBS=1` 禁广播 | 若控制器报告 `FNVMBS=1`，`NSID=FFFFFFFFh` 会被 `Invalid Field in Command` 拒绝 |
+| 空作用域算成功 | 广播作用域内**无** NS 时，命令仍成功完成（不报错） |
+| 多域要谨慎 | 多域子系统分割时，若控制器无法访问目标 NS，命令返回 `Asymmetric Access Inaccessible` 或 `Asymmetric Access Persistent Loss` |
+| 写保护阻断 | 任何受影响 NS 处于写保护 → `Namespace Is Write Protected` |
+| 冲突 I/O 阻断 | 目标 NS 上有进行中 I/O → 命令返回 `Command Sequence Error` |
+| 期间新 I/O | 格式化期间，新到受影响 NS 的 I/O 可能返回 `Format in Progress` |
+| 期间 Admin 白名单缩减 | 格式化期间允许的 Admin 命令集合被临时缩小（参考 5.1.x） |
+| `LBAFU` 受 `LBAFEE` 门控 | 主机未启用 `LBAFEE`（Host Behavior Support）时，`LBAFU` 被忽略 |
+| `SES=001b` vs `010b` | `001b`=User Data Erase（控制器在所有数据已加密时可走加密擦除路径）；`010b`=Cryptographic Erase（必须用密钥擦除） |
+| 完成后 Identify 反映 | 新格式由 Identify Namespace 数据结构（PI/MSET/LBAF）报告 |
+| `LBAFU` 编码 | bits `13:12` 是 LBA Format Upper，与 LBAFL 共同组成 Format Index |
 
-- **适用作用域位**：对于普通格式化操作使用 `FNS` 字段，对于安全擦除使用 `SENS` 字段
-- **广播限制**：如果 `FNVMBS=1`，则禁止使用广播 NSID（`NSID=FFFFFFFFh`）
-- **空作用域处理**：当有效的广播作用域内不包含任何命名空间时，命令会成功完成但不执行任何实际操作
+## 容易混淆的地方
 
-**规范参考：**[PDF pp. 218-219](../_source/pages/page-218.md)
+| 容易混 | 实际区别 |
+|--------|----------|
+| Format NVM vs Sanitize | Format = 命名空间级，同步；Sanitize = 子系统级，后台异步 |
+| Secure Erase vs Sanitize | "Secure Erase" 是 Format 的一个**选项**；"Sanitize" 是独立命令 |
+| `FNS` vs `SENS` | `FNS` 是格式作用域（无擦除时）；`SENS` 是擦除作用域（有擦除时） |
+| `FNS=0` vs `FNS=1` | `FNS=0` 时 `NSID=FFFFFFFFh` 仅覆盖**本控制器**已挂载 NS；`FNS=1` 时覆盖**整个子系统**所有 NS |
+| `SES=001b` User Data Erase | 控制器可"借加密擦除"完成；但规范上仍归类为"User Data Erase" |
+| `SES=010b` Cryptographic Erase | 必须通过删除加密密钥完成；不能只是覆盖 |
+| 广播 vs 单 NS | 广播**只能**用 `FFFFFFFFh`；传其他值是单 NS，不要混淆 |
+| `FNVMBS=1` 含义 | 控制器"禁止广播"——并不代表控制器不支持 Format NVM 本身 |
+| `Format in Progress` vs `Command Sequence Error` | 前者：I/O 在格式化**进行中**到达；后者：Format 命令发现**已有 I/O** 冲突 |
+| `Invalid Format` vs `Invalid Field` | `Invalid Format`=LBA Format Index 不支持；`Invalid Field`=命令字段非法（如广播禁用） |
+| `LBAFU` vs `LBAFL` | `LBAFU` 是 Format Index 的高 2 位（CDW10 bits 13:12）；`LBAFL` 是低 8 位（CDW10 bits 7:0） |
+| 格式化粒度 | 命名空间级 → 可能影响所有挂载它的控制器；但不会改 NVM Set 边界 |
 
-## 安全擦除与格式化字段
+## 进阶细节
 
-### 安全擦除设置（SES）
+- **Figure 188 作用域矩阵**（5.1.x）：
+  - `SES=000b` + `FNS=0` + `NSID=FFFFFFFFh`（仅当 `FNVMBS=0`）→ 本控制器已挂载的所有 NS
+  - `SES=000b` + `FNS=0` + 其他 NSID → 指定单 NS
+  - `SES=000b` + `FNS=1` + 任意 NSID 或 `FFFFFFFFh` → 子系统所有 NS
+  - `SES=001b/010b` + `SENS=0` + `NSID=FFFFFFFFh`（仅当 `FNVMBS=0`）→ 本控制器已挂载的所有 NS（带擦除）
+  - `SES=001b/010b` + `SENS=0` + 其他 NSID → 指定单 NS（带擦除）
+  - `SES=001b/010b` + `SENS=1` + 任意 NSID 或 `FFFFFFFFh` → 子系统所有 NS（带擦除）
+  - 其他组合 → `Invalid Field in Command`
+- **`FNVMBS` / `FNS` / `SENS` 来源**（Figure 312）：均在 Identify Controller 的 `FNA` 字段。
+- **Format NVM CDW10（Figure 189）**：Bits `13:12` = `LBAFU`（2 位）；Bits `07:00` = `LBAFL`（8 位；与 `LBAFU` 共同组成 Format Index）；Bit `09` = `SEST`；其余位是 MSET/PI 等（依 I/O 命令集而定）。
+- **`LBAFEE` 字段**（Host Behavior Support, 5.1.25.1.14）：主机未启用 LBA Format Extension 时 `LBAFU` 被忽略。
+- **LBA Format Index 选取**：Format Index 决定 `LBAFDx`（LBA Format Data Size）、`MSET`/`PI`；具体支持的 Format 由 Identify Namespace 报告。
+- **空作用域处理**（4 种成功组合）：`NSID=FFFFFFFFh` + 任意 `SES`/`FNS`/`SENS` 组合 + 作用域内无 NS → 命令成功完成。
+- **写保护交互**：作用域含任何写保护 NS（8.1.16）→ abort 为 `Namespace Is Write Protected`。
+- **多域交互**：多域子系统分割（3.2.5）+ 控制器不能访问目标 NS → abort 为 `Asymmetric Access Inaccessible` 或 `Asymmetric Access Persistent Loss`。
+- **I/O 命令交互**：
+  - 目标 NS 有 I/O 在执行 → Format NVM 可能被 abort 为 `Command Sequence Error`
+  - Format NVM 在执行时 → 新到受影响 NS 的 I/O 可能被 abort 为 `Format in Progress`
+- **安全规范交互**（如 TCG）：某些安全状态下可能被 abort。
+- **与 Sanitize 的根本区别**：
+  - 范围：Format = NS；Sanitize = Subsystem
+  - 时序：Format = 同步/近同步；Sanitize = 显式后台异步
+  - 监控：Format 无独立进度日志；Sanitize 有 LID `81h`
+- **Cryptographic Erase 可逆性**：用 SES `010b` 删除密钥后，**理论**上密钥恢复即可恢复数据（取决于密钥是否在控制器外部保存）；这是与块擦除的关键差异。
 
-| SES 值 | 操作效果 | 说明 |
-|--------|---------|------|
-| `000b` | 无安全擦除 | 仅执行格式化操作，不擦除数据 |
-| `001b` | 用户数据擦除（User Data Erase） | 控制器可以在所有受影响数据均已加密的情况下使用加密擦除 |
-| `010b` | 加密擦除（Cryptographic Erase） | 通过删除加密密钥使原数据无法恢复 |
+## 规范依据
 
-### 格式化参数
+- [Format 操作边界与固件下载完成的关系，PDF 第 217 页](../_source/pages/page-217.md)
+- [Figure 188：Format 与安全擦除作用域矩阵，PDF 第 218 页](../_source/pages/page-218.md)
+- [Figure 189 起始部分：作用域边界与 LBAFEE 门控，PDF 第 219 页](../_source/pages/page-219.md)
+- [Figure 189 续与 Figure 190：状态描述与 SES 编码，PDF 第 220 页](../_source/pages/page-220.md)
+- [Admin 命令白名单在 Format 期间的变化，PDF 第 192 页](../_source/pages/page-192.md)
 
-命令的格式索引由 `LBAFU` 和 `LBAFL` 字段组合而成：
+## 相关阅读
 
-- **保护信息和元数据字段**：这些字段的具体含义取决于所使用的 I/O 命令集（I/O Command Set）
-- **LBAFU 字段**：当主机行为支持（Host Behavior Support）禁用 LBA 格式扩展（LBA Format Extension）时，`LBAFU` 字段会被忽略
-
-**规范参考：**[PDF pp. 219-220](../_source/pages/page-219.md)
-
-## 并发控制与错误处理
-
-在执行 Format NVM 命令时，需要注意以下并发和错误情况：
-
-### 命令冲突
-
-- **正在进行的 I/O 冲突**：如果有正在进行的 I/O 操作与 Format NVM 命令冲突，Format NVM 命令可能会返回"命令序列错误"（Command Sequence Error）状态
-- **格式化期间的新 I/O**：在格式化过程中，发送到受影响命名空间的新 I/O 命令可能会返回"格式化进行中"（Format in Progress）错误状态
-
-**规范参考：**[PDF pp. 218-219](../_source/pages/page-218.md)
-
-### 多域子系统限制
-
-在分割的多域（Multi-Domain）子系统环境中，如果控制器无法访问所选的命名空间：
-
-- 命令会返回 ANA（Asymmetric Namespace Access，非对称命名空间访问）不可访问状态
-- 或返回持久丢失（Persistent Loss）路径状态
-
-**规范参考：**[PDF p. 218](../_source/pages/page-218.md)
-
-### 常见错误状态
-
-Format NVM 命令可能返回以下错误状态：
-
-| 错误场景 | 返回状态 |
-|---------|---------|
-| 禁用或不支持的格式 | Invalid Namespace or Format（无效的命名空间或格式） |
-| 命名空间处于写保护状态 | Namespace Is Write Protected（命名空间被写保护） |
-| 无效的广播操作 | Invalid Field（无效字段） |
-| 无效的格式参数 | Invalid Format（无效格式） |
-
-**规范参考：**[PDF pp. 219-220](../_source/pages/page-219.md)
-
-## 相关概念与关联
-
-### 与其他命令的交互
-
-- **管理命令限制**：Format NVM 执行期间，会临时缩减允许执行的管理命令（Admin Command）白名单
-- **I/O 命令交互**：格式化过程会影响 I/O 命令的处理流程
-
-**规范参考：**[PDF pp. 192-193, 218-219](../_source/pages/page-192.md)
-
-### 状态查询
-
-- 成功执行 Format NVM 后，新的格式设置会通过 **Identify Namespace** 数据结构上报
-
-**规范参考：**[PDF p. 219](../_source/pages/page-219.md)
-
-### 与 Sanitize 的区别
-
-- **Secure Erase（安全擦除）**：作为 Format NVM 命令的一个选项，用于在格式化时擦除数据
-- **Sanitize（数据清理）**：是一个独立的、更广义的数据清理操作，具有独立的状态机
-
-**规范参考：**[PDF pp. 218-220](../_source/pages/page-218.md)
-
-## 规范证据索引
-
-以下是本文档涉及的规范章节引用：
-
-- [Format 操作边界与固件下载完成，PDF p. 217](../_source/pages/page-217.md)
-- [Figure 188：Format 和安全擦除作用域矩阵，PDF p. 218](../_source/pages/page-218.md)
-- [作用域边界情况与 Figure 189 起始部分，PDF p. 219](../_source/pages/page-219.md)
-- [Figure 189 延续部分与 Figure 190 状态描述，PDF p. 220](../_source/pages/page-220.md)
+- [admin-command-model.md](admin-command-model.md) - Format opcode 在命令表中的位置
+- [capacity-management-operations.md](capacity-management-operations.md) - NS 所属 NVM Set 的容量层级
+- [firmware-update-lifecycle.md](firmware-update-lifecycle.md) - 固件激活与 Format 冲突
+- [command-effects-and-support.md](command-effects-and-support.md) - Format 效果描述符字段

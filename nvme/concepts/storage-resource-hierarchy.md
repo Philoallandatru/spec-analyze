@@ -1,251 +1,94 @@
-# 存储资源层次结构
+# 存储资源层次结构（Storage Resource Hierarchy）
 
-## 概述
+## 一句话说明
 
-NVMe 规范定义了一套完整的存储资源层次结构，用于组织和管理非易失性存储设备中的资源。这个层次结构从顶层的 NVM 子系统（NVM Subsystem）开始，逐层向下细分为域（Domain）、耐久度组（Endurance Group）、NVM 集合（NVM Set）、回收组（Reclaim Group）、回收单元（Reclaim Unit）、介质单元（Media Unit）以及最终的命名空间（Namespace）。
+NVMe 用一套从"子系统→域→耐久度组→底层介质单元→命名空间"的层级，把物理介质切成不同维度的"格子"，每个格子负责一个关注点：共享状态、寿命管理、数据放置、可寻址卷。
 
-这些概念分别从不同的维度描述存储资源：
-- **包含关系**：资源之间的层级归属
-- **耐久度管理**：存储介质的寿命和磨损管理
-- **资源分配**：存储空间的划分和分配
-- **数据放置**：数据在物理介质上的存放位置
+## 生活化类比
 
-> 参考规范：[PDF pp. 46-51](../_source/pages/page-046.md)
+把一台 NVMe SSD 想成一座**大型自动化仓库**：
 
----
+- **仓库大楼** = NVM 子系统（一个所有权、一次购电）
+- **楼层** = 域（同一层共享电源、容量信息）
+- **温区** = 耐久度组（同温区一起做温度/寿命管理）
+- **货架** = 介质单元（实际的闪存芯片）
+- **货位编号** = 命名空间（对外可订可取的标准位）
 
-## 层次结构示意图
+仓库管理员有两种摆货方式：
+- **NVM 集方式**：每张订单（命名空间）固定分配到一排货架，搬动少、规则简单。
+- **回收组方式**：订单可以分散到仓库里的多个回收篮（回收单元），工人按"放置句柄"动态决定这次塞哪个篮子——这就是灵活数据放置（FDP）。
 
-为了便于理解各个概念之间的关系，我们用树形结构展示完整的资源层次：
+## 工作流程
 
 ```text
 NVM 子系统 (NVM Subsystem)
-└── 域 (Domain)
-    └── 耐久度组 (Endurance Group)
-        ├── 介质单元 (Media Unit) - 一个或多个
-        └── 组织方式（二选一）
-            ├── 方式一：NVM 集合 (NVM Set)
-            │   └── 命名空间 (Namespace) - 每个命名空间恰好属于一个 NVM Set
-            └── 方式二：回收组 (Reclaim Group)
-                └── 回收单元 (Reclaim Unit)
-                    └── 命名空间 (Namespace) - 可跨越同一 EG 内的多个 RU
+  └─ 域 (Domain)
+       └─ 耐久度组 (Endurance Group)        ← 寿命 / 磨损管理边界
+            ├─ 介质单元 (Media Unit)        ← 物理闪存芯片
+            └─ 二选一组织方式：
+                 ├─ 方式 A：NVM 集 (NVM Set)
+                 │     └─ 命名空间 (Namespace)   每个 NS 恰好属于一个 NVM Set
+                 └─ 方式 B：回收组 (Reclaim Group)
+                       └─ 回收单元 (Reclaim Unit)
+                             └─ 命名空间 (Namespace)   跨多个 RU 分布
 ```
 
-### 重要说明
+简化说明：图中每条 "└─" 都表示"恰好属于一个"；同一耐久度组不会同时混用两种方式。
 
-1. **互斥的组织方式**：一个耐久度组（Endurance Group）要么采用 NVM Set 方式组织，要么采用 Reclaim Group 方式组织，两者不能同时存在于同一个耐久度组中。
+## 初学者案例
 
-2. **图例来源**：此图是基于 NVMe 规范 Figures 11-15 的解释性重构，已与规范 PDF 第 47-51 页的渲染内容进行核对验证。
+**场景：采购方问"为啥这款企业级 SSD 比消费级贵？"**
 
-> 参考规范：[PDF pp. 46-51](../_source/pages/page-046.md)
+1. 消费级 SSD 内部：1 子系统 → 1 域 → 1 耐久度组 → 1 NVM 集 → 1 命名空间，资源整块使用，无需对外报告多 EG / 多 NVM Set。
+2. 企业级 SSD 内部：1 子系统 → 多域 → 多耐久度组 → 多个 NVM 集或回收组 → 多个命名空间，可按租户/业务切分容量、隔离故障。
+3. 故障速查：若主机 `nvme list-ctrl` 看不到多个控制器，多半是设备把资源都收编到一个域/EG 里——并非故障，而是产品定位。
 
----
+## 必须记住的规则
 
-## 核心概念解析
-
-### 1. NVM 子系统 (NVM Subsystem)
-
-NVM 子系统是整个存储资源层次的最顶层，代表一个完整的 NVMe 存储设备或存储控制器。一个子系统可以包含一个或多个域。
-
-### 2. 域 (Domain)
-
-域是共享特定状态信息的最小不可分割单元。同一个域内的资源共享：
-- 电源状态 (Power State)
-- 容量信息 (Capacity Information)
-- 其他管理属性
-
-### 3. 耐久度组 (Endurance Group)
-
-耐久度组将具有相似耐久度特性的存储介质划分在一起，用于统一管理介质的寿命和磨损情况。一个耐久度组可以包含：
-- 一个或多个介质单元（Media Unit）
-- 一种组织方式：NVM Set 或 Reclaim Group
-
-### 4. 介质单元 (Media Unit)
-
-介质单元是底层存储介质的组成部分。耐久度组由一个或多个介质单元构成，代表实际的闪存芯片或其他非易失性存储硬件。
-
-### 5. 命名空间 (Namespace)
-
-命名空间是主机可见的逻辑存储卷，类似于传统存储中的逻辑分区或 LUN。主机通过命名空间进行数据读写操作。
-
----
-
-## 资源关系与约束规则
-
-### 基本关系表
-
-| 关系 | 规则说明 |
-|------|----------|
-| **Domain → NVM Subsystem** | 每个域必须属于且仅属于一个 NVM 子系统 |
-| **Endurance Group → Domain** | 每个耐久度组属于一个域 |
-| **NVM Set → Endurance Group** | 每个 NVM Set 属于一个耐久度组 |
-| **Namespace in NVM Set** | 在 NVM Set 组织方式下，每个命名空间恰好属于一个 NVM Set |
-| **Reclaim Group → Endurance Group** | 每个回收组属于一个耐久度组 |
-| **Namespace in Reclaim Group** | 在 Reclaim Group 组织方式下，命名空间属于一个耐久度组，并占用该组内若干回收组中的一个或多个回收单元 |
-
-> 参考规范：[PDF p. 46](../_source/pages/page-046.md)
-
-### 可选特性
-
-以下特性在 NVMe 规范中都是**可选实现**的：
-
-1. **多个耐久度组** (Multiple Endurance Groups)
-2. **多个 NVM Set** (Multiple NVM Sets)  
-3. **回收组机制** (Reclaim Groups)
-
-**实现说明**：
-- 供应商可以根据产品定位选择实现哪些特性
-- 客户可以根据需要进行配置或重新配置
-- 命名空间的创建和删除是最常见的动态配置操作
-- 如果设备不支持多个 NVM Set 或多个 Endurance Group，则无需在管理接口中报告这些实体
-
-> 参考规范：[PDF p. 51](../_source/pages/page-051.md)
-
----
-
-## 两种组织方式对比
-
-耐久度组内部可以采用两种不同的资源组织方式：
-
-### 方式一：基于 NVM Set 的组织
-
-| 特性 | 说明 |
+| 规则 | 要点 |
 |------|------|
-| **适用场景** | 传统的命名空间管理方式 |
-| **命名空间归属** | 每个命名空间恰好属于一个 NVM Set |
-| **资源隔离** | 通过 NVM Set 实现资源分组和隔离 |
-| **灵活性** | 相对固定的资源分配 |
+| 包含关系方向 | Domain ⊂ Subsystem；EG ⊂ Domain；NVM Set ⊂ EG；Namespace ⊂ NVM Set 或 EG（视方式而定） |
+| 互斥的组织方式 | 一个耐久度组内要么是 NVM Set 方式，要么是 Reclaim Group 方式，二选一 |
+| 命名空间归属 | NVM Set 方式下每个 NS 恰好属于一个 NVM Set；Reclaim Group 方式下每个 NS 恰好属于一个 EG、占用若干 RU |
+| 可选实体 | 多个 EG、多个 NVM Set、Reclaim Group 机制均为可选，不支持时不需要报告 |
+| 介质单元归属 | 每个 Media Unit 恰好属于一个耐久度组 |
+| 共享状态边界 | 同一 Domain 内共享电源状态、容量信息等管理属性 |
+| 命名空间生命周期 | 创建/删除命名空间是最常见的动态配置操作 |
 
-### 方式二：基于 Reclaim Group 的组织
+## 容易混淆的地方
 
-| 特性 | 说明 |
-|------|------|
-| **适用场景** | 灵活数据放置 (Flexible Data Placement, FDP) |
-| **命名空间归属** | 命名空间可以跨越多个回收单元 (Reclaim Unit) |
-| **数据放置** | 主机每次写入时可以指定目标回收组 |
-| **灵活性** | 高度灵活的数据放置控制 |
-| **回收管理** | 支持细粒度的垃圾回收和空间回收 |
+| 容易混 | 实际区别 |
+|--------|----------|
+| Domain vs Endurance Group | Domain 划的是"共享状态/电源"边界；EG 划的是"磨损/寿命管理"边界 |
+| NVM Set vs Reclaim Group | NVM Set 是"分块管理容量"的逻辑池；Reclaim Group 是"按写入分散数据"的回收单位 |
+| Media Unit vs NVM Set | Media Unit 是物理芯片；NVM Set 是逻辑容量池 |
+| Namespace vs NVM Set | Namespace 是主机可寻址的逻辑卷；NVM Set 是它的物理/逻辑归属 |
+| EG 方式 A vs EG 方式 B | 方式 A 把 NS 钉死在 NVM Set 上；方式 B 让 NS 跨多个 RU 分布，支撑 FDP |
 
-> **关键区别**：在 Reclaim Group 组织方式下，主机的每次写入操作都可以决定数据写入到哪个回收组，这使得同一个命名空间的数据可以分散在多个回收组中（但仍然位于同一个耐久度组内）。
+## 进阶细节
 
-> 参考规范：[PDF pp. 48-51](../_source/pages/page-048.md)
+- **规范 2.3.1 实体清单**（PDF 第 46 页）：NVM Subsystem、Domain、Endurance Group、Reclaim Group、Reclaim Unit、NVM Set、Namespace、Media Unit。
+- **包含关系**（规范 2.3.1）：
+  - 每个 Domain ⊂ 1 个 NVM Subsystem；
+  - 每个 EG ⊂ 1 个 Domain；
+  - EG 内可包含一个或多个 NVM Set，或一个或多个 Reclaim Group（二选一）；
+  - NVM Set 方式：每个 NVM Set ⊂ 1 个 EG，每个 NS ⊂ 1 个 NVM Set；
+  - Reclaim Group 方式：每个 Reclaim Group ⊂ 1 个 EG，每个 Reclaim Unit ⊂ 1 个 Reclaim Group，每个 NS ⊂ 1 个 EG 内的若干 RU；
+  - 每个 Media Unit ⊂ 1 个 EG。
+- **可选特性的报告义务**（规范 2.3.1）：不支持多 NVM Set 的子**系统不需要**报告 NVM Set；不支持多 EG 的子系统不需要报告 EG——"不存在即可不报"。
+- **Figure 11-15 示例图**：规范用 Figure 11（最简）→ Figure 15（多域多 EG 多 Reclaim Group 的复杂形态）展示层级膨胀，命名约定 "Abc" 中 A=Domain、b=EG、c=Reclaim Group。
+- **设计原则**：把"共享状态"（Domain）、"寿命管理"（EG）、"可寻址"（Namespace）拆成不同实体，而不是把多种语义混在一个标签里。
 
----
+## 规范依据
 
-## 实体定义与边界
+- [存储实体与包含规则，PDF 第 46 页](../_source/pages/page-046.md)
+- [复杂层次结构示例 Figure 15，PDF 第 51 页](../_source/pages/page-051.md)
+- [简单层次结构示例 Figures 11-12，PDF 第 47 页](../_source/pages/page-047.md)
 
-下表总结了各个实体的定义边界和职责范围：
+## 相关阅读
 
-| 实体 | 定义边界 |
-|------|----------|
-| **Domain（域）** | 共享状态（如电源状态和容量信息）的最小不可分割单元 |
-| **Endurance Group（耐久度组）** | 子系统中作为一个整体进行耐久度管理的非易失性存储部分 |
-| **Media Unit（介质单元）** | 底层介质的组成部分；耐久度组由介质单元构成 |
-| **Exported NVM Resources（导出的 NVM 资源）** | 用于远程访问的导出 NVM 子系统、导出命名空间和导出端口 |
-
-**设计原则**：这些定义将不同的关注点清晰地分离开来：
-- **共享状态管理**（通过 Domain）
-- **耐久度管理**（通过 Endurance Group）
-- **远程访问能力**（通过 Exported Resources）
-
-而不是将它们作为可互换的包含标签来对待。
-
-> 参考规范：[PDF p. 30](../_source/pages/page-030.md)
-
----
-
-## 灵活数据放置 (FDP) 机制详解
-
-### 放置间接性：从主机到物理单元
-
-在启用灵活数据放置（Flexible Data Placement, FDP）功能时，数据放置通过一套间接映射机制实现：
-
-**术语对照**：
-- **Placement Handle**：放置句柄，主机用于指定数据放置位置的标识符
-- **Reclaim Unit Handle**：回收单元句柄，控制器用于管理回收单元的内部标识符
-- **Reclaim Group Identifier**：回收组标识符
-- **Placement Identifier**：放置标识符 = 回收组标识符 + 放置句柄
-
-### 映射机制
-
-```text
-主机侧：命名空间作用域
-    ↓
-Placement Handle (放置句柄)
-    ↓
-控制器侧：耐久度组作用域
-    ↓
-Reclaim Unit Handle (回收单元句柄)
-    ↓
-在每个回收组中引用一个具体的回收单元
-```
-
-**工作原理**：
-1. 主机在写入命令中指定一个放置句柄（Placement Handle）
-2. 放置句柄映射到耐久度组作用域的回收单元句柄（Reclaim Unit Handle）
-3. 该回收单元句柄在每个回收组中各自引用一个回收单元
-4. 通过组合回收组标识符和放置句柄，形成完整的放置标识符（Placement Identifier），最终定位到具体的回收单元
-
-> 参考规范：[PDF pp. 32, 34](../_source/pages/page-032.md)
-
-### 动态重定向机制
-
-假设一个耐久度组包含：
-- **P** 个回收组 (Reclaim Group)
-- **N** 个回收单元句柄 (Reclaim Unit Handle)
-
-**约束条件**：
-- 每个回收单元句柄在每个回收组中引用恰好一个回收单元
-- 同一时刻，一个回收单元最多被一个句柄引用
-- 当被引用的回收单元写满后，控制器自动将该句柄重定向到一个空闲的回收单元
-
-**重定向示意图**：
-
-```text
-回收单元句柄 h
-   ├── 回收组 0 → 一个可写的回收单元
-   ├── 回收组 1 → 一个可写的回收单元
-   └── 回收组 P-1 → 一个可写的回收单元
-                        │
-                   写满 / 退役
-                        ↓
-                  自动重定向到空闲单元
-```
-
-**生命周期管理**：
-- 回收单元写满后进入"已满"或"已退役"状态
-- 控制器将句柄重定向到新的空闲回收单元
-- 原回收单元经过擦除后可以再次使用
-- 再次使用时可能分配给同一个句柄，也可能分配给不同的句柄（取决于后续的擦除/使用周期）
-
-> **说明**：此图是基于规范 Figure 70 的解释性重构，保留了跨回收组的间接映射关系，已与规范 PDF 第 104 页核对验证。
-
-> 参考规范：[PDF pp. 103-104](../_source/pages/page-103.md)
-
----
-
-## 规范引用索引
-
-本文档内容基于 NVMe 规范的以下章节：
-
-| 主题 | 规范页码 | 链接 |
-|------|----------|------|
-| 实体列表与包含规则 | PDF p. 46 | [page-046](../_source/pages/page-046.md) |
-| 简单与复杂层次结构示例 | PDF pp. 47-51 | [page-047](../_source/pages/page-047.md) |
-| Domain、Endurance Group 与导出资源定义 | PDF p. 30 | [page-030](../_source/pages/page-030.md) |
-| Media Unit 与数据放置定义 | PDF pp. 32, 34 | [page-032](../_source/pages/page-032.md) |
-| FDP 回收组、回收单元句柄与重定向规则 | PDF pp. 103-104 | [page-103](../_source/pages/page-103.md) |
-
----
-
-## 总结
-
-NVMe 存储资源层次结构通过多层抽象，为存储管理提供了灵活且精细的控制能力：
-
-1. **顶层抽象**：NVM 子系统和域提供了设备级和状态共享的边界
-2. **耐久度管理**：耐久度组将具有相似寿命特性的介质组织在一起
-3. **灵活组织**：支持 NVM Set 和 Reclaim Group 两种组织方式，满足不同应用场景
-4. **精细控制**：在 FDP 模式下，主机可以精确控制数据的物理放置位置
-5. **动态管理**：支持命名空间的动态创建、删除和配置调整
-
-理解这个层次结构是深入掌握 NVMe 规范的基础，也是进行高级存储管理和优化的前提。
+- [NVM 集与耐久度组](nvm-sets-and-endurance-groups.md) - EG/Set 子层详解
+- [NVM 容量模型](nvm-capacity-model.md) - 容量按层级分配
+- [控制器虚拟化资源](controller-virtualization-resources.md) - 多控制器资源虚拟化
+- [域与分区](domains-and-divisions.md) - 域与分区的细节
+- [NVM 子系统](nvm-subsystem.md) - 顶层子系统定义

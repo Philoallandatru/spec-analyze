@@ -1,41 +1,92 @@
-# Data Representation
+# 数据表示（Data Representation）
 
-Revision 2.1 defines conventions for encoded counts, units, strings, numeric notation, and byte ordering. Values are 1-based unless a field is explicitly described as 0's based; a 0's-based encoded value `n` represents the quantity `n + 1` and cannot represent zero. [PDF p. 25](../_source/pages/page-025.md)
+## 一句话说明
 
-## Mental model
+NVMe 规范定义了一套统一的"数字怎么写、字节怎么排、字符串怎么填"的约定，让主机和控制器在解析命令、寄存器、日志时不会因为格式不同产生歧义。
 
-Explanatory little-endian dword view, reconstructed from Figure 3:
+## 生活化类比
+
+把规范想象成**物流行业的包装标准**：
+
+- **十六进制后缀 `h` / 二进制后缀 `b`** = 包裹上贴的"易碎品""液体"标签，告诉搬运工"这个数字别用十进制读"。
+- **小端字节序** = 快递单上的"门牌号从右往左读"：先写的字段放在内存高字节，后写的放在低字节，控制器和主机必须约定同一套阅读顺序。
+- **1-based 计数 + 0's based 编码** = 货架上"第 0 号货架"实际是"第 1 个货架"：编码 0 表示数量 1，永远没有"数量 0"这种状态——NVM 没有"零长度块"这种说法。
+- **ASCII/UTF-8 + 空格右补** = 物品清单必须用通用字符写，写不满的位置用空格填齐，跨语言扫描仪才能正确识别。
+
+## 工作流程
 
 ```text
-bit 31                         bit 0
-+--------+--------+--------+--------+
-| byte 3 | byte 2 | byte 1 | byte 0 |
-+--------+--------+--------+--------+
-   MSB                         LSB
+  主机内存/寄存器里的一个 dword（32 位）按小端排列：
+
+  bit 31                         bit 0
+  +--------+--------+--------+--------+
+  | byte 3 | byte 2 | byte 1 | byte 0 |   <-- 一个 dword = 4 字节
+  +--------+--------+--------+--------+
+     MSB                         LSB
+
+  读取顺序：先 byte 0（最低地址），最后 byte 3
+  字 = 2 字节，双字（dword）= 4 字节，四字（qword）= 4 个字
+  没有特别说明时，所有多字节结构都按这个顺序解释
 ```
 
-Unless a structure says otherwise, multi-byte data is little-endian; a word is two bytes, a dword is four bytes, and a qword is four words. [PDF p. 27, Figure 3](../_source/pages/page-027.md)
+## 初学者案例
 
-## Numeric and unit conventions
+**场景：日志页里看到 `80h` 到底是什么意思？**
 
-| Form | Convention | Example |
-|---|---|---|
-| Hexadecimal | lower-case `h` suffix; underscore each eight digits when longer | `80h`, `1E_DEADBEEFh` |
-| Binary | lower-case `b` suffix; underscore each four digits when longer | `10b`, `1000_0101b` |
-| Decimal | digits with neither suffix; period decimal separator | `175`, `1.5` |
-| Decimal units | `k`, `M`, `G`, ... use powers of 10 | `k = 10^3` |
-| Binary units | `Ki`, `Mi`, `Gi`, ... use powers of 2 | `Ki = 2^10` |
+1. 你用 `nvme get-log` 拉了一个控制器属性日志，看到字段值 `80h`。
+2. 看到后缀 `h` 就知道：**这是十六进制**，等价于十进制 128；如果写成 `1000_0000b` 则等价二进制。
+3. 这时候字段宽度是 1 字节，按小端读就是 1 个字节 `0x80`，没歧义。
+4. 但如果读到 32 位寄存器值 `0000_0080h`，别误以为是"位 7 翻转"——其实**字节 0 = 0x80**，字节 1~3 都是 0。
+5. 当字段描述说"0's based"时，要给数字 +1：编码 `0h` 表示 1 个，`1h` 表示 2 个，**不能表示 0**。
 
-The complete decimal/binary unit table extends through `Y = 10^24` and `Yi = 2^80`. [PDF pp. 25-26, Figure 2](../_source/pages/page-025.md) [PDF p. 26](../_source/pages/page-026.md)
+> 排错提示：日志里数字"差 1"或"少 1"，先看是不是 0's based 编码，少算了一个 1。
 
-## String rules
+## 必须记住的规则
 
-ASCII strings use code values `20h` through `7Eh`; UTF-8 strings use `20h` through `7Eh`, `80h` through `BFh`, and `C2h` through `F4h`. Both are left justified and, unless null-terminated, padded on the right with spaces. Padding after a null-terminated string should use null bytes. [PDF pp. 25-26](../_source/pages/page-025.md) [PDF p. 26](../_source/pages/page-026.md)
+| 规则 | 要点 |
+|------|------|
+| 默认字节序 | 多字节结构小端，最低有效字节在最低地址 |
+| 计数默认 | 1-based；标"0's based"的字段编码 `n` 代表 `n+1`，不能为 0 |
+| 十六进制写法 | 小写 `h` 后缀，超过 8 位每 8 位加下划线，如 `1E_DEADBEEFh` |
+| 二进制写法 | 小写 `b` 后缀，超过 4 位每 4 位加下划线，如 `1000_0101b` |
+| 十进制写法 | 无后缀，小数点 `.`，如 `175`、`1.5` |
+| 十进制单位 | `k/M/G/.../Y` = 10^3 起跳，`k = 10^3` |
+| 二进制单位 | `Ki/Mi/Gi/.../Yi` = 2^10 起跳，`Ki = 2^10` |
+| 单位上界 | 十进制到 Y（10^24），二进制到 Yi（2^80） |
+| 字符串字符集 | ASCII：`20h-7Eh`；UTF-8：`20h-7Eh`、`80h-BFh`、`C2h-F4h` |
+| 字符串对齐 | 左对齐；非 null 终止的字符串右侧用空格（`20h`）填充；null 终止后用 `00h` 填充 |
 
-An admin label applies one of those string forms to identify a host, NVM subsystem, or namespace, for example by physical location or DNS name. [PDF pp. 27-28](../_source/pages/page-027.md) [PDF p. 28](../_source/pages/page-028.md)
+## 容易混淆的地方
 
-## Evidence
+| 容易混 | 实际区别 |
+|--------|----------|
+| `80h` vs `0x80` | 规范用后缀 `h`/`b`；`0x` 是 C 风格前缀，规范中不出现 |
+| `1KB` vs `1KiB` | `KB`（十进制）= 1000；`KiB`（二进制）= 1024；规范严格区分 |
+| 1-based vs 0's based | 1-based：编码就是数值；0's based：编码 n 表示 n+1 |
+| ASCII 字符串 vs UTF-8 字符串 | ASCII 限制更严（仅 20h-7Eh）；UTF-8 多字节序列允许 80h-F4h |
+| 空格填充 vs null 填充 | 非 null 终止串用空格（20h）；null 终止串的尾巴用 00h |
+| 小端 vs 大端 | NVMe 几乎所有结构都是小端；网络字节序（大端）只在特定 fabrics 字段出现 |
 
-- [Encoded counts, units, and ASCII rules, PDF p. 25](../_source/pages/page-025.md)
-- [UTF-8, padding, and numeric notation, PDF p. 26](../_source/pages/page-026.md)
-- [Byte/word/dword layout and admin labels, PDF p. 27](../_source/pages/page-027.md)
+## 进阶细节
+
+- **dword 与 qword 定义**（规范 1.4.3）：一个 word = 2 字节；一个 dword = 2 个 word（4 字节）；一个 qword = 2 个 dword（8 字节）。
+- **位编号方向**（规范 Figure 3）：位 0 = LSB，位 31（dword）或位 63（qword）= MSB。
+- **单位表 Figure 2**（规范 1.4.2）：从 `k`（10^3）到 `Y`（10^24），`Ki`（2^10）到 `Yi`（2^80），一一对应，**不可混用**。
+- **0's based 的典型用法**：块大小、队列条目数、最大数据传输大小等"至少 1"的字段常用 0's based 编码以省一个 bit。
+- **reserved 字段**（规范 1.4.1.6）：保留位 / 字节 / 字段必须清 0；接收方不必检查，写入保留值结果未定义。
+- **字符串场景**：管理标签（admin label）可携带主机、命名空间、子系统的位置或 DNS 名，必须遵循上述字符串规则。
+
+## 规范依据
+
+- [数字描述与 0's based 定义，PDF 第 25 页](../_source/pages/page-025.md)
+- [Figure 2 十进制/二进制单位表，PDF 第 25 页](../_source/pages/page-025.md)
+- [UTF-8 字符集与字符串填充规则，PDF 第 26 页](../_source/pages/page-026.md)
+- [字节/字/双字布局 Figure 3，PDF 第 27 页](../_source/pages/page-027.md)
+- [管理标签 admin label 定义，PDF 第 28 页](../_source/pages/page-028.md)
+
+## 相关阅读
+
+- [common-command-format.md](common-command-format.md) - 16 字节命令格式规范
+- [data-pointer-layouts.md](data-pointer-layouts.md) - PRP/SGL 数据指针布局
+- [common-controller-features.md](common-controller-features.md) - 控制器寄存器使用约定
+- [namespace-identifiers.md](namespace-identifiers.md) - NSID 的数据格式规范

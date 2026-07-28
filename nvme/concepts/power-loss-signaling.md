@@ -1,231 +1,156 @@
 # 断电信号机制（Power Loss Signaling）
 
-## 概述
+## 一句话说明
 
-断电信号机制（Power Loss Signaling，简称 PLS）是 NVMe 规范中一项重要的电源管理功能，作用范围覆盖整个 Domain（域）。该机制基于 PCIe 的能力实现，允许系统在电源即将断开时提前通知控制器（Controller），从而为数据保护争取宝贵时间。
+断电信号机制（Power Loss Signaling, PLS）是 NVMe 在 PCIe 上提供的"提前预警"能力：当系统检测到电源即将断开时，通过断言 PLN（Power Loss Notification）信号通知控制器；控制器在 Domain 范围内统一选择"强制静默（FQ）"或"紧急断电（EPF）"模式，在断电前完成数据保护工作。
 
-**工作原理：**
-- **传输层（Transport）** 通过断言（assert）**断电通知信号（Power Loss Notification，PLN）** 来告知即将发生的电源损失
-- **控制器（Controller）** 可选择性地暴露**断电应答信号（Power Loss Acknowledge，PLA）** 来响应此通知
-- **域配置（Domain Configuration）** 决定采用以下三种操作模式之一：
-  - 强制静默模式（Forced Quiescence，FQ）
-  - 紧急断电模式（Emergency Power Fail，EPF）
-  - 禁用 PLS 功能
+## 生活化类比
 
-> 规范参考：[PDF pp. 615-616](../_source/pages/page-615.md)
+把 Domain 内的控制器们想成**一群收银员**：
 
----
+- **商场断电预警广播** = PLN 信号
+- **收银员按商场规则处理**：
+  - **FQ 模式** = 收银员把手头的单子结完，暂停接新单（但收银机还亮着）
+  - **EPF 模式** = 收银员把手头的单子直接丢进保险箱（数据保护），可以关闭收银机
+- **两种 EPF 子模式**：
+  - **端口保持启用** = 收银机屏幕还亮，管理员可远程看进度或下发命令
+  - **端口禁用** = 收银机彻底关屏，只能等下次市电恢复
+- **断电后再次上电** = 收银员上班，先做"恢复"工作（vault 保护 + recovery）
 
-## 状态转换模型
+> 关键：所有收银员（Domain 内所有控制器）必须听同一份规则——同一时刻要么全 FQ、要么全 EPF，绝不能各行其是。
 
-下图展示了 PLS 机制的完整状态流转过程，帮助理解系统在不同情况下的行为：
+## 工作流程
 
 ```text
-上电 / 复位 / 关机事件
-         |
-         v
-   [PLS 未就绪状态]
-   (PLS Not Ready)
-         |
-         | SHST=00b (正常工作状态)
-         v
-    [PLS 就绪状态]
-    (PLS Ready)
-         |
-         | 检测到断电信号 PLN + 根据配置选择模式
-         |
-         +------------------------+------------------------+
-         |                        |                        |
-         v                        v                        v
-   [FQ 处理中]            [EPF 处理中]              [EPF 处理中]
- (Forced Quiescence)      端口保持启用             端口已禁用
-         |                        |                        |
-         |                        v                        v
-         v                 [EPF 完成状态]           [EPF 完成状态]
-   [FQ 完成状态]            端口保持启用             端口已禁用
-         |                        |                        |
-   解除 PLN 信号                   |                        |
-         |                        v                        v
-         |                   复位或关机               需要重新上电
-         v                  返回未就绪状态              才能恢复
-   返回 PLS 就绪
+   上电 / 复位 / 关机事件
+            |
+            v
+      [PLS Not Ready]
+            |
+            | SHST=00b (正常)
+            v
+      [PLS Ready]  <----------+
+            |                |
+            | PLN asserted   | 解除 PLN
+            | 选择 FQ / EPF  | 复位/重上电
+            v                |
+    +-------+-------+--------+----+
+    |               |             |
+    v               v             v
+ [FQ 处理中]   [EPF 处理中]   [EPF 处理中]
+ (端口保持启用)  (端口保持启用) (端口禁用)
+    |               |             |
+    v               v             v
+ [FQ Complete] [EPF Complete]  [EPF Complete]
+    |            (端口保持启用)    (端口禁用)
+    +--> 解除 PLN, 回到 Ready  |   |
+                              v   v
+                          复位/重上电 只能重上电
+                          回到 Not    才能恢复
+                          Ready
 ```
 
-**关键说明：**
-- 该状态机保留了规范图 660 中互斥的 EPF 端口分支设计，以及复位/重新上电的返回路径
-- 每次上电循环后，所有状态都会返回到"PLS 未就绪"状态
-- 执行控制器复位或关机操作（非零 `CSTS.SHST` 值）时，已启用端口的 FQ 状态也会返回到"未就绪"状态
+**两种模式对比**：
 
-> 规范参考：[PDF pp. 617-620](../_source/pages/page-617.md)
+| 维度 | FQ（强制静默）| EPF（紧急断电）|
+|------|--------------|----------------|
+| 已取命令 | 完成或中止 | 直接丢弃 |
+| 端口通信 | 保持 | 可保持 或 禁用 |
+| 后台操作 | 挂起 | 丢弃 |
+| 断电恢复 | 解除 PLN 即可 | 披露恢复时长 |
+| 退出方式 | 解除 PLN / 复位 | 复位 / 关机 / 重上电 |
 
----
+## 初学者案例
 
-## 信号定义与支持要求
+**场景：机房 UPS 即将耗尽，NVMe SSD 怎么自保？**
 
-### 核心信号说明
+1. UPS 控制器检测到电池快用完，向 PCIe 链路断言 PLN。
+2. 同一 Domain 内的所有 NVMe 控制器收到 PLN，根据之前保存的配置选择模式。
+3. **如果配的是 FQ**：
+   - 控制器停止从队列取新命令
+   - 把手头正在处理的写命令完成或中止
+   - 把需要的数据保护信息（vault）写入非易失存储
+   - 完成后解除 PLA 信号，PCIe 端口仍正常工作
+4. **如果配的是 EPF（端口禁用）**：
+   - 直接丢弃已取命令和管理端点命令
+   - 写入 vault
+   - 关闭 PCIe 端口通信
+   - 此时主机已无法下发任何命令
+5. 市电恢复后，控制器在 CQE 中披露 EPF recovery 间隔；命名空间初始化时可能尚未完全恢复。
+6. 驱动层应根据此报告延迟挂载数据敏感型命名空间。
 
-| 信号名称 | 设置方 | 含义说明 |
-|---------|--------|---------|
-| **PLN = Asserted**<br>（断电通知已断言） | NVMe 传输层<br>(NVMe Transport) | 系统检测到电源即将断开，<br>发出预警通知 |
-| **PLA = Asserted-EPF-Enabled**<br>（断电应答-EPF启用） | 控制器<br>(Controller) | 控制器已激活 EPF 模式，<br>PCIe 端口通信继续进行 |
-| **PLA = Asserted-EPF-Disabled**<br>（断电应答-EPF禁用） | 控制器<br>(Controller) | 控制器已激活 EPF 模式，<br>PCIe 端口通信已停止 |
+> 关键收获：PLS 不是"断电保护"本身，而是"在真正断电前，给控制器若干毫秒或数秒完成保护动作"。
 
-**信号复位规则：**
-- 执行控制器级别复位（Controller Level Reset）后，`PLN` 和 `PLA` 两个信号都会被重置为未断言（Deasserted）状态
+## 必须记住的规则
 
-### 支持要求与约束
+| 规则 | 要点 |
+|------|------|
+| 作用域是 Domain | 同一 Domain 内所有控制器必须披露相同支持、选择相同模式 |
+| PLN 强制 | 系统支持 PLS 时，PLN 信号必须实现 |
+| PLA 可选 | 控制器可选择是否实现 PLA 信号 |
+| 一种 EPF 端口行为 | 每个控制器只能实现"端口启用"或"端口禁用"之一；Domain 内必须一致 |
+| 已取状态下锁配置 | FQ 处理过程中拒绝改变 PLS 配置 |
+| 后台挂起 | FQ 期间所有后台操作（GC、磨损均衡）挂起 |
+| 复位清信号 | Controller Level Reset 会把 PLN/PLA 都重置为未断言 |
+| 状态返回条件 | 复位或关机（非零 SHST）会让 FQ 状态返回 Not Ready |
+| 端口禁用退出 | 端口禁用 EPF 完成后只能"重上电"退出 |
+| 恢复时序 | EPF 完成状态下首次上电可能暴露未就绪/降级的命名空间 |
 
-**Domain 级别约束：**
-- 同一个 Domain 内的所有控制器必须：
-  - 披露相同的支持模式
-  - 使用相同的选定模式
-  - 同一时刻最多只能激活一种操作模式
+## 容易混淆的地方
 
-**信号支持要求：**
-- 当系统支持 PLS 时，`PLN` 信号是**强制必须**的
-- `PLA` 信号是**可选**的，控制器可自行决定是否实现
+| 容易混 | 实际区别 |
+|--------|----------|
+| FQ vs EPF | FQ 优雅关门；EPF 直接丢单 |
+| EPF 端口启用 vs 端口禁用 | 前者保留可管理性；后者只能重上电 |
+| PLN vs PLA | PLN 由传输层发出；PLA 由控制器响应 |
+| Domain 模式 vs 控制器实现 | 模式在 Domain 范围一致；端口行为是每个控制器的实现选择 |
+| SHST vs SHN | `SHN` 主机发起的关闭通知；`SHST` 控制器当前关闭状态 |
+| Not Ready vs Ready | Not Ready 屏蔽 PLN；Ready 才允许响应 |
+| Power State Descriptor vs PLS | 前者定义电源状态；后者定义断电行为 |
 
-**附加支持要求：**
-支持 PLS 功能还需要满足以下条件：
-- 实现 Domain 范围的配置功能（Configuration Feature）
-- 提供命名空间 I/O 影响报告
-- 在支持的操作模式下，至少有一个适用电源状态的非零时序字段
+## 进阶细节
 
-> 规范参考：[PDF pp. 615-616](../_source/pages/page-615.md)
+- **三状态阶段**（规范 Figures 660-661）：
+  - Not Ready：屏蔽所有 PLN 转换
+  - Ready：监控 PLN 转换
+  - FQ Complete / EPF Complete：终态
+- **变量表**（规范 5.2.27）：Domain 范围配置决定当前生效模式（FQ / EPF / Disabled）；保存值在 Reset 后恢复。
+- **PLA 信号三态**（规范 Table 92）：
+  - Deasserted：未在 EPF 模式
+  - Asserted-EPF-Enabled：EPF 模式，PCIe 端口通信继续
+  - Asserted-EPF-Disabled：EPF 模式，PCIe 端口已停止
+- **FQ 处理序列**（规范 5.2.27.3）：
+  1. 断言 PLA
+  2. 停止从队列取命令
+  3. 完成/中止已取命令 + 准备 vault
+  4. 挂起后台操作
+  5. 解除 PLA 断言
+- **EPF 处理序列**（规范 5.2.27.4）：
+  1. 断言 PLA
+  2. 停止从队列取命令
+  3. 丢弃已取命令 + 丢弃管理端点命令
+  4. 准备 vault（按选定的端口行为）
+  5. 解除 PLA 断言
+- **被忽略的 PLN 转换**（规范 5.2.27.5）：
+  - Controller Level Reset 进行中
+  - Shutdown 进行中或已完成
+- **EPF Recovery 报告**（规范 5.2.27.6）：EPF 完成后，Identify Controller 中披露首次初始化的恢复间隔；实际恢复可在 `CC.EN=1` 之前或之后开始；非成功完成可能超出披露值。
+- **时序值为零的语义**（规范 5.2.27.7）：若 vault / recovery 时长配置为 0，则实际时长为厂商自定义。
+- **多 Domain 协调**：不同 Domain 的 PLS 状态独立；一个 Domain 进入 EPF 不影响其他 Domain。
+- **与 ANA 关系**：EPF 端口禁用时，ANA 状态应反映 inaccessible；其他 Domain 不受影响。
 
-### 特殊情况处理
+## 规范依据
 
-**被忽略的 PLN 转换：**
-以下情况下，PLN 信号的状态转换会被控制器忽略：
-- 控制器级别复位（Controller Level Reset）正在进行时
-- 关机（Shutdown）正在进行或已完成时
+- [PLS 模式与变量表，PDF 第 615 页](../_source/pages/page-615.md)
+- [PLA 表与支持约定，PDF 第 616 页](../_source/pages/page-616.md)
+- [状态机 Not Ready / Ready / 处理中，PDF 第 617 页](../_source/pages/page-617.md)
+- [状态 / PLA / 端口矩阵，PDF 第 618 页](../_source/pages/page-618.md)
+- [FQ 与 EPF 分支转换，PDF 第 619 页](../_source/pages/page-619.md)
+- [FQ 与 EPF 处理序列细节，PDF 第 621 页](../_source/pages/page-621.md)
 
-**时序值为零的情况：**
-- 当相应的 vault（数据保护）或 recovery（恢复）时长配置为零时，实际时长将变为厂商自定义（vendor specific）
+## 相关阅读
 
-**断电后的恢复行为：**
-- 在 EPF 完成状态发生电源损失后，首次恢复时可能会暴露出尚未就绪或降级的命名空间（namespace）
-- 原因：控制器内部的数据恢复过程可能仍在后台进行
-
-> 规范参考：[PDF pp. 616-617](../_source/pages/page-616.md)
-
----
-
-## 状态与端口通信规则
-
-### 各状态下的信号与通信行为
-
-| 控制器状态 | PLA 信号状态<br>（如果控制器支持） | PCIe 端口通信 |
-|-----------|---------------------------|-------------|
-| **PLS 未就绪 / 就绪**<br>(PLS Not Ready / Ready) | 未断言<br>(Deasserted) | 正常处理命令 |
-| **FQ 完成**<br>(FQ Complete) | 未断言<br>(Deasserted) | 正常处理命令 |
-| **EPF 处理中-端口启用**<br>(EPF Processing Port Enabled) | 已断言-EPF启用<br>(Asserted-EPF-Enabled) | 正常处理命令 |
-| **EPF 处理中-端口禁用**<br>(EPF Processing Port Disabled) | 已断言-EPF禁用<br>(Asserted-EPF-Disabled) | **不处理**命令 |
-| **EPF 完成-端口禁用**<br>(EPF Complete Port Disabled) | 未断言<br>(Deasserted) | **不处理**命令 |
-
-### 端口行为约束
-
-**实现规则：**
-- 每个控制器只能实现**一种** EPF 端口行为（端口启用 或 端口禁用）
-- 同一个 Domain 内的所有控制器必须实现**相同的** EPF 端口行为
-
-**端口禁用分支的限制：**
-- 无法通过 PCIe 端口发起控制器复位或子系统复位
-- 无法通过 PCIe 端口发起关机操作
-- 从"EPF 完成-端口禁用"状态退出的**唯一方式**是重新上电
-
-**端口启用分支的优势：**
-- 可以在复位或关机时正常返回到"PLS 未就绪"状态
-- 保持了控制器的可管理性
-
-> 规范参考：[PDF pp. 618-620](../_source/pages/page-618.md)
-
----
-
-## 两种断电处理模式详解
-
-### Forced Quiescence（强制静默模式）
-
-**处理流程：**
-```text
-断言 PLA 信号
-    ↓
-停止从队列中取指令（fetch）
-    ↓
-完成或中止所有已取出的命令 + 准备数据保护
-    ↓
-挂起后台操作（如垃圾回收、磨损均衡等）
-    ↓
-处理完成
-    ↓
-解除 PLA 信号断言
-```
-
-**模式特点：**
-- ✅ **保持连通性**：PCIe 端口继续工作，可以接收新命令
-- ✅ **命令完成保证**：应当完成或中止所有先前已取回的命令
-- ✅ **可恢复性**：如果电源实际未断开且 PLN 信号解除，控制器会恢复正常的命令取指操作
-- ⚠️ **配置锁定**：在已取指状态下，拒绝任何试图改变 PLS 配置的操作
-- ⚠️ **后台挂起**：所有后台操作（垃圾回收、数据整理等）会被挂起，直到 PLN 解除断言
-
-**中断处理：**
-- 执行复位或关机操作会中止 FQ 处理流程
-
-> 规范参考：[PDF p. 621](../_source/pages/page-621.md)
-
-### Emergency Power Fail（紧急断电模式）
-
-**处理流程：**
-```text
-断言 PLA 信号
-    ↓
-停止从队列中取指令
-    ↓
-丢弃所有已取指令 + 丢弃管理端点的带外命令
-    ↓
-根据选定的端口行为（启用/禁用）准备数据保护
-    ↓
-处理完成
-    ↓
-解除 PLA 信号断言
-```
-
-**模式特点：**
-- ⚡ **快速响应**：直接丢弃已取指令和管理端点命令，不尝试完成
-- 📊 **披露恢复时间**：成功完成 EPF 后，会披露首次初始化时的恢复间隔时间
-- ⏱️ **恢复时机灵活**：实际恢复可能在 `CC.EN=1`（控制器使能）之前或之后开始
-- ⚠️ **恢复时长不确定**：可能超过 `CSTS.RDY=1`（控制器就绪）的时长
-- ⚠️ **非成功完成**：如果 EPF 未能成功完成，可能花费比披露值更长的时间
-
-**命令丢弃范围：**
-- 进入 EPF 处理前已取回的所有 I/O 命令
-- 进入 EPF 处理前收到的所有管理端点（Management Endpoint）命令
-
-> 规范参考：[PDF pp. 621-622](../_source/pages/page-621.md)
-
----
-
-## 相关概念关联
-
-本文档涉及的 PLS 机制与以下 NVMe 概念紧密相关：
-
-| 相关文档 | 关联内容 | 规范位置 |
-|---------|---------|---------|
-| [电源状态描述符](power-state-descriptors.md) | 报告 FQ vault、EPF vault 和 EPF recovery 的时长参数 | [PDF pp. 616, 621-622](../_source/pages/page-616.md) |
-| [控制器使能、关机与复位](controller-enable-shutdown-reset.md) | 定义导致 PLS 返回未就绪状态的复位和关机条件 | [PDF pp. 616-620](../_source/pages/page-616.md) |
-| [通用控制器功能](common-controller-features.md) | 定义保存的 Domain 范围模式选择器配置 | [PDF pp. 411-412, 615](../_source/pages/page-411.md) |
-
----
-
-## 规范溯源
-
-以下是本文档内容在 NVMe 规范中的详细定位，便于深入研究：
-
-| 主题内容 | 规范页码 |
-|---------|---------|
-| PLS 模式、作用域与变量表起点 | [PDF p. 615](../_source/pages/page-615.md) |
-| PLA 表、支持约定与被忽略的转换 | [PDF p. 616](../_source/pages/page-616.md) |
-| 审阅图 660 状态机（完整状态转换图） | [PDF p. 617](../_source/pages/page-617.md) |
-| 审阅状态/PLA/端口矩阵及 Not Ready/Ready 转换 | [PDF p. 618](../_source/pages/page-618.md) |
-| 审阅 FQ 与 EPF 分支转换详情 | [PDF pp. 619-620](../_source/pages/page-619.md) |
-| FQ 与 EPF 处理序列详细说明 | [PDF pp. 621-622](../_source/pages/page-621.md) |
+- [controller-enable-shutdown-reset.md](controller-enable-shutdown-reset.md) - SHN/SHST 状态联动
+- [power-state-descriptors.md](power-state-descriptors.md) - 电源状态定义基础
+- [domains-and-divisions.md](domains-and-divisions.md) - Domain 范围与一致性
+- [persistent-event-log.md](persistent-event-log.md) - 意外断电事件归档

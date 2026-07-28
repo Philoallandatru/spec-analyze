@@ -1,178 +1,149 @@
-# Sanitize 操作状态
+# Sanitize 操作状态（Sanitize Operation Status）
 
-## 概述
+## 一句话说明
 
-本文档介绍 NVMe 规范中的 Sanitize Status（清理状态）日志，该日志用于跟踪数据清理操作的进度和结果。Sanitize 操作是一种彻底清除存储介质上数据的安全机制，确保数据无法被恢复。
+Sanitize Status 日志（LID `81h`）是 NVMe 控制器持久化保留的**只读观察口**，用于报告最近一次 Sanitize 操作的时间估计、当前进度与最终结果；它本身不下发任何命令，只反映后台 Sanitize Operation State Machine（规范 8.1.24.3）的当前状态。
 
-## Sanitize Status 日志
+## 生活化类比
 
-Sanitize Status 日志（Log Identifier 81h）是用于持久化观察 Sanitize 操作进度和最近一次 Sanitize 结果的接口。当控制器（Controller）报告支持 Sanitize 功能时，必须提供此日志。该日志具有以下特性：
+把 Sanitize 操作想成**医院的体检流程**：
 
-- **持久性**：在控制器重置（Reset）和电源循环（Power Cycle）后仍然保留
-- **有效性**：当控制器状态寄存器 `CSTS.RDY=1` 时包含有效数据
-- **必需性**：支持 Sanitize 功能的控制器必须实现此日志
+- **Sanitize 命令** = 病人挂号，护士登记到 HIS 系统
+- **后台擦除** = 病人去做 CT/抽血
+- **Sanitize Status 日志** = HIS 系统的"检验报告面板"
+  - **SPROG** = "检查完成百分比"
+  - **SOS** = "总状态"（还没来 / 已完成 / 在检查 / 失败 / 已完成但异常）
+  - **MVCNCLD** = "这次检查是否被中途打断"
+  - **GDE** = "自上次清空后病人没碰过医院任何东西吗"
+  - **OPC** = "覆写做了几轮"
+  - **ETO/ETBE/ETCE** = "下次同类检查预计要多久"
+- 病人查报告时系统是**只读**的——查报告不会改变报告内容
 
-[规范引用：PDF p. 302](../_source/pages/page-302.md)
-
-## 操作流程模型
-
-理解 Sanitize 操作的状态转换，可以参考以下流程：
+## 工作流程
 
 ```text
-       从未启动（Never Started）
-             |
-             v
- [清理处理中] ───> [介质验证] ───> [验证后释放]
- Sanitize         Media           Post-Verify
- Processing      Verification     Deallocate
-      |              |                 |
-      +──────────────+─────────────────+
-                     v
-           成功或失败结果
-
-状态观察：通过 LID 81h 获取进度 + 当前/最近状态 + 擦除证据
+   主机发 Get Log Page LID 81h
+              |
+              v
+   +---------------------------+
+   |   Sanitize Status Log     |  (控制器返回 512 字节)
+   +---------------------------+
+   | SPROG  | SSTAT  | SSI ... |  ETO/ETBE/ETCE/ETPVDS | ...
+   +---------------------------+
+              |
+              v
+   主机按字段解析：
+   - SOS (3 bit)         -> 当前/最近状态
+   - SPROG (16 bit)      -> 仅在 Sanitizing/PVD 时是 0..65535 进度
+   - MVCNCLD / GDE / OPC -> 状态细节
+   - ETO/ETBE/ETCE/...   -> 时间估计（0h = 同步完成；FFFFFFFFh = 不知道）
 ```
 
-### 状态说明
+**端到端流程**：
 
-- **清理处理中（Sanitize Processing）**：正在执行数据清理操作
-- **介质验证（Media Verification）**：验证清理操作是否成功
-- **验证后释放（Post-Verify Deallocate）**：验证后释放已分配的存储空间
+1. 主机定期 `Get Log Page LID 81h`。
+2. 控制器返回当前 Sanitize Status 日志的快照（512 字节）。
+3. 主机解析 `SOS`：
+   - `000b` = 从未启动过
+   - `001b` = 上次 Sanitize 成功，当前 Idle
+   - `010b` = 正在 Sanitize
+   - `011b` = 上次 Sanitize 失败
+   - `100b` = 已 Sanitize 但中途"意外释放了空间"（NDAS=1 时的异常结果）
+4. 若 `SOS=010b`，主机看 `SPROG`（0..65535）作为当前阶段的"分子"。
+5. 主机可对照 `SSI.SANS`/`SSI.FAILS` 得到更细的状态（受限/非受限/失败/验证中/PVD）。
+6. 主机读 `ETO/ETBE/ETCE/ETODMM/ETBENMM/ETCENMM/ETPVDS` 得到时间估计。
 
-以上流程为简化的概念模型，完整的操作状态机定义请参考规范性章节。[规范引用：PDF pp. 302-303](../_source/pages/page-302.md)
+## 初学者案例
 
-## 关键字段说明
+**场景：怎么知道"我两小时前发起的 Sanitize 走到哪了？"**
 
-### 进度指示：SPROG 字段
+1. 主机两小时前发 `nvme sanitize /dev/nvme0n1 -a 0x02`（Crypto Erase）。
+2. 工程师现在 `nvme sanitize-log /dev/nvme0n1` 查日志。
+3. 工具解析：`SOS=010b`（Sanitizing），`SPROG=0x8000`（即 32768/65536 = 50%）。
+4. 工程师对照 `ETCE`（Estimated Time for Crypto Erase）：如果 `ETCE=1800000` 表示还剩 30 分钟。
+5. 一段时间后再次查询，`SOS=001b`（Sanitized），`GDE=1`（自上次 Sanitize 后没写过数据）。
+6. 工程师放心地把这块盘退役。
 
-`SPROG`（Sanitize Progress）字段表示 Sanitize 操作的进度，其含义取决于当前操作阶段：
+> 边角案例：如果 `SOS=100b`（Sanitized Unexpected Deallocate），那说明当时请求 `NDAS=1`（不释放空间），但控制器**实际释放了**用户数据所占的全部空间——这种异常结果在审计上要专门标注。
 
-| 操作阶段 | SPROG 含义 |
-|---------|-----------|
-| 清理处理中（Sanitize Processing） | 进度值（分子），分母为 65,536 |
-| 验证后释放（Post-Verify Deallocate） | 进度值（分子），分母为 65,536 |
-| 介质验证（Media Verification） | 固定值 `FFFFh`（不适用） |
-| 未执行 Sanitize 操作 | 固定值 `FFFFh`（不适用） |
+## 必须记住的规则
 
-**注意**：`SPROG` 并非适用于所有状态的通用百分比指示器，仅在特定阶段有效。
+| 规则 | 要点 |
+|------|------|
+| 持久性 | Sanitize Status 日志在**电源循环和重置**后仍保留 |
+| 有效性 | `CSTS.RDY=1` 时日志包含有效数据；控制器未就绪时不应解析 |
+| 必需性 | 控制器报告 Sanitize 支持（`SANICAP ≠ 0`）就**必须**实现 LID `81h`；否则保留 |
+| `SOS` 是状态机的快照 | 它反映 8.1.24.3 状态机的当前状态；不是单独维护的"业务状态" |
+| `SPROG` 含义随状态变 | 仅在 `SOS=010b`（Sanitizing）的处理阶段或 Post-Verification Deallocation 阶段才返回 0..65535；其他阶段固定 `FFFFh` |
+| `SPROG` 分母固定 65536 | 进度 = `SPROG / 65536`，不要被 `0x10000` 迷惑 |
+| `SOS=100b` 是异常结果 | 表示"已 Sanitize 但意外释放了空间"，仅在 `NDAS=1` 异常路径下出现 |
+| `SOS` 保留值 | `101b` 到 `111b` 保留；规范未定义含义，不应解释为有效状态 |
+| `MVCNCLD=1` 表示验证被取消 | 原因可能是子系统组成变化或特定重置发生 |
+| `GDE=1` 表示"自上次成功后没写过数据" | 配合"自出厂后首次 Sanitize 前没写过数据"或"自上次成功 Sanitize 后没写过数据"两个条件 |
+| `OPC` 仅 Overwrite 时非零 | 其他擦除方式下 `OPC=0` |
+| `ETx` 哨兵值 | `0h` = 估计命令完成时同步完成；`FFFFFFFFh` = 控制器无法提供估计 |
+| `SSI.SANS` 仅在 Version Validity 允许时有效 | 否则不要解析这个字段 |
+| `SSI.FAILS` 仅在 `SOS=011b` 时非零 | 其他 `SOS` 下 `FAILS=0` |
 
-[规范引用：PDF p. 302](../_source/pages/page-302.md)
+## 容易混淆的地方
 
-### 状态观察字段
+| 容易混 | 实际区别 |
+|--------|----------|
+| `SOS=001b` vs `SOS=100b` | `001b` = 上次 Sanitize 干净结束；`100b` = 干净结束但**用户空间被意外释放了**（异常） |
+| `SPROG` vs "实时百分比" | `SPROG` 仅在处理/PVD 阶段有效；其他阶段是 `FFFFh`（不是 100%！） |
+| `GDE=1` vs "数据安全" | `GDE=1` 只代表"自上次成功后没写过数据"；不代表"现在盘上没数据" |
+| `ETx` 估计 vs 实际时间 | 估计是控制器**开始 Sanitize 时的预算**；实际可能更短或更长 |
+| `ETx` vs `ETxNMM` | `ETx`（ETO/ETBE/ETCE）是"标准操作时间"；`ETxNMM`（ETODMM/ETBENMM/ETCENMM）专用于 `NDAS=1` 启用时的"额外介质修改时间" |
+| `MVCNCLD=1` vs `SOS=011b` | 验证被取消不一定导致 Sanitize 失败；要看是否进入 Failed 状态 |
+| `SOS=010b` 子状态 | `SOS=010b` 不区分 Restricted/Unrestricted 处理、Media Verification、PVD；要靠 `SSI.SANS` 细分 |
+| `SSI.FAILS=0` vs 成功 | `SOS ≠ 011b` 时 `FAILS=0`；不是"成功"，只是"没失败" |
+| `SOS=000b` 含义 | "从未启动过"；一旦 Sanitize 启动过就再也不会回到 `000b` |
+| 估计字段不写明单位 | 所有 `ETx` 单位都是"毫秒"；不要误以为是秒或微秒 |
 
-| 字段 | 全称 | 含义 |
-|-----|------|------|
-| `SOS` | Sanitize Operation Status | 清理操作状态，可能的值包括：<br>• 从未启动（Never Started）<br>• 已清理（Sanitized）<br>• 清理中（Sanitizing）<br>• 失败（Failed）<br>• 已清理但意外释放（Sanitized with Unexpected Deallocation） |
-| `MVCNCLD` | Media Verification Canceled | 指示请求的介质验证操作是否被取消：<br>• 因子系统组成（Subsystem Composition）变化而取消<br>• 因指定的重置（Reset）条件而取消 |
-| `GDE` | Global Data Erased | 全局数据擦除指示器，满足以下条件时为真：<br>• 自制造后首次 Sanitize 之前未写入用户数据<br>• 自最近一次成功 Sanitize 后未写入用户数据<br>• 期间未启用 PMR（Persistent Memory Region） |
-| `OPC` | Overwrite Pass Count | 已完成的覆写遍数；仅用于 Overwrite 操作，其他操作类型此字段为零 |
+## 进阶细节
 
-[规范引用：PDF p. 303](../_source/pages/page-303.md)
+- **Sanitize Status Log Page 字段布局**（Figure 291, 规范 5.1.12.1.33）：
+  - Bytes `01:00` = SPROG（Sanitize Progress, 16 位）
+  - Bytes `03:02` = SSTAT（Sanitize Status, 16 位，含 MVCNCLD/GDE/OPC/SOS 等子字段）
+  - Bytes `07:04` = SSI（Sanitize Status Information, 含 SANS/FAILS）
+  - Bytes `11:08` = ETO（Estimated Time for Overwrite, 32 位毫秒）
+  - Bytes `15:12` = ETBE（Estimated Time for Block Erase, 32 位毫秒）
+  - Bytes `19:16` = ETCE（Estimated Time for Crypto Erase, 32 位毫秒）
+  - Bytes `23:20` = ETODMM（Overwrite with Deallocate Media Modification 时间）
+  - Bytes `27:24` = ETBENMM（Block Erase with No-Deallocate Media Modification 时间）
+  - Bytes `31:28` = ETCENMM（Crypto Erase with No-Deallocate Media Modification 时间）
+  - Bytes `35:32` = ETPVDS（Estimated Time for Post-Verification Deallocation）
+- **`SPROG` 边界行为**（规范 5.1.12.1.33）：
+  - 当 `SOS ≠ 010b`（Sanitizing）→ 固定 `FFFFh`
+  - 当处于 Media Verification 状态 → 固定 `FFFFh`（不适用）
+  - 当 `SOS=010b` 且处于处理/PVD 阶段 → 0..65535 的实际进度
+- **`SOS=100b` 触发条件**（规范 5.1.12.1.33）：控制器报告 Sanitize Capabilities 中"No-Deallocate After Sanitize"被禁止（Inhibit），但 Sanitize 命令又用 `NDAS=1` 成功完成时，可能被配置为"接受并记 Unexpected Deallocate"（Warning Mode）；此时 `SOS=100b`、状态机进入 Idle。
+- **`MVCNCLD=1` 触发条件**（规范 5.1.12.1.33）：
+  - 验证期间子系统组成变化
+  - 验证期间发生特定 Controller Level Reset（传输层特定 reset 或 NVM Subsystem Reset）
+- **`GDE=1` 双重条件**（规范 5.1.12.1.33）：
+  - 自制造起 + 首次 Sanitize 之前未写过数据，**且** 自制造起未启用过 PMR
+  - 或 自上次成功 Sanitize 起未写过数据，**且** 期间未启用过 PMR
+- **`SSI.SANS` 7 种状态**（规范 5.1.12.1.33 + 8.1.24.3）：Idle / Restricted Processing / Restricted Failure / Unrestricted Processing / Unrestricted Failure / Media Verification / Post-Verification Deallocation
+- **`SSI.FAILS` 失败码**：仅在 `SOS=011b` 时给出具体失败码；规范 8.1.24.3 定义详细编码。
+- **时间估计哨兵值**：
+  - `0h` = 控制器估计操作将在 Sanitize 命令返回 CQE 时同步完成（无后台）
+  - `FFFFFFFFh` = 控制器无法提供估计（不一定意味着不会后台运行）
+- **`ETPVDS` 哨兵值**：只有 `FFFFFFFFh`（不能提供估计），没有 `0h` 哨兵。
+- **与命令序列**：Sanitize 命令**先**更新 Sanitize Status 日志，再返回 CQE；这个顺序保证了"看到 CQE 成功就一定能看到 `SOS=010b`"。
+- **LID `81h` 存在性**：`SANICAP=0` → LID `81h` reserved；Get Log Page 会返回零页或按规范 5.1.12 通用行为处理。
 
-### SOS 特殊值说明
+## 规范依据
 
-`SOS=100b`（二进制值）表示一种特殊的结果状态："**已清理但意外释放**（Sanitized with Unexpected Deallocation）"：
+- [Sanitize Status 日志的必需性、持久性、就绪状态与进度语义，PDF 第 302 页](../_source/pages/page-302.md)
+- [Sanitize Status 位字段（SOS/MVCNCLD/GDE/OPC）定义，PDF 第 303 页](../_source/pages/page-303.md)
+- [时间估计字段（ETO/ETBE/ETCE/ETPVDS）与异常结果，PDF 第 304 页](../_source/pages/page-304.md)
+- [No-Deallocate 时间估计与 SSI 编码，PDF 第 305 页](../_source/pages/page-305.md)
+- [Sanitize Operation State Machine 完整状态机，PDF 第 387 页](../_source/pages/page-387.md)
 
-- **场景**：使用了 No-Deallocate（不释放）选项的 Sanitize 请求成功完成
-- **异常行为**：尽管请求不释放空间，但所有用户数据（User Data）占用的介质空间均被释放
-- **状态机状态**：操作状态机处于空闲（Idle）状态
+## 相关阅读
 
-**保留值**：`101b` 至 `111b` 为保留值，规范未定义其含义。
-
-[规范引用：PDF pp. 303-304](../_source/pages/page-303.md)
-
-## 时间估计字段
-
-Sanitize Status 日志提供各阶段操作的预估完成时间，帮助主机（Host）了解操作进度。
-
-### 标准操作时间估计
-
-以下字段估计不包含特殊 No-Deallocate 介质修改路径的操作时间：
-
-| 字段 | 全称 | 估计的操作类型 | 哨兵值含义 |
-|-----|------|---------------|-----------|
-| `ETO` | Estimated Time for Overwrite | 覆写（Overwrite）操作的后台处理时间 | `0h`：命令完成时预计完成<br>`FFFFFFFFh`：无法提供估计 |
-| `ETBE` | Estimated Time for Block Erase | 块擦除（Block Erase）操作的后台处理时间 | `0h`：命令完成时预计完成<br>`FFFFFFFFh`：无法提供估计 |
-| `ETCE` | Estimated Time for Crypto Erase | 加密擦除（Crypto Erase）操作的后台处理时间 | `0h`：命令完成时预计完成<br>`FFFFFFFFh`：无法提供估计 |
-
-### No-Deallocate 介质修改时间估计
-
-当请求 No-Deallocate 选项且控制器能力（Capability）选择该行为时，以下字段估计包含额外介质修改的操作时间：
-
-| 字段 | 全称 | 估计的操作类型 | 哨兵值含义 |
-|-----|------|---------------|-----------|
-| `ETODMM` | Estimated Time for Overwrite with Deallocate Media Modification | 覆写操作包含额外介质修改的时间 | `0h`：命令完成时预计完成<br>`FFFFFFFFh`：无法提供估计 |
-| `ETBENMM` | Estimated Time for Block Erase with No-Deallocate Media Modification | 块擦除操作包含额外介质修改的时间 | `0h`：命令完成时预计完成<br>`FFFFFFFFh`：无法提供估计 |
-| `ETCENMM` | Estimated Time for Crypto Erase with No-Deallocate Media Modification | 加密擦除操作包含额外介质修改的时间 | `0h`：命令完成时预计完成<br>`FFFFFFFFh`：无法提供估计 |
-
-### 验证后释放时间估计
-
-| 字段 | 全称 | 估计的操作类型 | 哨兵值含义 |
-|-----|------|---------------|-----------|
-| `ETPVDS` | Estimated Time for Post-Verification Deallocation | 验证后释放（Post-Verification Deallocation）操作时间<br>（若操作进入此阶段） | `FFFFFFFFh`：无法提供估计 |
-
-[规范引用：PDF pp. 304-305](../_source/pages/page-304.md)
-
-### 哨兵值说明
-
-- **`0h`**：表示操作预计在命令完成（Completion）时同步完成，无需后台处理
-- **`FFFFFFFFh`**：表示控制器无法提供时间估计
-
-## 详细状态信息
-
-### SSI 字段（Sanitize Status Information）
-
-`SSI.SANS`（Sanitize Action Not Started）和 `SSI.FAILS`（Sanitize Action Failed Status）字段提供更细粒度的状态信息：
-
-#### SANS 字段
-
-仅当版本有效性（Version Validity）位允许时，`SSI.SANS` 才暴露当前的详细状态：
-
-- **空闲**（Idle）
-- **受限处理中**（Restricted Processing）
-- **受限失败**（Restricted Failure）
-- **非受限处理中**（Unrestricted Processing）
-- **非受限失败**（Unrestricted Failure）
-- **介质验证中**（Media Verification）
-- **验证后释放中**（Post-Verification Deallocation）
-
-#### FAILS 字段
-
-- **当 `SOS` 报告失败时**：`SSI.FAILS` 记录具体的失败状态码
-- **当 `SOS` 未报告失败时**：此字段值为零
-
-**重要提示**：以上说明仅为观察字段的映射关系，不能替代规范第 8.1.24.3 节中定义的规范性状态转换机制。完整的状态机行为必须参考规范文档。
-
-[规范引用：PDF p. 305](../_source/pages/page-305.md)
-
-## 相关概念
-
-### 与其他概念的关联
-
-- **[Sanitize Operation Lifecycle](sanitize-operation-lifecycle.md)**  
-  定义了 Sanitize 命令的启动条件（Gate）和状态转换逻辑，本日志观察的即是该生命周期的状态。  
-  [规范引用：PDF pp. 387-390](../_source/pages/page-387.md)
-
-- **与 Format NVM 的区别**  
-  Sanitize 操作与 Format NVM 命令的 Secure Erase 选项是不同的数据清除机制。Sanitize Status 日志仅观察 Sanitize 操作，不涉及 Format NVM 操作。  
-  [规范引用：PDF p. 302](../_source/pages/page-302.md) | [PDF pp. 218-220](../_source/pages/page-218.md)
-
-- **状态机映射关系**  
-  `SOS`、取消（Cancellation）、进度（Progress）与操作状态之间的精确对应关系，由 Sanitize Status 日志定义所引用的状态机章节详细规定。  
-  [规范引用：PDF pp. 302-303](../_source/pages/page-302.md)
-
-## 规范引用
-
-以下是本文档涉及的 NVMe 规范页面，供深入研究参考：
-
-- **支持性、持久性、就绪状态与进度语义**  
-  [PDF p. 302](../_source/pages/page-302.md)
-
-- **Sanitize Status 位字段定义与初始状态值**  
-  [PDF p. 303](../_source/pages/page-303.md)
-
-- **其他结果状态、操作参数与时间估计字段**  
-  [PDF p. 304](../_source/pages/page-304.md)
-
-- **No-Deallocate 时间估计与状态信息编码**  
-  [PDF p. 305](../_source/pages/page-305.md)
+- [sanitize-operation-lifecycle.md](sanitize-operation-lifecycle.md) - 触发与状态机源头
+- [log-page-retrieval.md](log-page-retrieval.md) - Get Log Page 通用机制
+- [persistent-event-log.md](persistent-event-log.md) - 关联事件流
+- [format-nvm-lifecycle.md](format-nvm-lifecycle.md) - 类似异步操作对照

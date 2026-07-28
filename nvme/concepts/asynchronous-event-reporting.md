@@ -1,236 +1,117 @@
 # 异步事件上报（Asynchronous Event Reporting）
 
-## 概述
+## 一句话说明
 
-异步事件请求（Asynchronous Event Request, AER）是 NVMe 规范中的一种特殊管理命令，它允许控制器（Controller）主动向主机（Host）报告各类事件。与传统的命令-响应模式不同，AER 是一个"长寿命"命令——主机提交后，控制器会持有这个请求，直到有事件需要报告时才通过完成队列条目（Completion Queue Entry, CQE）返回结果。
+异步事件请求（Asynchronous Event Request, AER）是 NVMe 控制器主动通知主机发生重要事件的长寿命命令：主机预先提交多个 AER，控制器在事件发生时通过完成队列条目（Completion Queue Entry, CQE）回报事件类型，并由 Get Log Page 读取详情并解除屏蔽。
 
-**支持的事件类型包括：**
-- 状态事件（Status）
-- 健康状态事件（Health）
-- 通知事件（Notice）
-- I/O 相关事件（I/O-specific）
-- 即时事件（Immediate）
-- 一次性事件（One-shot）
-- 厂商自定义事件（Vendor）
+## 生活化类比
 
-**规范参考：** [PDF pp. 195-202](../_source/pages/page-195.md)
+把异步事件上报想成**医院的护士呼叫系统**：
 
----
+- **护士站的主机** = 主机（Host）
+- **床头呼叫器** = 控制器（Controller）
+- **预先按下的"待命"按钮** = AER 命令（长寿命，等着被响应）
+- **不同床位的报警灯** = 事件族（Error / SMART / Notice / I/O-specific / Immediate / One-Shot / Vendor）
+- **护士去床头看病情记录** = Get Log Page 读取日志详情
+- **"读完日志 = 故障已处理"** = 解除事件屏蔽
 
-## 工作原理
+护士（主机）不会一直守在每个床位旁，而是预先按下"待命"按钮（AER）；病人一有情况（事件），床头呼叫器亮灯（CQE）；护士去翻病历本（Get Log Page），处理完后这一类报警才会重新"被允许"触发。
 
-### 交互流程图
-
-下面的流程图展示了主机和控制器如何通过 AER 机制协同工作：
+## 工作流程
 
 ```text
-主机（Host）                控制器（Controller）            日志页（Log Page）
-    |
-    |---- 提交一个或多个 AER ---->|
-    |                              |
-    |                              |<---- 事件发生
-    |                              |
-    |<---- CQE: AET + AEI + LID --|
-    |                              |
-    |                              |---- 屏蔽相同事件类型
-    |                              |
-    |---- Get Log Page (RAE=0) -------------------------------->|
-    |                                                            |
-    |<---- 返回事件详情 ----------------------------------------|
-    |                              |
-    |                              |<---- 事件类型解除屏蔽/清除
-    |                              |
-    |---- 提交新的 AER 补充 ------>|
-    |                              |
+主机（Host）                  控制器（Controller）              日志页（Log Page）
+    |                                |                              |
+    |---- 提交 AER ① --------------->|                              |
+    |---- 提交 AER ② --------------->|  (持有，不立即完成)             |
+    |                                |                              |
+    |                                |<---- 事件发生（如温度过高）     |
+    |                                |                              |
+    |<---- CQE: AET + AEI + LID -----|  (返回事件概要)                |
+    |                                |---- 屏蔽同类型事件              |
+    |                                |                              |
+    |---- Get Log Page (RAE=0) -------------------------->|         |
+    |                                                     |         |
+    |<---- 返回事件详情 -------------------------------|         |
+    |                                |                              |
+    |                                |<---- 事件类型解除屏蔽          |
+    |                                |                              |
+    |---- 提交新 AER 补回 ---------->|  (维持未完成请求数)            |
+    |                                |                              |
 ```
 
-### 流程说明
+简化说明：上图是"提交 → 触发 → 读取 → 解除 → 补回"的最小循环；多个 AER 并行持有时，只有最先匹配上的事件占先返回 CQE，其他 AER 继续等待。
 
-1. **提交阶段**：主机预先向控制器提交一个或多个 AER 命令（在控制器支持的上限范围内）
-2. **等待阶段**：控制器持有这些请求，不立即返回
-3. **事件触发**：当控制器检测到需要报告的事件时，通过 CQE 返回事件信息（AET + AEI + LID）
-4. **自动屏蔽**：控制器自动屏蔽同类型事件，防止重复报告
-5. **主机处理**：主机通过 Get Log Page 命令读取详细日志（RAE=0 表示读取后确认）
-6. **解除屏蔽**：日志读取完成后，该事件类型的屏蔽被解除
-7. **补充请求**：主机提交新的 AER 以维持未完成请求的数量
+## 初学者案例
 
-**特殊情况：**
-- **即时事件（Immediate）**：仅在事件发生时已有未完成 AER 的情况下才报告
-- **一次性事件（One-shot）**：报告后自动清除，不需要日志读取步骤
+**场景：SSD 温度过高，主机怎么知道？**
 
-**规范参考：** [PDF pp. 195-197](../_source/pages/page-195.md)
+1. 主机启动后通过 `nvme aer` 提交若干 AER 命令，保持在 Admin 提交队列里"挂着"。
+2. 控制器内部温度传感器读数越过阈值。
+3. 控制器把 AER 命令之一标记为完成，CQE DW0 写入：`AET=001b`（SMART/Health）、`AEI=0x03`（温度阈值跨越）、`LID=02h`（SMART/Health log）。
+4. 主机收到中断，解析 CQE，发现是 SMART 事件。
+5. 主机用 `nvme get-log /dev/nvme0 -i 2` 读取 SMART/Health 日志，确认当前温度与临界温度。
+6. 主机把 RAE 位清零（默认就为 0）提交 Get Log Page，控制器在数据搬运成功后解除该事件类型的屏蔽。
+7. 主机再次提交 AER 补回，确保事件流不中断。
 
----
+> 速查：若发现事件"刷屏"，往往是底层条件未消除（温度还没降下来）。规范建议主机在清除事件前先调阈值或临时屏蔽。
 
-## 请求状态管理
+## 必须记住的规则
 
-### 未完成请求（Outstanding）与待处理事件（Pending）
-
-| 场景 | 行为说明 | 规范参考 |
-|------|----------|----------|
-| **无超时机制** | AER 命令没有超时限制，可以无限期等待事件发生 | [PDF pp. 195-196](../_source/pages/page-195.md) |
-| **多个未完成请求** | 主机可同时提交多个 AER（在控制器通告的上限内），减少事件上报延迟 | [PDF pp. 195-196](../_source/pages/page-195.md) |
-| **重置时中止** | 控制器重置（Reset）会中止所有未完成的 AER，且不返回 CQE | [PDF p. 196](../_source/pages/page-196.md) |
-| **事件保留机制** | 除即时事件外，当启用的事件发生但没有未完成 AER 时，事件会被保留到下次 AER 提交时报告 | [PDF p. 197](../_source/pages/page-197.md) |
-| **事件合并与排队** | 相同的事件响应可以合并为一次报告；不同的事件响应应排队等待报告 | [PDF p. 197](../_source/pages/page-197.md) |
-| **事件类型屏蔽** | 普通事件一旦被报告，该事件类型就会被屏蔽，直到清除操作成功完成 | [PDF p. 196](../_source/pages/page-196.md) |
-| **介质未就绪阻塞** | 如果清除事件所需的日志暂时无法读取（media-not-ready），则阻止该事件的报告 | [PDF p. 196](../_source/pages/page-196.md) |
-
-### 关键理解点
-
-**屏蔽机制的作用**：防止同一事件在主机处理之前反复报告。只有当主机读取相关日志（执行清除操作）后，控制器才会再次报告同类型的新事件。
-
----
-
-## 完成队列条目（CQE）格式
-
-### 字段布局
-
-当 AER 命令完成时，控制器返回的 CQE 包含以下信息：
-
-```text
-AER CQE DW0（双字 0）
-31        24 23        16 15         8 7       3 2       0
-+-----------+------------+-------------+---------+---------+
-| 保留      | LID        | AEI         | 保留    | AET     |
-|           | 日志标识   | 事件信息    |         | 事件类型|
-+-----------+------------+-------------+---------+---------+
-
-AER CQE DW1（双字 1）
-事件特定的 32 位参数（Event-specific Parameter）
-```
-
-### 字段说明
-
-| 字段 | 位范围 | 说明 |
-|------|--------|------|
-| **AET** | 2:0 | 异步事件类型（Asynchronous Event Type）<br>标识事件所属的大类（族） |
-| **AEI** | 15:8 | 异步事件信息（Asynchronous Event Information）<br>标识该族内的具体事件 |
-| **LID** | 23:16 | 日志标识符（Log Identifier）<br>指向包含事件详细信息和清除操作的日志页 |
-| **DW1** | 全部 | 事件特定参数<br>携带与该事件相关的附加数据（32 位） |
-
-**规范参考：** [PDF pp. 197-198](../_source/pages/page-197.md)（Figures 147-148）
-
----
-
-## 事件分类与清除机制
-
-### 按清除模型分类
-
-| 事件族 | 清除/保留模型 | 处理方式 |
-|--------|--------------|----------|
-| **Error（错误）** | 日志支持型 | 使用 Get Log Page 命令读取指定的日志页，并设置 RAE=0（Retain Asynchronous Event = 0）以清除事件 |
-| **SMART/Health（健康）** | 日志支持型 | 同上 |
-| **Notice（通知）** | 日志支持型 | 同上 |
-| **I/O-specific（I/O 特定）** | 日志支持型 | 同上 |
-| **Vendor（厂商自定义）** | 日志支持型 | 同上 |
-| **Immediate（即时）** | 发生时上报型 | 仅在事件发生时存在未完成 AER 的情况下才报告 |
-| **One-Shot（一次性）** | 自动清除型 | 报告一次后，控制器在完成时自动清除，无需主机操作 |
-
-### 具体事件类型（AEI 值）
-
-规范的 Figures 149-155 中定义了详细的 AEI 值。主要事件族涵盖：
-
-**Notice 事件族：**
-- 命名空间属性变更
-- 固件激活（Firmware Activation）
-- 遥测日志（Telemetry）
-- 非对称命名空间访问（ANA）状态变更
-- 耐久性/可达性/发现日志变更
-
-**I/O-specific 事件族：**
-- 预留（Reservation）状态
-- 清理（Sanitize）状态
-
-**Immediate 事件族：**
-- 子系统关机（Subsystem Shutdown）
-
-**One-Shot 事件族：**
-- 控制器数据队列尾部/满载通知
-
-**规范参考：** [PDF pp. 198-202](../_source/pages/page-198.md)
-
-### 持久条件与瞬态条件的处理
-
-对于**持久条件（Persistent Condition）**或**瞬态阈值事件（Transient Threshold Event）**：
-
-1. **问题**：如果底层触发条件仍然存在，清除事件后可能立即再次触发通知
-2. **解决方案**：主机在清除事件前应：
-   - 调整相关阈值参数（如温度阈值），或
-   - 临时屏蔽该事件类型
-3. **目的**：避免事件通知风暴，给主机时间处理根本原因
-
-**规范参考：** [PDF p. 197](../_source/pages/page-197.md)
-
----
-
-## 异步事件配置功能
-
-### 功能概述
-
-**异步事件配置功能（Asynchronous Event Configuration Feature）** 是一个事件族级别的启用屏蔽（Enable Mask）。通过 Set Features 命令配置此功能，主机可以控制哪些类型的事件会被报告。
-
-### 可配置的事件类型
-
-主机可以独立启用或禁用以下事件类型的通知：
-
-| 事件类别 | 具体事件 |
-|---------|---------|
-| **日志变更** | Discovery Log、Host Log、AVE Log、Pull-Model Log 的内容变更 |
-| **命名空间变更** | 命名空间的分配（Allocated）或连接（Attached）状态变更 |
-| **网络状态** | 可达性（Reachability）变化 |
-| **温度恢复** | 温度滞后恢复（Temperature-hysteresis Recovery） |
-| **关机通知** | 正常关机（Normal Shutdown） |
-| **耐久性组** | Endurance Group 事件 |
-| **延迟聚合** | Predictable Latency Aggregates 事件 |
-| **ANA** | 非对称命名空间访问（Asymmetric Namespace Access）状态变更 |
-| **遥测** | Telemetry Log 更新 |
-| **固件激活** | Firmware Activation 完成 |
-| **SMART 警告** | SMART/Health 警告 |
-
-### 重要行为特征
-
-| 场景 | 行为 |
+| 规则 | 要点 |
 |------|------|
-| **启用已成立的持久条件** | 如果启用的事件对应的条件已经成立，控制器会立即发送该事件 |
-| **启用不支持的资源特定事件** | 对于控制器不支持的资源特定事件族，启用操作是非法的 |
-| **配置的作用范围** | 此功能仅控制事件通知的交付，不影响底层条件是否发生或日志是否更新 |
-| **恢复事件的特殊要求** | 某些恢复事件要求在事件发生时刻存在未完成的 AER，否则不会被保留 |
-| **保留事件行为** | 已启用但无未完成 AER 时发生的事件，其保留行为遵循各事件族的规则 |
+| AER 没有超时 | AER 命令可无限期等待事件（"长寿命"命令） |
+| 主机可提交多个 AER | 数量受 Identify Controller 通告的上限限制（超出返回状态码 05h） |
+| 事件屏蔽 | 同一事件类型在报告后被屏蔽，直到 Get Log Page（RAE=0）成功完成 |
+| 即时事件（Immediate） | 仅在事件发生时存在未完成 AER 才上报，不保留 |
+| 一次性事件（One-Shot） | 报告后由控制器自动清除，无需读取日志 |
+| 事件合并/排队 | 相同事件响应可合并；不同事件响应应排队等待 |
+| 介质未就绪阻塞 | 若清除事件所需日志暂时无法读（media-not-ready），控制器阻塞该事件 |
+| 控制器重置中止 | Reset 中止所有未完成 AER，且**不返回 CQE** |
+| 启用已成立的条件 | 通过异步事件配置（Asynchronous Event Configuration）启用某事件时，若条件已成立，立即上报 |
 
-**规范参考：** [PDF pp. 399-400](../_source/pages/page-399.md)
+## 容易混淆的地方
 
----
+| 容易混 | 实际区别 |
+|--------|----------|
+| AER vs 普通 Admin 命令 | 普通命令有超时、AER 没有；AER 是"挂着等事件" |
+| AET vs AEI | AET（3 位）= 事件族（族级）；AEI（8 位）= 族内具体事件（个例） |
+| 屏蔽 vs 禁用 | 屏蔽是事件族内的临时阻断（清除后自动解除）；禁用通过 Set Features 关闭整族通知 |
+| 持久条件 vs 瞬态事件 | 持续存在的条件在清除后会立刻再触发；规范建议先调阈值再清除 |
+| LID vs 事件类型 | LID 是日志页标识（用来 Get Log Page 读详情），不等于事件类型 |
+| One-Shot vs Immediate | One-Shot 报告后自动清除；Immediate 仅在有 AER 时报告、不保留 |
 
-## 关键关系与约束
+## 进阶细节
 
-### 命令与功能的关联
+- **CQE DW0 字段布局**（Figure 147）：
+  - `AET`（bit 2:0）：异步事件类型（Event family）
+  - `AEI`（bit 15:8）：异步事件信息（具体事件）
+  - `LID`（bit 23:16）：日志标识符（指向 Get Log Page 目标）
+  - 剩余位：保留
+- **CQE DW1**：32 位事件特定参数（Event-specific Parameter），由各事件族定义。
+- **事件族与典型成员**：
+  - **Error**（日志支持型）：所有命令错误状态。
+  - **SMART/Health**（日志支持型）：温度、可靠性、降级警告。
+  - **Notice**（日志支持型）：命名空间属性变更、固件激活、ANA 状态变更、Discovery Log 变更。
+  - **I/O-specific**（日志支持型）：预留（Reservation）状态、清理（Sanitize）状态。
+  - **Immediate**（发生时上报型）：子系统关机（Subsystem Shutdown）。
+  - **One-Shot**（自动清除型）：控制器数据队列（Controller Data Queue）尾指针/满载通知。
+  - **Vendor**：厂商自定义事件。
+- **Asynchronous Event Configuration Feature**（规范第 5 章 Feature 定义）：按事件族粒度启用/禁用通知；启用已成立的条件时控制器立即补发。
+- **保留事件**：除即时事件外，已启用但无未完成 AER 时发生的事件，控制器会保留到下次 AER 完成时回报。
+- **错误码**：`05h` Asynchronous Event Request Limit Exceeded（超出控制器允许的未完成 AER 数）。
 
-| 组件 | 作用 | 规范参考 |
-|------|------|----------|
-| **AER 命令** | 接收事件通知，CQE 指示应读取哪个日志页以获取详细信息和执行清除操作 | [PDF pp. 196-198](../_source/pages/page-196.md) |
-| **Get Log Page 命令** | 读取日志详情并清除事件（当 RAE=0 时），将通知机制与日志检索耦合 | [PDF pp. 196-198](../_source/pages/page-196.md) |
-| **Asynchronous Event Configuration** | 选择性启用或禁用可配置的事件条件，控制哪些事件会生成通知 | [PDF p. 196](../_source/pages/page-196.md) |
+## 规范依据
 
-### 错误处理
+- [AER 命令与异步事件基础，PDF 第 195 页](../_source/pages/page-195.md)
+- [CQE 字段与命令特定状态值，PDF 第 197 页](../_source/pages/page-197.md)
+- [事件族定义 Figures 149-150（Error / SMART/Health），PDF 第 198 页](../_source/pages/page-198.md)
+- [Notice / I/O-specific / Immediate / One-Shot 事件 Figures 151-155，PDF 第 199 页](../_source/pages/page-199.md)
+- [Asynchronous Event Configuration Feature，PDF 第 399 页](../_source/pages/page-399.md)
 
-**超出 AER 数量限制**：如果主机提交的 AER 数量超过控制器支持的上限，控制器会返回命令特定状态码 `05h`（Asynchronous Event Request Limit Exceeded）。
+## 相关阅读
 
-**规范参考：** [PDF p. 197](../_source/pages/page-197.md)
-
----
-
-## 规范引用索引
-
-以下是本文档内容对应的 NVMe 规范原文位置：
-
-### 核心机制
-
-- [AER 生命周期、屏蔽机制、事件族定义，PDF pp. 195-197](../_source/pages/page-195.md)
-- [Figures 146-148：状态码与 CQE 编码格式，PDF pp. 197-198](../_source/pages/page-197.md)
-
-### 事件类型详细定义
-
-- [Figures 149-150：Error 事件与 SMART/Health 事件，PDF p. 198](../_source/pages/page-198.md)
-- [Figure 151：Notice 事件，PDF pp. 199-201](../_source/pages/page-199.md)
-- [Figures 152-155：I/O-specific、Immediate 与 One-Shot 事件，PDF pp. 201-202](../_source/pages/page-201.md)
+- [admin-command-model.md](admin-command-model.md) - AER 在 Admin opcode 表中
+- [keep-alive.md](keep-alive.md) - 关联终止的 AEN 触发源
+- [controller-initialization.md](controller-initialization.md) - 初始化末尾配 AER 流程
+- [firmware-update-lifecycle.md](firmware-update-lifecycle.md) - Firmware Activation AEN 来源

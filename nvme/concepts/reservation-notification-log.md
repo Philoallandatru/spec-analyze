@@ -1,169 +1,123 @@
-# Reservation Notification Log（预留通知日志）
+# 预留通知日志（Reservation Notification Log）
 
-## 概述
+## 一句话说明
 
-预留通知日志（Reservation Notification Log）是一个特殊的日志队列，用于记录 NVMe 命名空间上发生的预留变更事件。该日志具有以下特点：
+预留通知日志是 NVMe 控制器维护的**破坏性读取**（Destructive Read）日志队列，专门记录挂接到本控制器的命名空间上发生的"未屏蔽"预留变更事件，主机用 `Get Log Page`（LID `80h`）按时间顺序逐条消费。
 
-- **控制器本地存储**：每个控制器（Controller）维护自己的日志队列
-- **破坏性读取**：每次读取操作会返回最旧的通知记录，并将其从队列中移除
-- **事件过滤**：只记录未被屏蔽的预留变更事件
-- **作用范围**：仅涵盖挂接到该控制器的命名空间（Namespace）
+## 生活化类比
 
-通过 Get Log Page 命令并指定日志标识符（Log Identifier, LID）为 `80h` 来读取此日志。
+把控制器想成**物业前台**：
 
-**规范参考**：[PDF pp. 301-302](../_source/pages/page-301.md)
+- **每个命名空间** = 一间办公室
+- **预留变更**（被注册/被释放/被抢占）= 办公室门上换锁、撕封条、强拆工位
+- **物业前台** = 控制器自带的**事件小黑板**，每发生一次就在小黑板上记一行
+- **租户（主机）** 来前台时，前台**撕下最早那行**给他（破坏性读取），并在黑板底下补"已处理"标记
+- **小黑板写满了** = 队列溢出，前台不会拒绝登记，只会把**最早的那一行划掉**，但"已划掉的次数"会记在**最新一行**的右上角
+- 租户一比较：哎？我前一条是第 102 号，现在变成第 110 号——说明有 7 条**我没看到**
 
----
-
-## 工作原理
-
-### 队列结构示意图
-
-下图展示了预留通知日志的工作机制：
+## 工作流程
 
 ```text
-未屏蔽的预留变更事件
-          |
-          v
-   +--------+----------+----------+       Get Log Page LID 80h
-   | LPC n  | LPC n+1  | LPC n+2  |  --------------------------> 返回并移除最旧的记录
-   +--------+----------+----------+       
-          ^
-          |
-    队列溢出时，丢失的变更会使
-    最新入队记录的计数器前进
+  命名空间上发生"未屏蔽"预留变更事件
+                |
+                v
+   +-----------+----------+-----------+-----------+     Get Log Page LID 80h
+   |  LPC=100  |  LPC=101 |  LPC=102  |  LPC=103 |  <------ 返回最旧并移除
+   +-----------+----------+-----------+-----------+
+                                       ^ 
+                                       |
+                                  LPC 持续递增
+                                  (即使队列溢出也递增)
+
+   LPC 字段语义：
+   0h               = 队列空，返回全零 64 字节页
+   1h..FFFF...FFFFh = 事件编号
+   绕过全 1 后回绕  = 下一次重置为 1h
 ```
 
-**说明**：
-- 事件按发生顺序入队，每个事件都有递增的日志页计数器（Log Page Count, LPC）
-- 读取时返回队列头部（最旧）的记录，同时将其移除
-- 当队列满时，新事件会覆盖旧事件，但会更新计数器以指示丢失了多少记录
+**字段级流程**：
 
-**规范参考**：[PDF pp. 301-302](../_source/pages/page-301.md)
+1. 主机对控制器下发 `Get Log Page`，`LID = 80h`。
+2. 控制器取出队列头部最旧的一条记录返回，同时**从队列中移除**。
+3. 主机解析 64 字节日志页：LPC、RNLPT、NALP、NSID。
+4. 主机继续读取直到 `NALP = 0`，表示队列清空。
+5. 队列空时返回全零 64 字节页（所有字段为 0h）。
 
----
+## 初学者案例
 
-## 核心字段说明
+**场景：多主机共享一个命名空间，怎么知道别的机器把我的预留抢走了？**
 
-### 日志记录结构
+1. 主机 A 在 NS1 上注册、并下了预留（Reservation）。
+2. 主机 B 发 `Reservation Register` 把 A 抢占走（Registration Preempted）。
+3. 控制器在队列里入队一条记录：`LPC=42`、`RNLPT=01h`（Registration Preempted）、`NSID=1`、`NALP=0`。
+4. 主机 A 轮询日志（或收到异步事件触发）→ 发 `Get Log Page LID 80h`。
+5. 控制器返回这条 LPC=42 的记录，并从队列移除。
+6. 主机 A 看到自己被抢占了，决定让出锁或重注册。
 
-每条预留通知记录包含以下关键字段：
+> 关键点：日志是**控制器本地**的（每个控制器一份），只覆盖挂接到**本控制器**的命名空间；用 `Reservation Notification Mask`（Feature `82h`）可以屏蔽不想关心的事件类型。
 
-| 字段名称 | 说明 |
-|---------|------|
-| **LPC**（Log Page Count）<br>日志页计数器 | • 64 位序列号，用于标识每个通知事件<br>• 控制器级别重置（Controller Level Reset）时清零<br>• 从 `1h` 开始递增，达到全 `FFFFFFFFFFFFFFFFh` 后回绕到 `1h`<br>• `0h` 保留用于表示空结果（无可用记录） |
-| **RNLPT**（Reservation Notification Log Page Type）<br>通知类型 | 指示事件类型：<br>• Registration Preempted（注册被抢占）<br>• Reservation Released（预留被释放）<br>• Reservation Preempted（预留被抢占） |
-| **NALP**（Number of Additional Log Pages）<br>额外日志页数量 | • 指示读取当前记录后还有多少条未读记录<br>• 最大值为 255（饱和计数） |
-| **NSID**（Namespace Identifier）<br>命名空间标识符 | 指示发生预留变更的命名空间 ID |
-| **空队列标识** | 当队列为空时，返回全零的 64 字节日志页 |
+## 必须记住的规则
 
-**规范参考**：[PDF p. 302](../_source/pages/page-302.md)
+| 规则 | 要点 |
+|------|------|
+| 破坏性读取 | 每次读出后**立即从队列移除**，不可重复读；NALP 告诉主机"还剩多少条没读" |
+| 队列在控制器本地 | 每个控制器维护自己的队列，与 NVM 子系统、命名空间无关；跨控制器看不到对方的事件 |
+| LPC 单调递增 | 64 位序列号，从 `1h` 起递增；`0h` 保留表示空；`FFFF...FFFFh` 后回绕到 `1h` |
+| 溢出计数在最新条 | 队列满时仍持续递增 LPC；最近一条的 LPC 反映"包括已丢失事件在内的累计计数" |
+| 仅未屏蔽事件入队 | 已被 `Reservation Notification Mask`（Feature `82h`）屏蔽的事件**不会**生成日志记录 |
+| 屏蔽在事件产生时生效 | 屏蔽是"出生前过滤"，不是"出生后丢弃"——主机不能事后读到被屏蔽的事件 |
+| NSID 指向源命名空间 | 每条记录带命名空间 ID，主机能直接定位是哪间办公室出的事 |
+| 命名空间独立配置 Mask | Feature `82h` 按命名空间生效；支持广播 Set 但**不支持广播 Get** |
+| Reservation Persistence 单独配 | Feature `83h`（PTPL）控制预留是否跨断电保留；不可被 Save；与 Mask 是不同维度 |
+| Controller Level Reset 清零 LPC | 控制器级重置会把 LPC 计数器清零，主机要意识到序列号会"重置" |
 
-### 溢出处理机制
+## 容易混淆的地方
 
-当队列容量不足时，系统采用以下策略：
+| 容易混 | 实际区别 |
+|--------|----------|
+| 预留通知日志 vs 普通快照日志 | 通知日志读一次就消失；普通日志（如 Error Info）读 N 次都一样 |
+| NALP vs LPC | NALP 告诉你"这条读完还剩多少条"；LPC 是"事件的唯一编号"。NALP = 0 时队列空，**不是** LPC 归零 |
+| RNLPT 值 `1h` vs `3h` | `1h` = Registration Preempted（注册被抢）；`3h` = Reservation Preempted（预留被抢）；`2h` = Reservation Released（释放） |
+| Feature `82h` Mask vs Feature `83h` PTPL | Mask 决定"记不记"；PTPL 决定"断电后还在不在"；两者都按命名空间配置但**作用不同** |
+| 广播 Set vs 广播 Get | Feature `82h`/`83h` 都支持"一次设全部挂接命名空间"；**都不支持**广播 Get |
+| LPC 跳跃 vs 事件丢失 | 连续读取时 LPC 跳号 = 队列溢出丢事件；**LPC 不跳但 NALP 大于实际期望** 也说明有异常 |
+| PTPL 启用 vs 预留持久 | PTPL 启用 = 断电后 Reservations + Registrants 都保留；PTPL 禁用 = 全部释放 + 清除注册者 |
+| Save 操作 vs 不可 Save | Feature `83h`（PTPL）**不能**用 Save 命令持久化（non-saveable） |
 
-1. **序列号持续递增**：即使无法将事件入队，LPC 序列号仍会递增
-2. **丢失检测**：通过比较连续读取的 LPC 值，主机可以检测到是否有记录丢失
-3. **最新记录更新**：队列中最新的记录会更新其 LPC，反映包括已丢失事件在内的所有事件计数
+## 进阶细节
 
-**举例说明**：
-- 假设队列当前有 LPC 为 100、101、102 的三条记录（队列已满）
-- 新事件发生（LPC 应为 103），但队列无空间
-- 系统移除 LPC 100 的记录，将 LPC 103 的事件入队
-- 主机读取时会发现 LPC 从 102 跳到 103，可以推断没有丢失记录
-- 若跳跃幅度更大（如从 102 到 110），则表明丢失了中间的 7 个事件
+- **64 字节页布局**（规范 Figure 290）：
+  - Bytes `07:00` = LPC（Log Page Count, 64 位）
+  - Byte `08` = RNLPT（Reservation Notification Log Page Type）
+  - Byte `09` = NALP（Number of Additional Log Pages, 8 位，>255 时饱和为 255）
+  - Bytes `11:10` = Reserved
+  - Bytes `15:12` = NSID（Namespace Identifier, 32 位）
+  - Bytes `63:16` = Reserved
+- **LPC 边界处理**（规范 5.1.12.1.32）：
+  - 队列空时返回 `0h` 标识的"空日志页"；LPC 从非零值（最后一条记录的 LPC）继续递增。
+  - 跨越 `FFFF_FFFF_FFFF_FFFFh` 时，下次递增回到 `1h`，并产生新日志页。
+- **RNLPT 编码**：
+  - `0h` = Empty Log Page
+  - `1h` = Registration Preempted
+  - `2h` = Reservation Released
+  - `3h` = Reservation Preempted
+  - `4h..FFh` = Reserved
+- **NALP 饱和计数**：当未读记录 > 255 时，NALP 返回 255；主机不应假定"读到 NALP=0 才结束"，应循环到 LPC 出现 `0h` 标识的空页。
+- **Mask 屏蔽语义**（规范 5.1.25.1.18）：屏蔽在事件**产生时**生效，控制器根本不创建日志页；这与"产生后丢弃"在主机侧不可见的事件流上**结果相同**，但实现上不会占用队列槽。
+- **PTPL 与 Reservations 关系**（规范 5.1.25.1.19）：PTPL=1 时 Reservations 和 Registrants 在断电后保留；PTPL=0 时断电后全部释放，控制器重启后没有持久化预留状态。
+- **Persistent Event Log 关联**：预留通知日志里的事件**同时**会在 Persistent Event Log 中以"Reservation Notification"事件类型持久化，跨掉电后可重建时间线。
 
-**规范参考**：[PDF pp. 301-302](../_source/pages/page-301.md)
+## 规范依据
 
----
+- [Reservation Notification 队列创建、破坏性读取与溢出 LPC 计数，PDF 第 301 页](../_source/pages/page-301.md)
+- [Figure 290 字段布局（LPC/RNLPT/NALP/NSID）与回绕，PDF 第 302 页](../_source/pages/page-302.md)
+- [Reservation Notification Mask 特性（Feature `82h`），PDF 第 424 页](../_source/pages/page-424.md)
+- [Reservation Persistence 特性（Feature `83h`），PDF 第 424 页](../_source/pages/page-424.md)
+- [Persistent Event Log 事件类型定义，PDF 第 301 页](../_source/pages/page-301.md)
 
-## 相关特性与配置
+## 相关阅读
 
-### 1. Reservation Notification Mask（预留通知屏蔽，Feature ID `82h`）
-
-**功能说明**：
-控制哪些类型的预留变更事件会被记录到日志中。
-
-**可屏蔽的事件类型**：
-| 事件类型 | 说明 |
-|---------|------|
-| Registration Preempted<br>注册被抢占 | 主机的注册被其他主机抢占 |
-| Reservation Released<br>预留被释放 | 预留被主动释放 |
-| Reservation Preempted<br>预留被抢占 | 预留被其他主机抢占 |
-
-**配置特点**：
-- **作用范围**：每个命名空间独立配置
-- **广播设置**：支持 Broadcast Set 操作，可一次性配置所有已挂接且具备预留能力的命名空间
-- **广播读取**：不支持 Broadcast Get 操作
-- **屏蔽机制**：在事件产生时阻止其创建，而非事后过滤
-
-**规范参考**：[PDF p. 424](../_source/pages/page-424.md)
-
-### 2. Reservation Persistence（预留持久化，Feature ID `83h`）
-
-**功能说明**：
-控制预留信息在断电后是否保留（Persist Through Power Loss, PTPL）。
-
-**配置选项**：
-| PTPL 值 | 断电后的行为 |
-|---------|-------------|
-| **1**（启用） | 保留预留（Reservations）和注册者（Registrants）信息 |
-| **0**（禁用） | 释放预留并清除注册者信息 |
-
-**配置特点**：
-- **作用范围**：每个命名空间独立配置
-- **广播设置**：支持 Broadcast Set，影响所有已挂接且具备预留能力的命名空间
-- **广播读取**：不支持 Broadcast Get 操作
-- **保存限制**：此特性不可被保存（Non-saveable，不支持 Save 操作）
-
-**规范参考**：[PDF pp. 424-425](../_source/pages/page-424.md)
-
-### 3. 与其他日志的区别
-
-预留通知日志与普通日志的重要区别：
-
-| 特性 | 预留通知日志 | 普通快照式日志 |
-|------|-------------|---------------|
-| **读取效果** | 破坏性读取（移除记录） | 非破坏性读取（保留数据） |
-| **NALP 字段** | 指示是否还有更多记录待读取 | 通常不需要 |
-| **使用场景** | 主机需持续排空队列 | 主机可重复读取相同数据 |
-
-**NALP**（Number of Additional Log Pages）字段告诉主机是否应该继续发起读取请求，直到队列清空。
-
-**规范参考**：[PDF pp. 301-302](../_source/pages/page-301.md)
-
----
-
-## 典型使用流程
-
-### 主机端操作步骤
-
-1. **配置屏蔽**：根据需要设置 Reservation Notification Mask（Feature `82h`）
-2. **配置持久化**：根据需要设置 Reservation Persistence（Feature `83h`）
-3. **读取日志**：
-   - 发送 Get Log Page 命令，LID = `80h`
-   - 处理返回的通知记录
-4. **检查 NALP**：
-   - 如果 NALP > 0，继续读取
-   - 如果 NALP = 0，队列已空
-   - 空队列返回全零 64 字节页
-5. **检测丢失**：比较连续记录的 LPC 值，发现序列号跳跃则表明有记录丢失
-
-### 注意事项
-
-- 只有挂接到当前控制器的命名空间的事件才会出现在该日志中
-- 已屏蔽的事件类型不会生成日志记录
-- 控制器重置会清零 LPC 计数器，导致序列号重新开始
-- 队列容量有限，重要事件应及时读取以避免丢失
-
----
-
-## 规范引用
-
-本文档内容基于以下 NVMe 规范章节：
-
-- [队列创建、破坏性读取、空行为与溢出计数，PDF p. 301](../_source/pages/page-301.md)
-- [渲染的图 290 字段布局与计数器回绕，PDF p. 302](../_source/pages/page-302.md)
-- [Reservation Notification Mask 特性，PDF p. 424](../_source/pages/page-424.md)
-- [Reservation Persistence 特性，PDF pp. 424-425](../_source/pages/page-424.md)
+- [namespace-reservation-lifecycle.md](namespace-reservation-lifecycle.md) - 产生通知的预留操作
+- [log-page-retrieval.md](log-page-retrieval.md) - Get Log Page 读取机制
+- [persistent-event-log.md](persistent-event-log.md) - 跨断电事件补全
+- [asynchronous-event-reporting.md](asynchronous-event-reporting.md) - AER 通知主机来读取

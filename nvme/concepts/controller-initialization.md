@@ -1,147 +1,131 @@
 # 控制器初始化（Controller Initialization）
 
-控制器初始化是一个依赖于传输类型的启动过程（transport-specific bootstrap process），主要完成以下工作：
+## 一句话说明
 
-- 建立管理通道（Admin Path）
-- 选择控制器支持的配置参数
-- 使能控制器（Enable Controller）
-- 发现其命令集（Command Set）和命名空间（Namespace）配置
-- 创建 I/O 队列（I/O Queue）
-- 可选地启用异步事件通知（Asynchronous Events）
+控制器初始化是"transport-specific"的启动流程：Memory-Based（PCIe）走"等 RDY=0 → 配 AQA/ASQ/ACQ → 写 CC.EN=1 → 等 RDY=1"，Message-Based（Fabrics）走"建链 → Connect 建 Admin 队列 → Property Get/Set 写 CC → EN=1 → 等 RDY=1"；之后统一进入"Identify → 枚举 NS → 建 I/O 队列 → 配置 AER"四步。
 
-> **规范参考**：[PDF pp. 124-127](../_source/pages/page-124.md)
+## 生活化类比
 
-## 概念模型
+把控制器初始化想成**新员工入职**：
 
-不同传输类型的控制器初始化流程存在差异，但核心步骤相似。下图对比了基于内存的传输（Memory-based，如 PCIe）和基于消息的传输（Message-based，如 NVMe-oF Fabrics）：
+- **Memory-Based 员工**（本地坐班）：先在工位上铺好入职材料（`AQA`/`ASQ`/`ACQ`），再按下"上班打卡"（`CC.EN=1`），等工牌灯亮（`CSTS.RDY=1`）。
+- **Message-Based 员工**（远程办公）：先打开视频会议（建链 + Connect 建 Admin 队列），可能要先"亮工牌"（`AUTHREQ` 触发的认证），再打卡上班。
+- 入职后**两人都做同一件事**：先自我介绍（Identify Controller），认识团队（命令集 / Profile）、认识项目（命名空间）、领工单（I/O 队列），最后订邮件提醒（异步事件 AER）。
 
-```text
-基于内存的传输 (PCIe)                基于消息的传输 (Fabrics)
-等待 RDY=0                          建立传输层连接
-配置 AQA / ASQ / ACQ                 执行 Connect → 创建 Admin 队列 + 关联
-选择 CSS / AMS / MPS                 如果 AUTHREQ != 0 则执行身份认证
-设置 EN=1; 等待 RDY=1                Property Get/Set CAP, CC; EN=1; 等待 RDY=1
-          \                         /
-           +---> 执行 Identify 识别控制器和 I/O 命令集
-                 枚举活动的命名空间
-                 协商/创建 I/O 队列
-                 启用事件监听 + 提交 AER
-```
-
-> **说明**：此流程综合了规范中的两个标准序列以及 Figure 82 中的队列创建时序图。[PDF pp. 124-126](../_source/pages/page-124.md)
-
-## 基于能力寄存器的通用初始化序列
-
-### 配置命令集选择
-
-主机（Host）需要根据控制器能力寄存器 `CAP.CSS`（Controller Capabilities - Command Sets Supported）来决定命令集配置 `CC.CSS`（Controller Configuration - Command Set Selection）：
-
-| CSS 值 | 含义 | 说明 |
-|--------|------|------|
-| `111b` | 无 I/O 命令集模式（No I/O Command Set） | 仅支持管理命令 |
-| `110b` | I/O 命令集组合（I/O Command Set Combination） | 支持多种命令集的组合 |
-| `000b` | NVM 命令集（NVM Command Set） | 标准块存储命令集，需满足能力条件 |
-
-### 初始化前的准备工作
-
-在设置 `CC.EN=1`（使能控制器）之前，主机还需要完成：
-
-1. **选择仲裁机制**（Arbitration Mechanism）：从控制器支持的仲裁方式中选择一种
-2. **选择内存页大小**（Memory Page Size）：与系统内存管理匹配
-3. **等待就绪信号**：设置 `CC.EN=1` 后，轮询等待 `CSTS.RDY=1`（Controller Status - Ready）
-
-> **规范参考**：[PDF pp. 124-126](../_source/pages/page-124.md)
-
-### 控制器就绪后的发现流程
-
-控制器进入就绪状态后，主机按以下顺序执行发现操作：
-
-1. **识别控制器**：执行 `Identify Controller` 命令，获取控制器基本信息
-2. **命令集发现**：
-   - 如果控制器支持命令集组合（Combinations），主机识别可用组合并选择合适的配置文件（Profile）
-   - 对每个已使能的 I/O 命令集，执行命令集特定的识别操作
-3. **枚举命名空间**：遍历活动的命名空间标识符（Active NSID）
-4. **读取标识结构**：获取命令集特定和命令集独立的 Identify 数据结构
-5. **创建 I/O 队列**：
-   - **基于内存的传输**：按照"先完成队列（CQ）后提交队列（SQ）"的顺序创建
-   - **Fabrics 传输**：使用 Connect 命令创建队列对（Queue Pair）
-6. **配置异步事件**：在控制器就绪后的任意时刻配置异步事件通知
-
-> **规范参考**：[PDF pp. 125-127](../_source/pages/page-125.md)
-
-## 不同传输类型的启动细节
-
-下表对比了基于内存和基于消息两种传输类型在初始化各阶段的差异：
-
-| 初始化阶段 | 基于内存的控制器（PCIe） | 基于消息的控制器（Fabrics） |
-|-----------|------------------------|---------------------------|
-| **建立管理路径** | 在禁用状态下通过寄存器编程：<br>• `AQA`（Admin Queue Attributes）<br>• `ASQ`（Admin Submission Queue）<br>• `ACQ`（Admin Completion Queue） | 建立传输层连接后：<br>• 执行 Connect 命令<br>• 创建 Admin 队列对和关联（Association） |
-| **属性访问方式** | 通过绑定定义的寄存器访问（Binding-defined register access） | 使用 Fabrics Property Get 和 Property Set 命令 |
-| **身份认证** | 不属于此初始化序列 | 当 `AUTHREQ != 0` 时，必须在正常初始化之前完成认证 |
-| **创建 I/O 队列** | 1. 通过 Set Features 设置队列数量（Number of Queues）<br>2. 配置中断（Interrupt）设置<br>3. 先创建完成队列（Create CQ）<br>4. 后创建提交队列（Create SQ） | 1. 查询队列数量限制（Number of Queues 和 `CAP.MQES`）<br>2. 对每个 I/O 队列对执行 Connect |
-
-> **补充说明**：Figure 82 展示了成功的 Connect 命令会在任何必需的带内身份认证（in-band authentication）交换之前创建 Admin 或 I/O 队列。如果主机在建立关联后 2 分钟内未设置 `CC.EN=1`，控制器可能会移除该关联。
-
-> **规范参考**：[PDF pp. 125-127](../_source/pages/page-125.md)
-
-## Discovery 控制器的初始化流程
-
-Discovery 控制器（Discovery Controller）是 NVMe-oF 架构中的特殊控制器，专门用于发现可用的存储目标。其初始化流程根据是否请求变更通知而有所不同：
+## 工作流程
 
 ```text
-收到 Connect 请求
-  |
-  |-- 如果请求变更通知 + 非零 KATO
-  |      ├─> 控制器可调整 KATO（Keep Alive Timeout）
-  |      ├─> 预分配 AER/AEN 资源（异步事件）
-  |      ├─> Connect 成功
-  |      └─> 主机提交 AER（Asynchronous Event Request）
-  |
-  └-- 否则
-         ├─> 使用固定的 KATO
-         |   （或对不支持的通知请求返回 Connect 错误）
-         └─> 主机完成连接，不提交 AER
+Memory-Based (PCIe)                      Message-Based (Fabrics)
+─────────────────────────────────        ─────────────────────────────────
+等 CSTS.RDY=0                            建传输层连接
+配 AQA / ASQ / ACQ                       发 Connect 建 Admin 队列 + Association
+按 CAP.CSS 选 CC.CSS                     若 AUTHREQ≠0 → 必做认证
+选 AMS / MPS                             Property Get/Set CAP, CC；写 CC.EN=1
+写 CC.EN=1；轮询 CSTS.RDY=1              轮询 CSTS.RDY=1
+              \                          /
+               +---> 共同后续：Identify Controller / 命令集 Profile
+                     枚举活动 NSID → 读 Identify Namespace
+                     协商/创建 I/O 队列
+                     配置 AER
 ```
 
-### 初始化步骤详解
+简化说明：两路在"建立 Admin 通道"上分叉，在"识别 + 队列 + AER"上汇合。
 
-上述流程简化自规范中的 Figure 83，保留了关键的决策分支：
+## 初学者案例
 
-- **变更通知支持** + **非零 Keep Alive Timeout** → 控制器预留异步事件资源
-- Connect 成功后的操作序列：
-  1. 如需身份认证，执行认证流程
-  2. 读取控制器能力（Capabilities）
-  3. 写入控制器配置 `CC`（包括设置 `EN=1`）
-  4. 等待就绪信号 `RDY=1`
-  5. 识别相应的 Controller 数据结构
-  6. 读取 Discovery Log Page（发现日志页）
+**场景：驱动加载时按 PCIe 流程初始化一个本地 NVMe SSD。**
 
-> **规范参考**：[PDF p. 128](../_source/pages/page-128.md)
+1. 上电后等 `CSTS.RDY=0`，确认上次的 Controller Reset 已结束。
+2. 写 `AQA`/`ASQ`/`ACQ`：分别配置 Admin SQ/CQ 的条目数（2..4096，0-based）、物理基地址（页对齐）。
+3. 读 `CAP.CSS`：若 `NOIOCSS=1` → `CC.CSS=111b`；若 `IOCSS=1` → `CC.CSS=110b`；若 `NCSS=1` → `CC.CSS=000b`。
+4. 写 `CC`：选好 `AMS`、`MPS`、合法的 `IOSQES`/`IOCQES`，再 `EN=1`。
+5. 轮询 `CSTS.RDY=1`（不可在 1 之前提交命令）。
+6. 发 `Identify Controller`（`CNS=1`）→ 读 `Identify Namespace`（遍历 NSID）→ `Set Features Number of Queues` → `Create I/O CQ` → `Create I/O SQ` → 提交 AER。
+7. 故障速查：`RDY=1` 长时间不到 → 看 `CAP.TO` 是否到；不到就查 `CFS`/`PP` 与 PCIe 链路状态。
 
-## 关键术语对照表
+## 必须记住的规则
 
-| 中文术语 | 英文术语 | 缩写 | 说明 |
-|---------|---------|-----|------|
-| 控制器 | Controller | - | NVMe 设备的管理核心 |
-| 主机 | Host | - | 发起 I/O 操作的系统 |
-| 管理队列 | Admin Queue | AQ | 用于管理命令的队列 |
-| 提交队列 | Submission Queue | SQ | 主机提交命令的队列 |
-| 完成队列 | Completion Queue | CQ | 控制器返回完成状态的队列 |
-| 命名空间 | Namespace | NS | NVMe 的逻辑存储单元 |
-| 异步事件请求 | Asynchronous Event Request | AER | 主机提交的异步事件监听命令 |
-| 异步事件通知 | Asynchronous Event Notification | AEN | 控制器发送的异步事件 |
-| 能力寄存器 | Controller Capabilities | CAP | 报告控制器支持的功能 |
-| 配置寄存器 | Controller Configuration | CC | 控制器的配置参数 |
-| 状态寄存器 | Controller Status | CSTS | 控制器的当前状态 |
-| 队列对 | Queue Pair | QP | 一对提交队列和完成队列 |
-| 关联 | Association | - | Fabrics 中主机与控制器的连接关系 |
+| 规则 | 要点 |
+|------|------|
+| 启动前提（Memory-Based） | 必须等 `CSTS.RDY=0`（上次重置结束）再开始 |
+| 启动前提（Fabrics） | 先建传输层连接 + Connect 成功，才能访问 CC/CAP |
+| Admin 队列配置时机 | `AQA`/`ASQ`/`ACQ` 仅在 `CC.EN=0` 时可改 |
+| CSS 选取 | `CC.CSS` 必须根据 `CAP.CSS` 选取：`NOIOCSS=1`→`111b`；`IOCSS=1`→`110b`；`NCSS=1`→`000b` |
+| 启用等待 | `CC.EN=1` 后到 `CSTS.RDY=1` 之间**禁止**提交任何命令 |
+| 队列条目大小 | `IOSQES`/`IOCQES` 必须在创建 I/O 队列前初始化为合法值；否则队列创建报 Invalid Queue Size |
+| 队列创建顺序（Memory-Based） | 先 `Create I/O CQ` → 后 `Create I/O SQ` |
+| 队列创建（Fabrics） | 用 Connect 命令一次建 SQ + CQ 队列对 |
+| 队列数量协商 | 创建 I/O 队列前先用 `Set Features Number of Queues` 协商（Memory-Based）；Fabrics 通过 `CAP.MQES` 限制 |
+| 认证要求 | Fabrics 下若 `AUTHREQ≠0`，**必须**在正常初始化前完成 in-band 认证 |
+| 关联超时 | Fabrics 主机在 Connect 后 2 分钟内未置 `CC.EN=1`，控制器可移除 Association |
+| 命名空间发现 | 用 `Identify CNS=0h` 逐 NSID 探测 或 `CNS=2h` 一次拉 1024 个活动 NSID；用 `CNS=10h` 拉已分配 NSID |
+| 异步事件 | 控制器就绪后**任意时刻**可配置 AER；建议在创建 I/O 队列前先发 AER 兜底 |
 
-## 规范参考
+## 容易混淆的地方
 
-以下页面提供了初始化流程的详细规范说明：
+| 容易混 | 实际区别 |
+|--------|----------|
+| 启动 vs 启用 | "启动"包含建链 + 配 Admin 队列；"启用"特指 `CC.EN=1` |
+| 启动 vs 重置 | 启动是首次可用化；重置是运行中复位（CLR/NSSR） |
+| Memory-Based vs Fabrics 初始化 | 前者用 MMIO 寄存器；后者用 Property Get/Set + Connect |
+| `CC.CSS=110b` vs `111b` | 110b = 多命令集组合（按 I/O Command Set Profile 选）；111b = 无 I/O 命令集（只跑 Admin） |
+| `RDY=1` vs `CFS=0` | RDY=1 是"已就绪处理命令"；CFS=0 是"无致命错误"——两件事要一起看 |
+| 关联保留 vs 关联超时 | CLR 前关联保留 2 分钟；启动期间未 `EN=1` 也可能 2 分钟后被移除 |
 
-- [基于内存的初始化起点，PDF p. 124](../_source/pages/page-124.md)
-- [基于内存的完成流程与 Fabrics 启动，PDF p. 125](../_source/pages/page-125.md)
-- [Figure 82 时序图与 Fabrics 初始化起点，PDF p. 126](../_source/pages/page-126.md)
-- [Fabrics 初始化延续与超时处理，PDF p. 127](../_source/pages/page-127.md)
-- [Figure 83 时序图与 Discovery 初始化序列，PDF p. 128](../_source/pages/page-128.md)
+## 进阶细节
+
+- **规范 3.5.1 Memory-Based 初始化序列**（PDF 第 124-125 页）：
+  1. 等 `CSTS.RDY=0`；
+  2. 配 `AQA` / `ASQ` / `ACQ`；
+  3. 读 `CAP.CSS`，按 `NOIOCSS` / `IOCSS` / `NCSS` 三种情形设置 `CC.CSS`；
+  4. 选 `AMS` / `MPS` / `IOSQES` / `IOCQES`（在 `CC.EN=0` 时合法可写）；
+  5. 写 `CC.EN=1`，轮询 `CSTS.RDY=1`；
+  6. 发 `Identify Controller`；
+  7. 若 `CAP.CSS.IOCSS=1`，识别可用命令集组合并选 Profile；
+  8. 对每个使能的 I/O 命令集做命令集特定的 Identify；
+  9. 枚举活动 NSID，识别 Namespace 数据结构；
+  10. 创建 I/O CQ / SQ（先 CQ 后 SQ）；
+  11. 任意时刻配置并提交 AER。
+- **`CAP.CSS` → `CC.CSS` 选取规则**（规范 3.5.1 / PDF 第 124 页）：
+  - `CAP.CSS.NOIOCSS=1` → `CC.CSS=111b`（无 I/O 命令集）；
+  - `CAP.CSS.IOCSS=1` → `CC.CSS=110b`（I/O 命令集组合）；
+  - `CAP.CSS.IOCSS=0` 且 `CAP.CSS.NCSS=1` → `CC.CSS=000b`（NVM 命令集）。
+- **Figure 82 时序**（规范 3.5.2 / PDF 第 126-127 页）：Fabrics 成功的 Connect 在任何必需 in-band 认证交换**之前**就建出 Admin / I/O 队列；主机 Association 建立后 2 分钟内未 `CC.EN=1`，控制器可移除该 Association。
+- **Fabrics 启动序列**（规范 3.5.2 / PDF 第 125-127 页）：
+  1. 建立传输层连接；
+  2. 发 Connect 命令 → 建 Admin 队列 + Association；
+  3. 若 `AUTHREQ≠0`，完成 in-band 认证；
+  4. Property Get CAP / Property Get CC / Property Set CC（写 `EN=1`）；
+  5. 轮询 `CSTS.RDY=1`；
+  6. Identify Controller / Identify Namespace；
+  7. 用 Connect 建 I/O 队列对（每对一个 QID）。
+- **Discovery 控制器初始化**（Figure 83 / 规范 3.5.3 / PDF 第 128 页）：
+  - 收到 Connect → 若**请求变更通知 + 非零 KATO** → 控制器**可**调 KATO + 预分配 AER/AEN 资源 → Connect 成功 → 主机提交 AER；
+  - 否则 → 控制器使用**固定** KATO；若不支持该通知请求则 Connect 报错；
+  - 控制器不一定支持可变 KATO（"MAY"），可保持固定 KATO。
+- **Discovery 启动后顺序**（规范 3.5.3 / PDF 第 128 页）：
+  1. 如需认证，先做认证；
+  2. 读 Controller Capabilities；
+  3. 写 CC（含 `EN=1`）；
+  4. 等 `RDY=1`；
+  5. 识别相应 Controller 数据结构；
+  6. 读 Discovery Log Page。
+- **Create I/O 队列前置**（规范 3.3.1 / PDF 第 79 页）：在 `CC.EN=1` 之前若未初始化 `CC.IOCQES` / `CC.IOSQES`，Create I/O CQ/SQ 命令会以 `Invalid Queue Size` 中止。
+- **`CC.CSS=110b` 时的工作**（规范 3.5.1 / PDF 第 124-125 页）：主机识别可用命令集组合并选择合适 Profile（I/O Command Set Profile，见 5.1.25.1.17）。
+- **章节号**：Memory-Based 在 3.5.1；Fabrics 在 3.5.2；Ready Modes 在 3.5.3-3.5.4；Connect 命令在 3.3.2；Identify CNS 在 5.1.13；Admin 队列寄存器在 3.1.4.8-10；CC 在 3.1.4；CSTS 在 3.1.5；CAP 在 3.1.3。
+
+## 规范依据
+
+- [Memory-Based 初始化起点，PDF 第 124 页](../_source/pages/page-124.md)
+- [Memory-Based 完成流程与 Fabrics 启动，PDF 第 125 页](../_source/pages/page-125.md)
+- [Figure 82 时序与 Fabrics 初始化，PDF 第 126 页](../_source/pages/page-126.md)
+- [Fabrics 初始化延续与超时处理，PDF 第 127 页](../_source/pages/page-127.md)
+- [Figure 83 与 Discovery 初始化，PDF 第 128 页](../_source/pages/page-128.md)
+- [CC / CSTS / CAP 定义，PDF 第 79 页](../_source/pages/page-079.md)
+
+## 相关阅读
+
+- [controller-enable-shutdown-reset.md](controller-enable-shutdown-reset.md) - 启用/禁用/重置的寄存器契约
+- [controller-ready-modes.md](controller-ready-modes.md) - RDY=1 的就绪模式选择
+- [asynchronous-event-reporting.md](asynchronous-event-reporting.md) - 初始化末尾配置 AER
+- [admin-command-model.md](admin-command-model.md) - Identify 等 Admin 命令模型

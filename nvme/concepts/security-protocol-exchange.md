@@ -1,115 +1,129 @@
 # 安全协议交换（Security Protocol Exchange）
 
-## 概述
+## 一句话说明
 
-安全协议交换机制为主机（Host）和控制器（Controller）之间提供了一个标准化的安全通信通道。通过 **Security Send** 和 **Security Receive** 这两个配对命令，主机可以向控制器发送安全相关的命令和参数，并接收控制器返回的状态和数据。
+NVMe 不自己定义安全协议细节，只用 **Security Send**（主机→控制器）和 **Security Receive**（控制器→主机）这对命令当"信封"，具体协议内容由 SPC-5 / ACS-4 等规范定义，主机通过协议发现机制查支持列表。
 
-**核心设计理念：**
-- NVMe 只负责提供命令的"信封"（Command Envelope），即传输机制
-- 具体的请求/响应配对关系和数据载荷（Payload）的含义由所选择的安全协议（Security Protocol）自行定义
-- 这种设计实现了协议层面的解耦，使 NVMe 能够支持多种不同的安全协议
+## 生活化类比
 
-> 参考规范：[PDF pp. 390-392](../_source/pages/page-390.md)
+把安全协议交换想成**"密封信箱"**：
 
-## 工作原理
+- **Security Send** = 你把"请求信"投进信箱（带协议类型 + 协议特定字段 + 信件正文）。
+- **Security Receive** = 你打开信箱取"回信"。
+- **协议 `00h`** = 信箱的"说明书"，直接告诉你"这个信箱支持哪几种信件格式"（不需要先投信才能读）。
+- **协议 `EAh`（NVMe 专用）** = 信箱里专门为 NVMe 用户留的格子，其中 `SPSP=0001h` 用来访问 RPMB。
+- **NSSF** = 当格子太大，再细分"几个具体仓位"（比如哪个 RPMB Target）。
 
-### 交互模型
-
-下图展示了主机和控制器之间的典型安全协议交互流程：
+## 工作流程
 
 ```text
-主机（Host）                  控制器（Controller）/ 安全协议处理模块
-    |                                           |
-    |---- Security Send (发送安全命令和数据) ---->|
-    |                                           |
-    |                   [控制器执行协议定义的操作] |
-    |                                           |
-    |<--- Security Receive (接收状态和结果) ------|
-    |                                           |
-
-注意：命令的配对关系和保留机制由具体的安全协议定义
+  主机                                       控制器 / 安全协议模块
+    |                                            |
+    |  Security Send (主机→控制器)              |
+    |  CDW10: SECP(31:24) | SPSP1(23:16)        |
+    |         | SPSP0(15:08) | NSSF(7:0)        |
+    |  CDW11: Transfer Length (TL)              |
+    |  DPTR : 数据缓冲                          |
+    |-----------------------------------------> |
+    |                  [协议执行]               |
+    |                                            |
+    |  Security Receive (控制器→主机)           |
+    |  CDW10: SECP | SPSP1 | SPSP0 | NSSF       |
+    |  CDW11: Allocation Length (AL)            |
+    |  DPTR : 接收缓冲                          |
+    | <---------------------------------------- |
+    |                                            |
+    ※ Send/Receive 配对关系由协议决定（SPC-5/ACS-4）
+    ※ SECP=00h 的 Receive 是"协议发现"，不需要先 Send
 ```
 
-**关键特性：**
+## 初学者案例
 
-1. **不对称方向性**：Send 和 Receive 是两个独立的命令，由协议决定如何配对
-2. **协议主导**：配对关系和数据保留策略完全由安全协议规范定义
-3. **数据易失性**：通过 Receive 获取的数据在发生通信中断（Communication Loss）或控制器级别重置（Controller Level Reset）时可能丢失
+**场景：RPMB 写不进去，怀疑是 Target 选错了。**
 
-> 参考规范：[PDF pp. 390-392](../_source/pages/page-390.md)
+1. 你要做 RPMB 编程操作，先用 `nvme security-receive -p 0xEA -s 0x0001 -l 512` 读 RPMB 配置。
+2. 命令中：`SECP=EAh`（NVMe 专用协议），`SPSP=0001h`（RPMB 子协议），`NSSF=<target_idx>`（第几个 RPMB 目标）。
+3. 控制器回 `Invalid Field in Command`。
+4. 排错：用 `nvme id-ctrl` 看 `RPMB` 字段（`RNUM`=`RPMB Unit Number`）；若目标索引 ≥ RNUM 就是越界。
+5. 还要确认 `Identify` 的 RPMB 能力位声明了非零 RPMB 目标数，否则控制器可能根本不支持 RPMB（不实现 Security Send/Receive 时连命令都不收）。
+6. 改 `NSSF=0`（默认第一个 RPMB）重试。
 
-## 命令结构
+> 排错提示：`NSSF` 字段仅在 `SECP=EAh` 时有定义；其他协议下它是保留位，写了非零值就报错。
 
-### 命令字段说明
+## 必须记住的规则
 
-Security Send 和 Security Receive 命令共享相似的字段结构，但用途略有不同：
+| 规则 | 要点 |
+|------|------|
+| 命令对 | Security Send（Out）+ Security Receive（In） |
+| SECP 范围 | `00h`-`FFh`，由 SPC-5 / ACS-4 等外部规范定义 |
+| 协议 `00h` | 专用：协议发现；只需 Security Receive，不与任何 Send 关联 |
+| 不支持的 SECP | 命令中止，状态 `Invalid Field in Command` |
+| CDW10 位域 | `31:24` SECP；`23:16` SPSP1（bit 15:08 of SPSP）；`15:08` SPSP0（bit 07:00 of SPSP）；`07:00` NSSF |
+| NSSF 含义 | 仅当 `SECP=EAh` 时有定义；其他协议此字段保留 |
+| 协议 `EAh` 用途 | 分配给 NVMe 接口使用（参见 ACS-4） |
+| SPSP=0001h (EAh) | 选 RPMB；`NSSF`=RPMB Target |
+| SPSP=0002h..FFFFh (EAh) | 保留 |
+| CDW11 含义 | Send=Transfer Length (TL)；Receive=Allocation Length (AL) |
+| 长度语义 | 与 SPC-5 的 `INC_512=0h` 情形相同 |
+| DPTR | 数据缓冲起始地址，按 Common Command Format Figure 92 解释 |
+| 其他命令字段 | 除 DPTR/CDW10/CDW11 外，命令特定字段保留 |
+| 配对关系 | 由协议规范定义；NVMe Base 不规定状态保留时长 |
+| 数据易失性 | Receive 取得的数据可能在通信丢失或控制器级重置后丢失 |
+| RPMB 强制支持 | 控制器声明非零 RPMB Target 数时，必须实现 Send/Receive 命令 |
+| RPMB 能力 | 在 Identify Controller 数据结构中声明目标数与共享能力 |
 
-| 字段名称 | Security Send | Security Receive | 说明 |
-|---------|--------------|------------------|------|
-| **SECP**<br>（Security Protocol） | 指定 Security Protocol Out 的语义 | 指定 Security Protocol In 的语义 | 选择要使用的安全协议类型 |
-| **SPSP**<br>（Security Protocol Specific） | 16 位协议特定选择器 | 使用相同的选择器命名空间 | 协议内部的子功能选择 |
-| **NSSF**<br>（NVMe Security Specific） | 仅在协议 `EAh` 时使用 | 仅在协议 `EAh` 时使用 | 对于非 `EAh` 协议，此字段为保留字段 |
-| **长度字段** | 指定传输长度（Transfer Length） | 指定分配长度（Allocation Length） | Send 表示发送的数据量<br>Receive 表示预留的接收缓冲区大小 |
-| **数据方向** | 主机到控制器 | 控制器到主机 | 数据流向 |
+## 容易混淆的地方
 
-**错误处理：**
-- 如果 SECP 字段指定的协议值为保留值或控制器不支持的值，命令将失败并返回 **Invalid Field in Command** 错误状态
+| 容易混 | 实际区别 |
+|--------|----------|
+| Security Send vs Security Receive | Send 是主机→控制器；Receive 是控制器→主机 |
+| SECP vs SPSP | SECP=协议族；SPSP=协议内子功能 |
+| SPSP1 vs SPSP0 | SPSP1 = SPSP 字段的 bit 15:08；SPSP0 = bit 07:00 |
+| NSSF 含义 | 仅在 `SECP=EAh` 下作为子选择；其他协议保留 |
+| 协议 `00h` vs 其他协议 | `00h` 是发现入口；其他协议是实际工作 |
+| Transfer Length vs Allocation Length | TL=要发送的字节数；AL=接收缓冲预留大小 |
+| SECP=EAh vs SCSI SPC 协议 | EAh 由 ACS-4 定义给 NVMe；其余多由 SPC-5 定义 |
+| Security 命令 vs Format NVM | Security 走信令通道；Format NVM 是 NVMe 内置命令 |
 
-> 参考规范：[PDF pp. 391-392](../_source/pages/page-391.md)
+## 进阶细节
 
-## 协议发现与 NVMe 专用协议
+- **CDW10 位定义**（规范 Figures 376/380）：
+  - `31:24` SECP（按 SPC-5 定义）
+  - `23:16` SPSP1（SPSP bit 15:08）
+  - `15:08` SPSP0（SPSP bit 07:00）
+  - `07:00` NSSF（仅 SECP=EAh 有定义；其余协议保留）
+- **CDW11**：
+  - Receive：`AL` Allocation Length
+  - Send：`TL` Transfer Length
+  - 均与 SPC-5 的 `INC_512=0h` 情形一致
+- **协议 `00h` 行为**（规范 5.1.23.2）：返回控制器支持的协议列表；用作发现过程，不需要对应 Send。
+- **协议 `EAh` 子协议**（Figure 378）：
+  - `SPSP=0001h` → Replay Protected Memory Block；`NSSF` = RPMB Target
+  - `SPSP=0002h..FFFFh` → 保留
+- **命令字段使用**：仅 DPTR + CDW10 + CDW11，其他命令特定字段保留。
+- **错误码**：
+  - `Invalid Field in Command`（保留/不支持 SECP、SPSP 非法、NSSF 在非 EAh 协议下非零等）
+- **强制支持触发条件**：控制器在 Identify Controller 中报告非零 RPMB Target 数时，必须实现 Security Send 和 Security Receive。
+- **协议规范引用**：
+  - SPC-5（SCSI Primary Commands - 5）：定义大多数协议的请求/响应格式
+  - ACS-4（ATA Command Set - 4）：定义 `EAh` 协议的 NVMe 用途
+  - NVMe Base 仅作"信封"，不重定义协议细节
+- **典型使用场景**：
+  1. 启动时 `SECP=00h` Receive 做协议发现
+  2. RPMB 访问 `SECP=EAh` + `SPSP=0001h`
+  3. TCG Opal / 其它加密协议使用其他 SECP 值
 
-### 安全协议发现（Protocol Discovery）
+## 规范依据
 
-**协议 `00h`** 具有特殊用途，专门用于发现控制器支持的安全协议列表：
+- [Security Receive 命令与保留边界，PDF 第 390 页](../_source/pages/page-390.md)
+- [Security Receive 字段 Figures 375-377，PDF 第 391 页](../_source/pages/page-391.md)
+- [协议 00h 发现 + 协议 EAh + RPMB 定义，PDF 第 391 页](../_source/pages/page-391.md)
+- [Security Send 命令 Figures 379-381，PDF 第 392 页](../_source/pages/page-392.md)
+- [Identify Controller 中 RPMB 能力声明，PDF 第 333-334 页](../_source/pages/page-333.md)
 
-- **使用场景**：主机需要了解控制器支持哪些安全协议时
-- **操作方式**：发送 Security Receive 命令，SECP 设置为 `00h`
-- **特点**：
-  - 这是一个独立的 Receive 请求，不需要先发送对应的 Send 命令
-  - 不与任何先前的 Send 命令关联
-  - 返回数据包含控制器支持的所有安全协议列表
+## 相关阅读
 
-### NVMe 专用安全协议（Protocol `EAh`）
-
-**协议 `EAh`** 是专门分配给 NVMe 接口使用的安全协议：
-
-| 子协议参数 | 用途 | 说明 |
-|-----------|------|------|
-| **SPSP = 0001h** | 选择 Replay Protected Memory Block (RPMB) | RPMB 是一种具有重放保护的安全存储区域 |
-| **NSSF** 字段 | 选择特定的 RPMB 目标（Target） | 控制器可能支持多个 RPMB 目标 |
-
-> 参考规范：[PDF p. 391](../_source/pages/page-391.md)
-
-## 相关概念
-
-### 与其他功能的关联
-
-**RPMB 能力声明：**
-- 通过 [Identify Command Model](identify-command-model.md) 中的 Identify Controller 数据结构，控制器会声明：
-  - 支持的 RPMB 目标数量
-  - RPMB 目标之间的共享能力
-- **强制要求**：如果控制器声明的 RPMB 目标数量非零，则必须支持 Security Send 和 Security Receive 命令
-
-> 参考规范：[PDF pp. 333-334](../_source/pages/page-333.md)
-
-**协议规范引用：**
-- NVMe Base Specification 仅定义命令传输机制（信封）
-- 具体协议的详细定义由外部规范定义：
-  - SPC（SCSI Primary Commands）规范
-  - ACS（ATA Command Set）规范
-- NVMe 规范不重复定义这些协议的具体细节，而是直接引用相关规范
-
-> 参考规范：[PDF pp. 390-392](../_source/pages/page-390.md)
-
-## 使用场景示例
-
-1. **发现支持的协议**：主机启动时发送 SECP=`00h` 的 Security Receive 命令，获取支持列表
-2. **RPMB 访问**：使用 SECP=`EAh`、SPSP=`0001h` 访问重放保护内存块
-3. **TCG Opal 加密**：使用特定的 Security Protocol 值实现全盘加密功能
-
-## 参考资料
-
-- [Security Receive 命令用途与保留边界说明，PDF p. 390](../_source/pages/page-390.md)
-- [Security Receive 字段详解、协议发现机制、NVMe EAh 协议与 RPMB 选择，PDF p. 391](../_source/pages/page-391.md)
-- [Security Send 命令字段与响应关系说明，PDF p. 392](../_source/pages/page-392.md)
+- [重放保护内存块](replay-protected-memory-block.md) - SPSP=0001h 访问 RPMB
+- [通用命令格式](common-command-format.md) - Security 命令的 SQE 布局
+- [数据指针布局](data-pointer-layouts.md) - DPTR 指向协议数据缓冲
+- [Key Per I/O](key-per-io.md) - 同属 NVMe 安全协议栈

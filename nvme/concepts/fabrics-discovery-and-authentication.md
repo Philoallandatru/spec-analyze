@@ -1,225 +1,243 @@
-# Fabrics Discovery and Authentication
+# Fabrics 发现与认证（Fabrics Discovery and Authentication）
 
-NVMe over Fabrics separates finding accessible subsystem paths from authorizing command traffic on a connected controller. A Discovery Service exposes only Discovery controllers and tells a host which accessible NVM subsystems and paths are available. [PDF p. 45](../_source/pages/page-045.md)
+## 一句话说明
 
-## Mental model
+NVMe over Fabrics 把"找路"和"进门"分两步：发现服务（Discovery Service）告诉主机哪些 NVM 子系统与路径可用；之后主机连接控制器时按需建立传输安全通道并完成带内认证，两道门都通过后才有正常命令流量。
 
-```text
-bootstrap information (implementation-specific)
-                    |
-                    v
-          [Discovery Service]
-                    |
-         subsystem paths + security need
-                    |
-                    v
-            Connect to controller
-                    |
-          +---------+----------+
-          | secure channel?    | establish before any command
-          | in-band auth?      | only auth commands on new queue
-          +---------+----------+
-                    |
-                    v
-             normal command traffic
-```
+## 生活化类比
 
-This explanatory sequence combines the discovery and authentication gates defined on PDF pages 45-46. [PDF pp. 45-46](../_source/pages/page-045.md)
+把发现与认证想成**酒店入住的两步**：
 
-## Contract and invariants
+- **发现（Discovery）** = 查"哪些酒店有空房、怎么去"：问前台（Discovery Service）拿一份清单（Discovery Log Page），上面列了酒店地址、房间类型、入住要求。
+- **传输安全通道** = 酒店门口的安全门：没它（明文）不能进客房。
+- **带内认证** = 办入住：出示证件、签单（Authentication Send/Receive）；认证完才能用自己的房卡（正常命令）。
 
-| Gate | Signal | Command restriction |
-|---|---|---|
-| Fabric secure channel | Discovery Service says it is required | Controller accepts no Fabrics, Admin, or I/O command until the channel exists |
-| NVMe in-band authentication | Connect response says it is required | On the queue created by Connect, only authentication commands are accepted until authentication completes |
+发现服务只管"指路"，不管"进门"；进门前必须看清两份要求：门口有没有安全门、办入住要不要认证。
 
-An NVM subsystem may require either gate or both. [PDF p. 46](../_source/pages/page-046.md)
-
-The initial information used to reach a Discovery Service is implementation-specific; the specification gives host configuration, hypervisor/OS properties, or other mechanisms as examples. Discovery can enumerate accessible subsystems, multiple paths, and statically configured controllers, and may support persistent Discovery-controller connections and asynchronous notifications. [PDF p. 45](../_source/pages/page-045.md)
-
-A Discovery controller is always message-based and dynamic. It implements discovery-related features only: no I/O Queues, I/O commands, or namespaces. A Discovery subsystem that advertises a unique Discovery Service NQN must accept both that NQN and the well-known Discovery Service NQN in Connect; otherwise it accepts the well-known NQN. [PDF pp. 58, 62](../_source/pages/page-058.md)
-
-Authentication Send transfers security-protocol commands or parameters to the controller; Authentication Receive retrieves protocol-defined status/data associated with one or more prior Sends. The selected SPC-5 security protocol defines association and payload interpretation, while NVMe supplies the FCTYPE, SGL, protocol selectors, and transfer/allocation lengths. Reserved protocol values fail as Invalid Parameter. [PDF pp. 471-473](../_source/pages/page-471.md)
-
-Authentication Receive data is ephemeral across communication loss and Controller Level Reset. Both authentication commands may be issued on Admin or I/O Queues, unlike Property commands, and their direction bits distinguish host-to-controller Send from controller-to-host Receive. [PDF pp. 471-473](../_source/pages/page-471.md)
-
-On successful Connect, `AUTHREQ` reports whether an authentication transaction is required or authentication followed by secure-channel establishment is required. A failed Connect uses Connect-specific status and parameter-location information rather than Invalid Field in Command or an Error Information Log entry. [PDF pp. 477-478](../_source/pages/page-477.md)
-
-## Discovery results and path selection
+## 工作流程
 
 ```text
-Discovery Log Page
-|-- entry: subsystem X, Port A ---- independent failure domain A
-|-- entry: subsystem X, Port B ---- independent failure domain B
-`-- entry: referral -------------> another Discovery Service
-
-single association  -> choose one applicable entry
-multiple associations -> prefer different Port IDs for path independence
+  引导信息（实现特定：主机配置 / OS 提示 / 其他）
+         |
+         v
+  [Discovery Service]
+         |  返回子系统路径 + 安全需求
+         v
+  Connect 到控制器
+         |
+   +-----+-----+---- 是否需要安全通道？
+   |               |
+   |  建立通道     | 建立前不接受任何 Fabrics/Admin/I/O 命令
+   |               |
+   +-------+-------+
+           |
+     是否需要带内认证？
+           |
+   +-------+-------+   队列只接受 Authentication Send/Receive
+   |  在 Connect   |   直到认证完成
+   |  创建的队列   |
+   +---------------+
+           |
+           v
+     正常命令流量
 ```
 
-Entries have no required ordering and may be filtered by Host NQN. Multiple entries for one subsystem may represent multiple fabric paths or multiple static controllers sharing a path; different Port IDs identify transport connections independent with respect to port hardware failures. [PDF p. 63](../_source/pages/page-063.md)
+简化说明：发现和认证可以**单独存在或同时存在**。一个 NVM 子系统可只要求安全通道、只要求带内认证，或两者都要求。
 
-The Discovery log (`LID 70h`) is persistent and exists only on Discovery controllers. A request may return the host/requester-specific subset, port-local records, or—when supported and requested—all registered subsystem ports without `HOSTNQN` filtering. Only a Direct Discovery Controller may support the port-local-only option; a controller may require authentication or external configuration before advertising all-subsystem access. [PDF pp. 306-307](../_source/pages/page-306.md)
+## 初学者案例
 
-```text
-Supported capability       Get Log Page request       Returned-page flag
-EXTDLPES ----------------> EXTDLPE ------------------> EXTEND
-PLEOS (DDC only) --------> PLEO --------------------> PORTLCL
-ALLSUBES ----------------> ALLSUBE ------------------> ALLSUB
-```
+**场景：NVMe-oF 客户端拿到 Discovery 日志后连接失败 `AUTHREQ`**
 
-This explanatory negotiation diagram preserves the three capability/request/result relationships. [PDF pp. 306-308](../_source/pages/page-306.md)
+1. 主机从 Discovery Service 拿到子系统 NQN + 传输地址 + `TRS`（Transport Requirements）字段。
+2. `TRS` 标记需要安全通道 + 带内认证。
+3. 主机 Connect 后立刻发 Identify 命令 → `AUTHREQ` 返回"需要认证"或"需要安全通道"。
+4. 解决：
+   - 若是认证要求：在该队列上**只**发 Authentication Send/Receive；先 Send 协商参数、Receive 读取控制器状态，循环直到成功。
+   - 若是安全通道要求：在 Connect 之外用底层协议（IPsec、RDMA PS 等）建立通道。
+5. 主机误把 Identify 当普通命令发出 → 控制器拒；这是**预期行为**。
 
-## Consistent discovery snapshots
+> 错误码速记：Connect 失败用**连接特定状态码** + 参数位置信息（不是 `Invalid Field in Command`，也不会写 Error Information Log）。
 
-```text
-read header + entries in increasing offset order
-                     |
-                     v
-          re-read Generation Counter
-             /                 \
-        unchanged             changed
-           |                     |
-      process data       discard and restart
-```
+## 必须记住的规则
 
-A one-command read is atomic. A multi-command read should use the Generation Counter protocol above; the controller may instead return `Discover Restart` when contents change. When index offsets are supported, index `0` addresses the header and index `1` begins at Entry 0. [PDF p. 307](../_source/pages/page-307.md)
+| 规则 | 要点 |
+|------|------|
+| 发现服务只指路 | Discovery Service 暴露 Discovery 控制器；不处理 I/O |
+| 两道门可独立 | 安全通道 / 带内认证可只一个，也可都要求 |
+| 引导信息实现特定 | 主机如何发现 Discovery Service 不在规范范围 |
+| Discovery 控制器特性 | 必为消息 + 动态模型；只支持发现相关特性 |
+| Discovery 控制器无 I/O | 无 I/O Queue、无 I/O 命令、无命名空间 |
+| Discovery NQN 规则 | 唯一 Discovery Service NQN 必须接受该 NQN + 知名 NQN；否则只接受知名 NQN |
+| Authentication Send | 传安全协议命令或参数到控制器 |
+| Authentication Receive | 取回协议定义的状态/数据（关联于一次或多次 Send） |
+| 安全协议 | 由 SPC-5 选定；NVMe 提供 FCTYPE/SGL/协议选择器/传输与分配长度 |
+| 保留协议值 | 视为 `Invalid Parameter` |
+| 认证数据时效 | Authentication Receive 数据在通信丢失和 CLR 后**临时**丢失 |
+| 队列灵活性 | Authentication Send/Receive 可在 Admin 或 I/O Queue 发 |
+| 方向位 | Send = 主机→控制器；Receive = 控制器→主机 |
+| Connect 成功 | `AUTHREQ` 报告是否需认证 / 认证 + 安全通道 |
+| Connect 失败 | 用连接特定状态码 + 参数位置信息（不写 Error Information Log） |
+| Discovery Log Page | LID `70h`，**仅在 Discovery 控制器**；持久 |
+| Host Discovery Log | LID `71h`，仅 Discovery 控制器；记录注册过发现信息的主机 |
+| AVE Discovery Log | LID `72h`，认证验证实体 |
+| Pull Model DDC Request | LID `73h`，DDC 向 CDC 拉日志 |
+| 能力协商 | `EXTDLPE→EXTDLPE→EXTEND`、`PLEO→PLEO→PORTLCL`（仅 DDC）、`ALLSUBE→ALLSUBE→ALLSUB` |
+| 快照协议 | 分段读时重读 Generation Counter；变则丢弃重读 |
+| 索引偏移 | 索引 0 = 头部；1 = 第一条 |
+| 主机级条目 | Host 提交 = Host 扩展条目；DDC 提交 = NVM 子系统基本/扩展条目 |
+| 头部 NQN | UUID 形式的 NQN 标识提交方 |
+| 键选择 | 键可基于传输地址（主机记录必须）或 Port ID（子系统记录允许） |
+| 任务基数 | Register = 1..N；De-register = 1..N；Update = 恰好 2 |
+| 容量不足 | Register 整体失败 |
+| 字段冲突 | 报 `Invalid Discovery Information` |
+| 主机扩展条目 | 至少含 1 个 Host Identifier 扩展属性 |
+| 子系统扩展条目 | 可无 Host Identifier 扩展属性 |
+| Extended 条目 | 1024 字节前缀 + `TEL` / `NUMEXAT` 框架的可变属性列表 |
+| TRADDR 首字节为 0 | 选择连接的远端 IP；该条目注册/注销每条命令限 1 条 |
+| 扩展属性长度 | 必非 0、必 4 的倍数；未用字节为 0 |
+| Host Identifier 属性 | 主机条目必含（16 字节）；子系统条目禁止 |
+| Admin label | ASCII 或 UTF-8 可选，4–256 字节 |
+| Vendor specific | 长度由类型决定 |
+| 主机条目路由字段 | 子系统类型 / Port ID / Controller ID / Admin SQ 大小清零忽略 |
+| 共同字段 | transport、NQN、地址、总长度、属性列表字段两种条目都用 |
+| Host Discovery | 可返回请求者子集；`ALLHOSTES` 声明 + `ALLHOSTE` 请求 = 全量；`ALLHOST` 标志表示范围 |
+| Host Discovery 条目 | 必含至少一个 Host Identifier 扩展属性；`NCC` 报告主机是否已连 CDC；非 CDC 该位为 0 忽略 |
+| AVE Discovery | AVE NQN + 0 或多个 20 字节 IPv4/IPv6 TCP 传输记录 |
+| Pull Model DDC | 包含 `ORI`、总长、GAZ/AAZ/RAZ/Discovery Log Page Request |
+| 持久发现连接 | 非零 Keep Alive Timer；必须支持 Keep Alive、AER、Discovery 变更通知；Discovery 永不实现 Disconnect |
+| 控制器 ID 哨兵 | `FFF0h–FFFCh` = 保留 / Connect 非法；`FFFDh` = 跨子系统分散；`FFFEh` = 任意静态；`FFFFh` = 任意动态 |
+| 静态分配记住 ID | `FFFEh` 拿到后主机应记住真实 Controller ID 用于重连 |
+| 变更通知 | `Notice (2h)` + `LID 70h` + `information F0h` = Discovery 变更；`LID 71h` + `F1h` = Host Discovery 变更 |
+| 通知对象 | 只发给**请求过对应异步事件类型**的实体 |
+| SDLP 限制 | 仅 Discovery (`70h`)、Host Discovery (`71h`)、AVE Discovery (`72h`) 允许；其他 LID 不带数据报 `Not Allowed` |
+| LPUR | Pull-model DDC 可在完成里置 1 请求重发；注册**仅持续到下次 SDLP** |
+| 关联边界 | 一个控制器同一时刻只与一个主机关联；多主机经同一端口到达不同控制器 ≠ 多主机共享关联 |
 
-## Entry semantics and layout
+## 容易混淆的地方
 
-| Record signal | Meaning |
-|---|---|
-| `SUBTYPE=01h` | referral to another Discovery Service |
-| `SUBTYPE=02h` | NVM subsystem whose controllers may expose namespaces |
-| `SUBTYPE=03h` | another access path to the current Discovery Service |
-| `DUPRETINFO=1` | current-service entries return duplicate discovery information, so one path may stand in for the group |
+| 容易混 | 实际区别 |
+|--------|----------|
+| Discovery Service vs Discovery 控制器 | Service 是"找路系统"；控制器是 Service 的接口端点 |
+| 引导信息 vs Discovery Log | 引导信息（实现特定）告诉你"去哪里问"；Discovery Log 告诉你"有什么可访问" |
+| 安全通道 vs 带内认证 | 安全通道在传输层（底层协议）；带内认证在 NVMe 命令层 |
+| EXTDLPE vs PLEOS vs ALLSUBES | 三个**能力位**，分别对应扩展 / 端口本地 / 全量子系统支持 |
+| EXTDLPE vs PLEO vs ALLSUBE | 上行是"能力位"，下行是"请求位" |
+| EXTEND vs PORTLCL vs ALLSUB | 上行是"能力位"，下行是"返回页"标志 |
+| Register vs De-register vs Update | Register 1..N；De-register 1..N；Update 恰好 2 |
+| 主机条目 vs 子系统条目 | 主机条目用 Host 扩展；子系统条目用 NVM 子系统条目 |
+| 头部 NQN vs 提交条目 NQN | 头部 NQN 标识提交方；条目 NQN 标识被操作实体 |
+| 传输地址键 vs Port ID 键 | 主机记录**必须**用传输地址；子系统记录可用任一 |
+| FFFEh vs FFFFh vs FFFDh | FFFEh = 任意静态；FFFFh = 任意动态；FFFDh = 跨子系统分散 |
+| 子系统清单 vs 主机清单 | 70h 列子系统；71h 列主机 |
+| Pull Model vs Push Model | Pull = DDC 主动从 CDC 拉（73h）；Push = CDC 主动注册到 DDC |
+| 通知 vs 轮询 | 通知通过 AER；轮询通过 Get Log Page |
+| LPUR vs Keep Alive | LPUR 是"请求重发该日志"；Keep Alive 是"控制器还活着" |
+| 控制器 ID FFFEh 取得后 | 主机应**记住**真实 ID 用于重连，不是每次 FFFEh |
+| Discovery 控制器 vs I/O 控制器 | Discovery 不挂载命名空间；I/O 才能挂载 |
 
-Referral processing deeper than eight levels is not required. `DUPRETINFO` is valid only for current-service entries and may also let one enabled change notification represent the duplicate-return group. [PDF p. 307](../_source/pages/page-307.md)
+## 进阶细节
 
-The fixed 1,024-byte entry carries transport/address family, subsystem type, transport security requirements, Port ID, Controller ID, maximum Admin SQ size, flags, service identifier, subsystem NQN, transport address, and transport-specific address data. Dynamic-model entries use `CNTLID=FFFFh`; static entries may name a controller or use `FFFEh` to request allocation while retaining the returned ID for reconnection. [PDF pp. 308-310](../_source/pages/page-308.md)
+- **Discovery Service 行为**（规范 4.2.1.1 / 3.1.3.3 / 5.1.13）：
+  - 引导信息：实现特定（主机配置 / OS 属性 / 其他）
+  - 列举可访问子系统、多路径、静态配置的控制器
+  - 可支持持久 Discovery 控制器连接 + 异步通知
+- **Discovery 控制器特性**（规范 3.1.2 / 3.1.3.3）：
+  - 必为消息（Message-Based）+ 动态模型
+  - 仅支持发现相关特性
+  - 无 I/O Queues / 无 I/O 命令 / 无命名空间
+- **Discovery NQN 规则**（规范 3.1.3.3 / 5.2.13）：
+  - 唯一 Discovery Service NQN ⇒ 必须接受该 NQN + 知名 NQN
+  - 否则只接受知名 NQN
+- **认证门控**（规范 4.1.3 / 6.3）：
+  - Connect 后若需认证：队列**只接受** Authentication Send/Receive 直到成功
+  - AUTHREQ 报告：是否需认证 / 认证 + 安全通道
+- **Authentication Send/Receive**（规范 6.x / 5.2.13）：
+  - Send = 主机→控制器，传输安全协议命令/参数
+  - Receive = 控制器→主机，取回协议定义状态/数据
+  - FCTYPE/SGL/协议选择器/传输与分配长度由 NVMe 提供
+  - 协议语义由 SPC-5 安全协议定义
+  - 保留协议值 → `Invalid Parameter`
+  - Receive 数据在通信丢失和 CLR 后**临时**
+  - 两者可在 Admin 或 I/O Queue 发
+  - 方向位：Send vs Receive 区分
+- **Discovery 日志**（规范 5.2.12）：
+  - LID `70h`：子系统路径 / referrals
+  - LID `71h`：已注册主机
+  - LID `72h`：认证验证实体（AVE）
+  - LID `73h`：Pull-model DDC 请求
+- **条目类型**（规范 5.2.12.1.18 / 4.2.1.1）：
+  - `SUBTYPE=01h` = referral 到另一 Discovery Service
+  - `SUBTYPE=02h` = NVM 子系统（控制器可能暴露命名空间）
+  - `SUBTYPE=03h` = 当前 Discovery Service 的另一访问路径
+  - `DUPRETINFO=1` = 当前服务条目返回重复信息，可让一条路径代表整组
+- **能力协商三件套**（规范 5.2.12.1.18）：
+  - `EXTDLPE` 能力位 → `EXTDLPE` 请求位 → `EXTEND` 返回标志
+  - `PLEOS` 能力位（仅 DDC） → `PLEO` 请求位 → `PORTLCL` 返回标志
+  - `ALLSUBES` 能力位 → `ALLSUBE` 请求位 → `ALLSUB` 返回标志
+- **快照协议**（规范 5.2.12.1.18）：单命令读原子；多命令读需重读 Generation Counter；变则丢弃重读。
+- **索引偏移**（规范 5.2.12）：支持时，索引 0 = 头部，1 = 第一条。
+- **条目固定 1,024 字节 + 扩展属性**（规范 5.2.12.1.18 / 5.2.12.1.19）：
+  - 固定 1,024 字节：传输/地址族、子系统类型、安全要求、Port ID、Controller ID、最大 Admin SQ 大小、标志、服务 ID、子系统 NQN、传输地址、传输特定地址
+  - 扩展属性：`TEL` + `NUMEXAT` 框架的可变属性列表
+- **Host Identifier 属性规则**（规范 5.2.12.1.19）：
+  - 主机条目**必含**，16 字节
+  - 子系统条目**禁止**
+- **Admin label 规则**（规范 5.2.12.1.19）：
+  - ASCII 或 UTF-8，可选
+  - 长度 4–256 字节
+- **路由字段**（规范 5.2.12.1.19）：主机条目中子系统类型 / Port ID / Controller ID / Admin SQ 大小**清零忽略**；共同字段（transport、NQN、地址、总长、属性列表）两种条目都用。
+- **任务基数**（规范 5.2.13.x）：
+  - Register = 1..N
+  - De-register = 1..N
+  - Update = 恰好 2（首条识别旧键，第二条原子替换）
+- **错误码**（规范 5.2.13.x）：
+  - 容量不足 → Register 整体失败
+  - 字段冲突 → `Invalid Discovery Information`
+  - 保留协议值 → `Invalid Parameter`
+- **DDC 提交**（规范 5.2.13.x）：DDC 提交 = NVM 子系统基本或扩展条目；**DDC 单独**可把条目标记为 port-local。
+- **头部 NQN**（规范 5.2.13.x）：UUID 形式的 NQN 标识提交方。
+- **键选择**（规范 5.2.13.x）：键可基于传输地址（主机记录必须）或 Port ID（子系统记录允许）。
+- **Extended Discovery Log Page Entry**（规范 5.2.12.1.19）：1024 字节前缀 + `TEL` + `NUMEXAT` 框架的可变属性列表。
+- **TRADDR 首字节为 0**（规范 5.2.12.1.19）：选连接的远端 IP；该条目注册/注销每条命令限 1 条。
+- **AVE Discovery 条目**：AVE NQN + 0 或多个 20 字节 IPv4/IPv6 TCP 传输记录。
+- **Pull Model DDC Request**（规范 5.2.13.x）：`ORI` + 总长 + GAZ/AAZ/RAZ/Discovery Log Page Request。
+- **Host Discovery**（规范 5.2.12.x）：
+  - 可返回请求者子集
+  - `ALLHOSTES` 声明 + `ALLHOSTE` 请求 = 全量
+  - `ALLHOST` 标志表示结果范围
+  - 必含至少一个 Host Identifier 扩展属性
+  - `NCC` 报告主机是否已连 CDC；非 CDC 该位为 0 忽略
+- **持久发现连接**（规范 3.1.3.3 / 5.1.13）：
+  - 非零 Keep Alive Timer 表示请求
+  - 必支持 Keep Alive、AER、Discovery Log 变更通知
+  - Discovery 控制器**永不支持** Disconnect
+- **控制器 ID 哨兵**（规范 6.3 / 5.2.6）：
+  - `FFF0h–FFFCh` = 保留；Connect 非法
+  - `FFFDh` = 跨子系统分散命名空间；Connect 非法
+  - `FFFEh` = 任意可用静态
+  - `FFFFh` = 任意可用动态
+- **静态分配的 ID 复用**（规范 6.3）：`FFFEh` 拿到后主机应记住真实 Controller ID 用于重连。
+- **变更通知**（规范 5.1.13）：
+  - `Notice (2h)` + `LID 70h` + `information F0h` = Discovery 变更
+  - `Notice (2h)` + `LID 71h` + `information F1h` = Host Discovery 变更
+  - 只发给**请求过对应异步事件类型**的实体
+- **SDLP 限制**（规范 5.2.13.x）：
+  - 仅 `70h` / `71h` / `72h` 允许
+  - 其他 LID 不带数据 + 报 `Not Allowed`
+- **LPUR 一次性**（规范 5.2.13.x）：Pull-model DDC 在完成里置 1 = 请求重发；注册**仅持续到下次 SDLP**。
+- **关联 vs 多主机**（规范 4.2.1.1）：一个控制器同一时刻只与一个主机关联；多主机经同一端口到达不同控制器 ≠ 多主机共享关联。
 
-An Extended Discovery Log Page Entry preserves that 1,024-byte header, then adds total entry length, attribute count, and a variable extended-attribute list. The length fields, rather than a fixed stride, delimit successive attributes. [PDF p. 311](../_source/pages/page-311.md)
+## 规范依据
 
-## Discovery information management
+- [Discovery Service 行为，PDF 第 45 页](../_source/pages/page-045.md)
+- [认证门控，PDF 第 46 页](../_source/pages/page-046.md)
+- [Discovery 控制器模型与 NQN 规则，PDF 第 58、62 页](../_source/pages/page-058.md)
+- [Discovery 条目、持久连接、路径选择，PDF 第 63 页](../_source/pages/page-063.md)
+- [Discovery 日志能力与过滤协商，PDF 第 306-308 页](../_source/pages/page-306.md)
 
-```text
-entity header (Host / DDC / CDC)
-        |
-        +-- Register: 1..N entries; matching key replaces, new key adds
-        +-- De-register: 1..N entry keys
-        `-- Update: exactly 2 entries, identify old key + atomic replacement
-                         |
-                         v
-                 CDC or DDC registration records
-```
+## 相关阅读
 
-This explanatory task model preserves entry cardinality and the atomic two-entry update rule; exact command and data layouts remain in Figures 495-499. [PDF pp. 449-455](../_source/pages/page-449.md)
-
-Discovery Information Management registers, de-registers, or updates host or NVM-subsystem discovery records. Host and CDC submissions contain host extended entries; DDC submissions contain basic or extended NVM-subsystem entries and alone may mark them port-local. The header's UUID-form NQN identifies the submitting entity, while the selected entry key is either transport-address based (required for host records) or port-ID based (also allowed for subsystem records). [PDF pp. 449-453](../_source/pages/page-449.md)
-
-| Task | Required entry count | Effect |
-|---|---:|---|
-| Register | one or more | replace a matching key or add a new record |
-| De-register | one or more | remove matching registration records |
-| Update | exactly two | first entry identifies the record; second atomically replaces it |
-
-Insufficient registration capacity fails the whole register command. Entity-type/field conflicts fail as Invalid Discovery Information. Host extended entries require at least one Host Identifier attribute; subsystem extended entries may have none. [PDF pp. 450-455](../_source/pages/page-450.md)
-
-An extended entry retains the 1,024-byte discovery prefix, then uses `TEL` and `NUMEXAT` to frame a variable attribute list. A null first byte in `TRADDR` selects the connection's remote IP address, but such null-address registration or de-registration is limited to one entry per command. [PDF pp. 454-455](../_source/pages/page-454.md)
-
-| Extended attribute | Applicability | Length rule |
-|---|---|---|
-| Host Identifier | mandatory for host entries; prohibited for subsystem entries | exactly 16 bytes |
-| Admin label ASCII | optional | 4 to 256 bytes |
-| Admin label UTF-8 | optional | 4 to 256 bytes |
-| Vendor specific | optional | type-defined |
-
-Every extended-attribute value length is non-zero and a multiple of four; unused bytes are zero. Host-entry-only routing fields such as subsystem type, Port ID, Controller ID, and Admin SQ size are cleared and ignored, while common transport, NQN, address, total-length, and attribute-list fields remain active for both entry types. [PDF pp. 455-456](../_source/pages/page-455.md)
-
-## Discovery inventories beyond subsystem paths
-
-```text
-Discovery controller
-|-- LID 70h: subsystem paths / referrals
-|-- LID 71h: registered hosts
-|-- LID 72h: authentication verification entities (AVEs)
-`-- LID 73h: pull-model DDC request to a CDC
-```
-
-This explanatory taxonomy groups the related discovery-plane inventories and request channel. [PDF pp. 312-317](../_source/pages/page-312.md)
-
-The Host Discovery log is supported only by Discovery controllers and inventories hosts that registered discovery information. It may return the requester-specific subset or, when `ALLHOSTES` is advertised and `ALLHOSTE` is requested, all registered hosts without `HOSTNQN` filtering; the returned `ALLHOST` flag states that result scope. Authentication or out-of-band configuration may gate advertisement of all-host access. [PDF pp. 312-315](../_source/pages/page-312.md)
-
-Each Host Discovery entry is variable length and must contain at least one extended attribute carrying a Host Identifier. Its fixed prefix identifies the host NQN and transport address, while `NCC` reports whether that host is connected to the CDC; on a non-CDC the bit is zero and ignored. Multi-command Host Discovery retrieval uses the same read-in-order, re-read-generation, discard-on-change protocol as the subsystem Discovery log. [PDF pp. 313-315](../_source/pages/page-313.md)
-
-| Log | Entry framing | Essential payload |
-|---|---|---|
-| Host Discovery (`71h`) | 1,024-byte header, then `TEL`-delimited entries | Host NQN, transport address, mandatory Host Identifier attribute |
-| AVE Discovery (`72h`) | 1,024-byte header, then `TEL`-delimited entries | AVE NQN plus zero or more 20-byte IPv4/IPv6 TCP transport records |
-| Pull Model DDC Request (`73h`) | `ORI`, total length, operation-specific bytes | GAZ, AAZ, RAZ, or Discovery Log Page Request |
-
-This compact layout summary was checked against rendered Figures 299-304; exact byte layouts remain in the cited source. [PDF pp. 314-317](../_source/pages/page-314.md)
-
-An explicit persistent Discovery connection is requested with a non-zero Keep Alive Timer. Such a controller must support Keep Alive, Asynchronous Event Request, and Discovery Log change notification; a Discovery controller never supports Disconnect. [PDF pp. 63-65](../_source/pages/page-063.md)
-
-## Discovery Controller ID sentinels
-
-| Controller ID | Meaning in discovery/Connect |
-|---|---|
-| `FFF0h`-`FFFCh` | Reserved; invalid in Connect |
-| `FFFDh` | Registered dispersed-namespace controller is in another participating subsystem; invalid in Connect |
-| `FFFEh` | Allocate any available static controller |
-| `FFFFh` | Allocate any available dynamic controller |
-
-For a static allocation obtained through `FFFEh`, the host should remember the actual returned Controller ID and reuse it for future associations to that controller. [PDF p. 64](../_source/pages/page-064.md)
-
-## Change notification
-
-```text
-Discovery/Host Discovery log changes
-              |
-              v
-Asynchronous Event: Notice (2h)
-  |-- LID 70h + information F0h -> Discovery log changed
-  `-- LID 71h + information F1h -> Host Discovery log changed
-```
-
-Notifications are sent only to entities that requested the corresponding asynchronous event type. [PDF pp. 64-65](../_source/pages/page-064.md)
-
-## Pull-model discovery-log delivery
-
-```text
-pull-model DDC requests log from CDC
-              |
-CDC -- SDLP(status, LID, offset, dword count, data) --> DDC
-              |                                         |
-              `---- if CQE.LPUR=1, register one resend --'
-                         registration consumed by next SDLP
-```
-
-This explanatory exchange preserves sender/receiver roles, segmented offset framing, and the one-shot update registration. [PDF pp. 469-470](../_source/pages/page-469.md)
-
-Send Discovery Log Page carries the same bytes that Get Log Page would return, together with transferred LID, log-specific parameter, 64-bit offset, dword count, and a requested-log status. Only Discovery (`70h`), Host Discovery (`71h`), and AVE Discovery (`72h`) logs are allowed; other LIDs carry no data and report Not Allowed. [PDF pp. 469-470](../_source/pages/page-469.md)
-
-The pull-model DDC may set `LPUR` in its completion to request a resend when that CDC log changes. The registration lasts only until the CDC issues the subsequent SDLP to that DDC, so continued updates require re-registration. [PDF p. 470](../_source/pages/page-470.md)
-
-## Relationships
-
-A controller is associated with exactly one host at a time, while multiple hosts may reach different controllers through the same NVM subsystem port. Discovery therefore identifies paths to controllers and subsystems; it does not make one controller a multi-host association. [PDF pp. 44-45](../_source/pages/page-044.md)
-
-## Evidence
-
-- [Discovery Service behavior, PDF p. 45](../_source/pages/page-045.md)
-- [Authentication gates, PDF p. 46](../_source/pages/page-046.md)
-- [Discovery controller model and NQN connection rules, PDF pp. 58, 62](../_source/pages/page-058.md)
-- [Discovery entries, persistent connections, and path selection, PDF p. 63](../_source/pages/page-063.md)
-- [Controller ID sentinels and change notifications, PDF pp. 64-65](../_source/pages/page-064.md)
-- [Discovery-log capability and filtering negotiation, PDF pp. 306-308](../_source/pages/page-306.md)
-- [Fixed Discovery entry fields and security/path semantics, PDF pp. 308-310](../_source/pages/page-308.md)
-- [Extended Discovery entry framing, adjacent PDF p. 311](../_source/pages/page-311.md)
-- [Host, AVE, and pull-model DDC discovery logs, PDF pp. 312-317](../_source/pages/page-312.md)
-- [Discovery Information Management tasks, keys, and data framing, PDF pp. 449-455](../_source/pages/page-449.md)
-- [Extended attribute types, lengths, and entry applicability, PDF pp. 455-456](../_source/pages/page-455.md)
-- [Send Discovery Log Page framing and update registration, PDF pp. 469-470](../_source/pages/page-469.md)
-- [Fabrics command matrix and Authentication Send/Receive, PDF pp. 471-473](../_source/pages/page-471.md)
-- [Connect authentication/security requirements, PDF pp. 477-478](../_source/pages/page-477.md)
+- [transport-models.md](transport-models.md) - 属于消息类 Fabrics 传输
+- [association-and-command-lifecycle.md](association-and-command-lifecycle.md) - 认证通过后才能建立关联
+- [fabric-zoning-model.md](fabric-zoning-model.md) - CDC 集中化访问控制机制
+- [command-sets.md](command-sets.md) - Fabrics 命令集负责建联
