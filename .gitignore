@@ -1,0 +1,15 @@
+# Agent / IDE 运行时状态（各家的本地配置，不入仓）
+.agents/
+.claude/
+.goose/
+.hermes/
+.pi/
+.qoder/
+.qwen/
+.zcode/
+
+# Skills 锁文件
+skills-lock.json
+
+# 改写时的内部 todo
+nvme/_rewrite_todo.md
