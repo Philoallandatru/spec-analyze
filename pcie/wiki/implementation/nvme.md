@@ -1,778 +1,115 @@
 # NVMe over PCIe 实现
 
-## 概述
+> **一句话总结**：NVMe（Non-Volatile Memory Express）是专为 PCIe 打造的高速存储协议——它用"多车道无锁环形队列 + Doorbell 门铃 + MSI-X 直连中断"取代了传统 SATA/AHCI 的单队列串行机制，充分榨干 PCIe 的全双工带宽。
 
-NVMe (Non-Volatile Memory Express) 是专为 PCIe 接口设计的高性能存储协议，相比传统的 AHCI/SATA 协议，NVMe 充分利用了 PCIe 的高带宽和低延迟特性，提供了多队列、并行处理和精简的命令集。
+---
 
-## NVMe 架构
+## NVMe 多队列架构与 PCIe 配置
 
-### 整体结构
-
-```
-+------------------+
-|   应用程序        |
-+------------------+
-|   文件系统        |
-+------------------+
-|   块设备层        |
-+------------------+
-|   NVMe 驱动      |
-| +-------------+  |
-| | Admin Queue |  |  <--- 管理命令
-| +-------------+  |
-| | I/O Queue 1 |  |  <--- 数据传输
-| | I/O Queue 2 |  |
-| |    ...      |  |
-| | I/O Queue N |  |
-| +-------------+  |
-+------------------+
-|   PCIe 层        |
-+------------------+
-|   NVMe SSD       |
-+------------------+
-```
-
-### 队列架构
+NVMe 控制器在 PCIe 配置空间中声明 Class Code 为 `0x010802`（NVM Express），必须支持 **Power Management** 与 **MSI-X** Capability。其核心并发能力源于 **成对的环形队列**：
 
 ```
-CPU 0           CPU 1           CPU 2           CPU 3
-  |               |               |               |
-  v               v               v               v
-SQ 1            SQ 2            SQ 3            SQ 4  <-- Submission Queues
-  |               |               |               |
-  +---------------+---------------+---------------+
-                        |
-                        v
-                  NVMe Controller
-                        |
-  +---------------+---------------+---------------+
-  |               |               |               |
-  v               v               v               v
-CQ 1            CQ 2            CQ 3            CQ 4  <-- Completion Queues
-  |               |               |               |
-  v               v               v               v
-IRQ 1           IRQ 2           IRQ 3           IRQ 4
+  CPU Core 0          CPU Core 1          ...         CPU Core N
+      │                   │                               │
+      ▼                   ▼                               ▼
+  [Admin SQ/CQ 0]     [I/O SQ/CQ 1]       ...         [I/O SQ/CQ N]
+      │                   │                               │
+      └───────────────────┴───────────┬───────────────────┘
+                                      ▼
+                            NVMe PCIe Controller
+                                      │
+                                      ▼
+                       各自绑定独立 MSI-X 中断向量
 ```
 
-**特点**：
-- Admin Queue：1 对 SQ/CQ，用于管理命令
-- I/O Queues：多对 SQ/CQ（最多 65535 对），用于 I/O 命令
-- 每个队列可以绑定到特定的 CPU 核心
-- 每个 CQ 可以有独立的中断向量
+- **Admin Queue（Queue 0）**：全局唯一的一对 SQ/CQ，用于控制器识别（Identify）、创建/删除 I/O 队列、固件更新等管理命令。
+- **I/O Queues（Queue 1–65535）**：每个 CPU 核心可独占一对 **SQ（Submission Queue，提交队列，64B/条）** 与 **CQ（Completion Queue，完成队列，16B/条）**，彻底消除多核锁竞争。
 
-## PCIe 配置
+---
 
-### BAR 布局
+## BAR0 核心寄存器与 Doorbell 布局
 
-NVMe 设备使用 **BAR0** 映射控制寄存器：
+NVMe 设备将全部控制寄存器与门铃（Doorbell）映射到 **64-bit BAR0**（通常 8KB–16KB）：
+
+| BAR0 偏移 | 寄存器名称 | 位宽 | 核心作用 |
+| :--- | :--- | :--- | :--- |
+| `0x0000` | `CAP` (Controller Capabilities) | 64-bit | 报告最大队列深度（MQES）、**Doorbell 步长（DSTRD）**、超时时间等 |
+| `0x0008` | `VS` (Version) | 32-bit | NVMe 规范版本号（如 `0x00010400` 表示 1.4） |
+| `0x000C / 0x0010` | `INTMS / INTMC` | 32-bit | 中断屏蔽置位 / 清零寄存器 |
+| `0x0014` | `CC` (Controller Configuration) | 32-bit | 配置页大小（MPS）、队列条目大小（IOSQES/IOCQES）及使能位 `EN` |
+| `0x001C` | `CSTS` (Controller Status) | 32-bit | 控制器就绪状态 `RDY`、致命错误 `CFS` |
+| `0x0024` | `AQA` (Admin Queue Attributes) | 32-bit | 设置 Admin SQ 与 Admin CQ 的队列深度 |
+| `0x0028 / 0x0030` | `ASQ / ACQ` | 64-bit | Admin SQ 与 Admin CQ 在主机内存中的 **DMA 基地址** |
+| `0x1000+` | **Doorbell 寄存器区** | 32-bit/个 | 按 `DSTRD` 步长排列每对队列的 `SQ Tail Doorbell` 与 `CQ Head Doorbell` |
+
+---
+
+## 控制器初始化流程
+
+Linux `nvme-pci` 驱动接管设备后，按以下顺序完成控制器握手：
+
+1. **PCIe 基础使能**：`pci_enable_device_mem()` → `pci_request_mem_regions()` → `dma_set_mask_and_coherent(64bit)` → `pci_ioremap_bar(pdev, 0)` → `pci_set_master()`。
+2. **中断分配**：先为 Admin Queue 分配 1 个 MSI-X 向量，待识别控制器支持的队列数后再扩展分配 I/O MSI-X 向量。
+3. **复位控制器**：读取 `CAP` 获取 `DSTRD` 与最大队列深度；若 `CC.EN=1`，先写 `CC.EN=0` 并轮询等待 `CSTS.RDY` 变为 `0`。
+4. **建立 Admin Queue**：用 `dma_alloc_coherent()` 分配物理连续且缓存一致的 Admin SQ/CQ 内存，将大小写入 `AQA`，物理地址写入 `ASQ/ACQ`。
+5. **使能控制器**：配置 `CC`（页大小 `MPS`、SQ 条目 64B `IOSQES=6`、CQ 条目 16B `IOCQES=4`、`CC.EN=1`），轮询等待 `CSTS.RDY == 1`。
+6. **识别与建队列**：通过 Admin Queue 发送 `Identify Controller / Namespace`，随后发送 `Create I/O CQ` 与 `Create I/O SQ`（注意：**必须先建 CQ 再建 SQ**）。
+
+---
+
+## 核心 I/O 路径（Submit → DMA → Complete）
+
+NVMe 的精妙之处在于**驱动与控制器通过共享内存环形缓冲区 + Doorbell 单向写完成通信**，全程无需耗时的 MMIO 读取：
 
 ```
-BAR0: 64-bit Memory Space
-+---------------------------+  0x0000
-|   Controller Capabilities  |  CAP (8 bytes)
-|   - Max Queue Entries      |
-|   - Doorbell Stride        |
-+---------------------------+  0x0008
-|   Version                  |  VS (4 bytes)
-+---------------------------+  0x000C
-|   Interrupt Mask Set       |  INTMS (4 bytes)
-+---------------------------+  0x0010
-|   Interrupt Mask Clear     |  INTMC (4 bytes)
-+---------------------------+  0x0014
-|   Controller Configuration |  CC (4 bytes)
-+---------------------------+  0x001C
-|   Controller Status        |  CSTS (4 bytes)
-+---------------------------+  0x0020
-|   Admin Queue Attributes   |  AQA (4 bytes)
-+---------------------------+  0x0028
-|   Admin SQ Base Address    |  ASQ (8 bytes)
-+---------------------------+  0x0030
-|   Admin CQ Base Address    |  ACQ (8 bytes)
-+---------------------------+  0x1000
-|   SQ 0 Tail Doorbell       |  (Doorbell stride)
-+---------------------------+  0x1004
-|   CQ 0 Head Doorbell       |
-+---------------------------+
-|   ...                      |
-+---------------------------+
+  [主机内存]                                        [NVMe 控制器]
+  1. 驱动写入 64B 命令到 SQ[sq_tail]
+     (含 PRP/SGL 数据缓冲区物理地址)
+  2. 写 BAR0 SQ Tail Doorbell ───────────────────► 3. 收到门铃，DMA 读取 SQ 命令
+                                                   4. DMA 读写主机数据页 (PRP/SGL)
+                                                   5. 写 16B CQE 到 CQ[cq_tail]
+                                                      (写入当前 Phase Tag 标志位)
+  7. 收到中断，轮询 CQ[cq_head]    ◄─────────────── 6. 触发对应 MSI-X 中断
+     直到 Phase Tag 不匹配为止
+  8. 写 BAR0 CQ Head Doorbell ───────────────────► 9. 回收 CQ 槽位
 ```
 
-### 配置空间
+> **Phase Tag（相位标志）**：CQE 中 `status` 字段的最低位（bit 0）。初始时驱动期望 `phase = 1`，控制器写入新 CQE 时置该位为 `1`；当 `cq_head` 绕回队列头部 `0` 时，驱动与控制器同时翻转 `phase` 为 `0`。借此机制，驱动无需读取任何 MMIO 寄存器即可无锁判断哪些 CQE 是新完成的。
 
-```c
-// PCI 配置空间标准头
-Vendor ID:    0x144D (Samsung) / 0x8086 (Intel) / ...
-Device ID:    设备特定
-Class Code:   0x010802 (NVM Express)
-Sub-Class:    0x08 (Non-Volatile Memory Controller)
-Prog IF:      0x02 (NVMe)
+---
 
-// BAR0 配置
-BAR0: 64-bit, Prefetchable Memory
-Size: 通常 8KB - 16KB
+## 高性能调优机制
 
-// Capabilities
-- Power Management Capability (必需)
-- MSI-X Capability (必需，NVMe 1.0+)
-- PCIe Capability
-- AER Capability (推荐)
-```
+- **CPU 亲和与多队列（`blk-mq`）**：通过 `blk_mq_pci_map_queues()` 将每个 CPU 核心的软件请求队列直接绑定到专属的硬件 SQ/CQ 与 MSI-X 向量，实现跨核零锁扩展。
+- **轮询模式（IOPoll）**：在超低延迟场景（如 Optane / 高端 NVMe SSD）下，为特定队列关闭中断，由应用通过 `io_uring` IOPoll 直接死循环扫描 CQ 的 Phase Tag，消除中断上下文切换延迟。
+- **批量提交（Batching）**：驱动连续向 SQ 写入多条命令后，只写一次 `SQ Tail Doorbell` 通知硬件，大幅减少 PCIe MMIO 写事务开销。
 
-## 初始化流程
+---
 
-### 1. PCIe 层初始化
-
-```c
-static int nvme_pci_probe(struct pci_dev *pdev,
-                          const struct pci_device_id *id)
-{
-    struct nvme_dev *dev;
-    int result;
-    
-    // 1. 启用 PCIe 设备
-    result = pci_enable_device_mem(pdev);
-    if (result)
-        return result;
-    
-    // 2. 请求内存区域
-    result = pci_request_mem_regions(pdev, "nvme");
-    if (result)
-        goto disable;
-    
-    // 3. 设置 64-bit DMA
-    result = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
-    if (result)
-        goto release;
-    
-    // 4. 映射 BAR0
-    dev = kzalloc(sizeof(*dev), GFP_KERNEL);
-    if (!dev) {
-        result = -ENOMEM;
-        goto release;
-    }
-    
-    dev->bar = pci_ioremap_bar(pdev, 0);
-    if (!dev->bar) {
-        result = -ENOMEM;
-        goto free_dev;
-    }
-    
-    // 5. 设置 Bus Master
-    pci_set_master(pdev);
-    
-    // 6. 配置 MSI-X
-    result = nvme_setup_irqs(dev);
-    if (result)
-        goto unmap;
-    
-    // 7. 初始化 NVMe 控制器
-    result = nvme_dev_map(dev);
-    if (result)
-        goto free_irqs;
-    
-    return 0;
-
-free_irqs:
-    nvme_release_irqs(dev);
-unmap:
-    iounmap(dev->bar);
-free_dev:
-    kfree(dev);
-release:
-    pci_release_mem_regions(pdev);
-disable:
-    pci_disable_device(pdev);
-    return result;
-}
-```
-
-### 2. NVMe 控制器初始化
-
-```c
-static int nvme_dev_map(struct nvme_dev *dev)
-{
-    u64 cap;
-    u32 cc;
-    
-    // 1. 读取 Controller Capabilities
-    cap = readq(&dev->bar->cap);
-    dev->dbbuf_stride = 1 << (2 + ((cap >> 32) & 0xf));
-    dev->max_queue_depth = min_t(int, ((cap >> 0) & 0xffff) + 1,
-                                  NVME_Q_DEPTH);
-    
-    // 2. 检查版本
-    dev->ctrl.version = readl(&dev->bar->vs);
-    if (dev->ctrl.version < NVME_VS(1, 2, 0)) {
-        dev_warn(dev->ctrl.device, "Old NVMe version\n");
-    }
-    
-    // 3. 重置控制器
-    cc = readl(&dev->bar->cc);
-    if (cc & NVME_CC_ENABLE) {
-        // 禁用控制器
-        writel(cc & ~NVME_CC_ENABLE, &dev->bar->cc);
-        
-        // 等待控制器就绪
-        if (nvme_wait_ready(dev, false))
-            return -ENODEV;
-    }
-    
-    // 4. 创建 Admin Queue
-    result = nvme_create_admin_queue(dev);
-    if (result)
-        return result;
-    
-    // 5. 配置控制器
-    cc = NVME_CC_CSS_NVM;
-    cc |= NVME_CC_MPS(PAGE_SHIFT - 12);  // Memory Page Size
-    cc |= NVME_CC_AMS_RR;                // Arbitration: Round Robin
-    cc |= NVME_CC_SHN_NONE;
-    cc |= NVME_CC_IOSQES | NVME_CC_IOCQES;  // 6 bits each
-    cc |= NVME_CC_ENABLE;
-    
-    writel(cc, &dev->bar->cc);
-    
-    // 6. 等待控制器就绪
-    if (nvme_wait_ready(dev, true))
-        return -ENODEV;
-    
-    // 7. 识别控制器
-    result = nvme_identify_ctrl(dev);
-    if (result)
-        return result;
-    
-    // 8. 创建 I/O Queues
-    result = nvme_setup_io_queues(dev);
-    if (result)
-        return result;
-    
-    return 0;
-}
-```
-
-### 3. 队列创建
-
-```c
-// 创建 Admin Queue
-static int nvme_create_admin_queue(struct nvme_dev *dev)
-{
-    struct nvme_queue *nvmeq;
-    
-    // 分配队列结构
-    nvmeq = nvme_alloc_queue(dev, 0, NVME_AQ_DEPTH);
-    if (!nvmeq)
-        return -ENOMEM;
-    
-    // 分配 SQ (Submission Queue)
-    nvmeq->sq_cmds = dma_alloc_coherent(dev->dev,
-                                         SQ_SIZE(NVME_AQ_DEPTH),
-                                         &nvmeq->sq_dma_addr,
-                                         GFP_KERNEL);
-    if (!nvmeq->sq_cmds)
-        goto free_nvmeq;
-    
-    // 分配 CQ (Completion Queue)
-    nvmeq->cqes = dma_alloc_coherent(dev->dev,
-                                      CQ_SIZE(NVME_AQ_DEPTH),
-                                      &nvmeq->cq_dma_addr,
-                                      GFP_KERNEL);
-    if (!nvmeq->cqes)
-        goto free_sq;
-    
-    // 配置 Admin Queue 寄存器
-    writel(NVME_AQ_DEPTH - 1, &dev->bar->aqa);
-    writeq(nvmeq->sq_dma_addr, &dev->bar->asq);
-    writeq(nvmeq->cq_dma_addr, &dev->bar->acq);
-    
-    dev->queues[0] = nvmeq;
-    return 0;
-
-free_sq:
-    dma_free_coherent(dev->dev, SQ_SIZE(NVME_AQ_DEPTH),
-                      nvmeq->sq_cmds, nvmeq->sq_dma_addr);
-free_nvmeq:
-    kfree(nvmeq);
-    return -ENOMEM;
-}
-
-// 创建 I/O Queue
-static int nvme_create_io_queue(struct nvme_dev *dev, u16 qid)
-{
-    struct nvme_queue *nvmeq = dev->queues[qid];
-    struct nvme_command c;
-    
-    // 1. 创建 I/O Completion Queue
-    memset(&c, 0, sizeof(c));
-    c.create_cq.opcode = nvme_admin_create_cq;
-    c.create_cq.prp1 = cpu_to_le64(nvmeq->cq_dma_addr);
-    c.create_cq.cqid = cpu_to_le16(qid);
-    c.create_cq.qsize = cpu_to_le16(nvmeq->q_depth - 1);
-    c.create_cq.cq_flags = cpu_to_le16(NVME_CQ_IRQ_ENABLED |
-                                        NVME_QUEUE_PHYS_CONTIG);
-    c.create_cq.irq_vector = cpu_to_le16(nvmeq->cq_vector);
-    
-    result = nvme_submit_sync_cmd(dev->queues[0], &c, NULL, 0);
-    if (result)
-        return result;
-    
-    // 2. 创建 I/O Submission Queue
-    memset(&c, 0, sizeof(c));
-    c.create_sq.opcode = nvme_admin_create_sq;
-    c.create_sq.prp1 = cpu_to_le64(nvmeq->sq_dma_addr);
-    c.create_sq.sqid = cpu_to_le16(qid);
-    c.create_sq.qsize = cpu_to_le16(nvmeq->q_depth - 1);
-    c.create_sq.sq_flags = cpu_to_le16(NVME_QUEUE_PHYS_CONTIG);
-    c.create_sq.cqid = cpu_to_le16(qid);
-    
-    result = nvme_submit_sync_cmd(dev->queues[0], &c, NULL, 0);
-    if (result)
-        goto delete_cq;
-    
-    return 0;
-
-delete_cq:
-    nvme_delete_cq(dev, qid);
-    return result;
-}
-```
-
-## I/O 路径
-
-### 命令提交
-
-```c
-static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
-                                   const struct blk_mq_queue_data *bd)
-{
-    struct nvme_queue *nvmeq = hctx->driver_data;
-    struct request *req = bd->rq;
-    struct nvme_command cmnd;
-    blk_status_t ret;
-    
-    // 1. 构建 NVMe 命令
-    ret = nvme_setup_cmd(req->q->queuedata, req, &cmnd);
-    if (ret)
-        return ret;
-    
-    // 2. 映射数据缓冲区
-    ret = nvme_map_data(nvmeq->dev, req, &cmnd);
-    if (ret)
-        return ret;
-    
-    // 3. 提交命令到 SQ
-    spin_lock_irq(&nvmeq->sq_lock);
-    nvme_submit_cmd(nvmeq, &cmnd);
-    spin_unlock_irq(&nvmeq->sq_lock);
-    
-    return BLK_STS_OK;
-}
-
-static void nvme_submit_cmd(struct nvme_queue *nvmeq,
-                             struct nvme_command *cmd)
-{
-    u16 tail = nvmeq->sq_tail;
-    
-    // 1. 拷贝命令到 SQ
-    memcpy(&nvmeq->sq_cmds[tail], cmd, sizeof(*cmd));
-    
-    // 2. 更新 tail 指针
-    if (++tail == nvmeq->q_depth)
-        tail = 0;
-    nvmeq->sq_tail = tail;
-    
-    // 3. 写 Doorbell 寄存器通知设备
-    writel(tail, nvmeq->q_db);
-}
-```
-
-### 命令完成
-
-```c
-static irqreturn_t nvme_irq(int irq, void *data)
-{
-    struct nvme_queue *nvmeq = data;
-    
-    // 处理完成队列
-    nvme_process_cq(nvmeq);
-    
-    return IRQ_HANDLED;
-}
-
-static void nvme_process_cq(struct nvme_queue *nvmeq)
-{
-    u16 head = nvmeq->cq_head;
-    u16 phase = nvmeq->cq_phase;
-    
-    for (;;) {
-        struct nvme_completion *cqe = &nvmeq->cqes[head];
-        
-        // 1. 检查 Phase Tag
-        if ((le16_to_cpu(cqe->status) & 1) != phase)
-            break;
-        
-        // 2. 处理完成条目
-        nvme_handle_cqe(nvmeq, cqe);
-        
-        // 3. 更新 head 指针
-        if (++head == nvmeq->q_depth) {
-            head = 0;
-            phase = !phase;
-        }
-    }
-    
-    // 4. 更新 CQ head doorbell
-    if (head != nvmeq->cq_head) {
-        nvmeq->cq_head = head;
-        nvmeq->cq_phase = phase;
-        writel(head, nvmeq->q_db + nvmeq->dev->db_stride);
-    }
-}
-
-static void nvme_handle_cqe(struct nvme_queue *nvmeq,
-                             struct nvme_completion *cqe)
-{
-    struct request *req;
-    u16 status = le16_to_cpu(cqe->status) >> 1;
-    u16 cid = le16_to_cpu(cqe->command_id);
-    
-    // 1. 根据 Command ID 找到请求
-    req = blk_mq_tag_to_rq(nvmeq->tags, cid);
-    if (!req) {
-        dev_warn(nvmeq->dev->ctrl.device,
-                 "Invalid command id %d\n", cid);
-        return;
-    }
-    
-    // 2. 解除 DMA 映射
-    nvme_unmap_data(nvmeq->dev, req);
-    
-    // 3. 完成请求
-    if (status)
-        blk_mq_complete_request(req, BLK_STS_IOERR);
-    else
-        blk_mq_complete_request(req, BLK_STS_OK);
-}
-```
-
-## 中断配置
-
-### MSI-X 设置
-
-```c
-static int nvme_setup_irqs(struct nvme_dev *dev)
-{
-    int nr_io_queues = num_online_cpus();
-    int result;
-    
-    // 1. 确定中断向量数量
-    // Admin Queue (1) + I/O Queues (nr_io_queues)
-    dev->num_vecs = 1 + nr_io_queues;
-    
-    // 2. 请求 MSI-X 向量
-    result = pci_alloc_irq_vectors(dev->pdev, 1, dev->num_vecs,
-                                    PCI_IRQ_MSIX | PCI_IRQ_AFFINITY);
-    if (result < 0)
-        return result;
-    
-    dev->num_vecs = result;
-    
-    // 3. 注册 Admin Queue 中断
-    result = request_irq(pci_irq_vector(dev->pdev, 0),
-                         nvme_irq, 0, "nvme-admin", dev->queues[0]);
-    if (result)
-        goto free_vectors;
-    
-    // 4. 注册 I/O Queue 中断
-    for (int i = 1; i < dev->num_vecs; i++) {
-        result = request_irq(pci_irq_vector(dev->pdev, i),
-                             nvme_irq, 0, "nvme-io",
-                             dev->queues[i]);
-        if (result)
-            goto free_irqs;
-    }
-    
-    return 0;
-
-free_irqs:
-    while (--i >= 0)
-        free_irq(pci_irq_vector(dev->pdev, i), dev->queues[i]);
-    free_irq(pci_irq_vector(dev->pdev, 0), dev->queues[0]);
-free_vectors:
-    pci_free_irq_vectors(dev->pdev);
-    return result;
-}
-```
-
-### 中断亲和性
-
-```c
-// 绑定中断到特定 CPU
-static void nvme_set_irq_affinity(struct nvme_dev *dev)
-{
-    int i;
-    
-    for (i = 0; i < dev->num_vecs; i++) {
-        int cpu = cpumask_first(pci_irq_get_affinity(dev->pdev, i));
-        if (cpu < nr_cpu_ids) {
-            dev->queues[i]->cpu = cpu;
-        }
-    }
-}
-```
-
-## FEMU 实现
-
-FEMU 中 NVMe 设备的实现位于 `hw/block/nvme.c`：
-
-### 设备初始化
-
-```c
-static void nvme_realize(PCIDevice *pci_dev, Error **errp)
-{
-    NvmeCtrl *n = NVME(pci_dev);
-    
-    // 1. 设置 PCI 配置空间
-    pci_config_set_vendor_id(pci_dev->config, PCI_VENDOR_ID_INTEL);
-    pci_config_set_device_id(pci_dev->config, 0x5845);
-    pci_config_set_class(pci_dev->config, PCI_CLASS_STORAGE_EXPRESS);
-    
-    // 2. 注册 BAR0
-    memory_region_init_io(&n->iomem, OBJECT(n), &nvme_mmio_ops, n,
-                          "nvme", n->reg_size);
-    pci_register_bar(pci_dev, 0,
-                     PCI_BASE_ADDRESS_SPACE_MEMORY |
-                     PCI_BASE_ADDRESS_MEM_TYPE_64,
-                     &n->iomem);
-    
-    // 3. 配置 MSI-X
-    if (msix_init(pci_dev, n->params.msix_qsize,
-                  &n->iomem, 0, PCI_MSIX_TABLE_OFFSET,
-                  &n->iomem, 0, PCI_MSIX_PBA_OFFSET, 0, errp)) {
-        return;
-    }
-    msix_vector_use(pci_dev, 0);  // Admin Queue
-    
-    // 4. 初始化控制器寄存器
-    n->bar.cap = 0x0020001f00028001ULL;  // Capabilities
-    n->bar.vs = 0x00010200;               // Version 1.2
-    n->bar.intms = 0;
-    n->bar.intmc = 0;
-    n->bar.cc = 0;
-    n->bar.csts = 0;
-}
-```
-
-### MMIO 操作
-
-```c
-static const MemoryRegionOps nvme_mmio_ops = {
-    .read = nvme_mmio_read,
-    .write = nvme_mmio_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .impl = {
-        .min_access_size = 2,
-        .max_access_size = 8,
-    },
-};
-
-static uint64_t nvme_mmio_read(void *opaque, hwaddr addr,
-                                unsigned size)
-{
-    NvmeCtrl *n = opaque;
-    
-    if (addr < sizeof(n->bar)) {
-        // 读取控制寄存器
-        return *(uint64_t *)((char *)&n->bar + addr);
-    } else {
-        // Doorbell 寄存器
-        return 0;
-    }
-}
-
-static void nvme_mmio_write(void *opaque, hwaddr addr,
-                             uint64_t data, unsigned size)
-{
-    NvmeCtrl *n = opaque;
-    
-    if (addr == NVME_REG_CC) {
-        // Controller Configuration
-        n->bar.cc = data;
-        if (data & NVME_CC_ENABLE) {
-            nvme_start_ctrl(n);
-        } else {
-            nvme_clear_ctrl(n);
-        }
-    } else if (addr >= 0x1000) {
-        // Doorbell 写入
-        uint16_t qid = (addr - 0x1000) / (4 << n->db_stride);
-        bool is_cq = (addr - 0x1000) & (2 << n->db_stride);
-        
-        if (is_cq) {
-            nvme_update_cq_head(n, qid, data);
-        } else {
-            nvme_process_sq(n, qid, data);
-        }
-    }
-}
-```
-
-### 命令处理
-
-```c
-static void nvme_process_sq(NvmeCtrl *n, uint16_t qid, uint16_t new_tail)
-{
-    NvmeSQueue *sq = &n->sq[qid];
-    NvmeCommand *cmd;
-    
-    // 处理 SQ 中的所有新命令
-    while (sq->head != new_tail) {
-        cmd = &sq->dma_buf[sq->head];
-        
-        // 分发命令
-        if (qid == 0) {
-            nvme_admin_cmd(n, cmd, qid);
-        } else {
-            nvme_io_cmd(n, cmd, qid);
-        }
-        
-        // 更新 head
-        sq->head = (sq->head + 1) % sq->size;
-    }
-}
-
-static void nvme_io_cmd(NvmeCtrl *n, NvmeCommand *cmd, uint16_t qid)
-{
-    switch (cmd->opcode) {
-    case NVME_CMD_READ:
-        nvme_read(n, cmd, qid);
-        break;
-    case NVME_CMD_WRITE:
-        nvme_write(n, cmd, qid);
-        break;
-    case NVME_CMD_FLUSH:
-        nvme_flush(n, cmd, qid);
-        break;
-    default:
-        nvme_post_cqe(n, qid, NVME_INVALID_OPCODE);
-    }
-}
-```
-
-### 中断注入
-
-```c
-static void nvme_post_cqe(NvmeCtrl *n, uint16_t qid, uint16_t status)
-{
-    NvmeCQueue *cq = &n->cq[qid];
-    NvmeCompletion *cqe;
-    
-    // 1. 写入完成条目
-    cqe = &cq->dma_buf[cq->tail];
-    cqe->status = cpu_to_le16(status | (cq->phase << 15));
-    cqe->sq_head = cpu_to_le16(n->sq[qid].head);
-    cqe->sq_id = cpu_to_le16(qid);
-    
-    // 2. 更新 tail
-    cq->tail = (cq->tail + 1) % cq->size;
-    if (cq->tail == 0) {
-        cq->phase = !cq->phase;
-    }
-    
-    // 3. 触发中断
-    if (cq->irq_enabled) {
-        msix_notify(&n->parent_obj, cq->vector);
-    }
-}
-```
-
-## 性能优化
-
-### 1. 多队列利用
-
-```c
-// 根据 CPU 数量创建队列
-int nr_queues = min_t(int, num_online_cpus(), dev->max_io_queues);
-
-// 绑定队列到 CPU
-blk_mq_pci_map_queues(&set, dev->pdev, 0);
-```
-
-### 2. 轮询模式
-
-```c
-// 禁用中断，使用轮询
-static int nvme_poll(struct blk_mq_hw_ctx *hctx)
-{
-    struct nvme_queue *nvmeq = hctx->driver_data;
-    
-    // 直接处理完成队列，不等待中断
-    nvme_process_cq(nvmeq);
-    
-    return 0;
-}
-```
-
-### 3. 批量提交
-
-```c
-// 批量提交命令，减少 doorbell 写入
-static void nvme_queue_rqs(struct request **rqlist)
-{
-    struct nvme_queue *nvmeq = ...;
-    
-    // 提交多个命令
-    while (*rqlist) {
-        nvme_setup_cmd_and_queue(*rqlist);
-        rqlist++;
-    }
-    
-    // 一次性更新 doorbell
-    writel(nvmeq->sq_tail, nvmeq->q_db);
-}
-```
-
-## 调试技巧
-
-### 查看 NVMe 信息
+## 常用调试与压测命令
 
 ```bash
-# nvme-cli 工具
+# 列出 NVMe 设备及控制器/命名空间详情
 nvme list
 nvme id-ctrl /dev/nvme0
-nvme id-ns /dev/nvme0n1
 
-# 查看队列状态
+# 查看当前块设备启用的硬件队列数量
 cat /sys/block/nvme0n1/queue/nr_hw_queues
 
-# 查看中断亲和性
-cat /proc/irq/*/smp_affinity_list | grep nvme
-```
-
-### 性能测试
-
-```bash
-# fio 测试
+# 使用 fio 进行 4K 随机读压测（Direct I/O，队列深度 32，4 并发）
 fio --name=randread --ioengine=libaio --iodepth=32 \
-    --rw=randread --bs=4k --direct=1 \
-    --size=1G --numjobs=4 --runtime=60 \
-    --filename=/dev/nvme0n1
-
-# 查看 I/O 统计
-iostat -x 1 /dev/nvme0n1
+    --rw=randread --bs=4k --direct=1 --size=1G --numjobs=4 --filename=/dev/nvme0n1
 ```
 
-## 总结
+---
 
-NVMe over PCIe 的关键特性：
+## 关联与引申概念
 
-1. **多队列架构**：每个 CPU 核心独立队列，消除锁竞争
-2. **精简命令集**：64 字节命令，16 字节完成，高效传输
-3. **低延迟**：Doorbell 机制，无需 MMIO 读取
-4. **高吞吐**：支持 65535 个队列，每队列 65536 条目
-5. **PCIe 优化**：充分利用 PCIe 带宽和并行性
-
-参见：
-- [PCIe 驱动开发](driver-guide.md)
-- [MSI-X 中断](../interrupts/msix.md)
-- [配置空间](../configuration/config-space.md)
-- [FEMU 概览](femu-overview.md)
+- **SGL（Scatter-Gather List）**：除 PRP 外，NVMe 还支持 SGL 来描述任意长度与对齐方式的非连续内存段，常用于企业级 SSD 与 NVMe-oF（NVMe over Fabrics）。
+- **NVMe-oF**：将 NVMe 队列模型扩展到网络传输层（RDMA、TCP、FC），实现跨网络的低延迟共享存储访问。
+- **延伸阅读**：
+  - [PCIe 驱动开发指南](driver-guide.md)
+  - [FEMU 代码概览](femu-overview.md)
+  - [PCIe 中断实现](interrupts.md)
+  - [PCIe 配置空间实现](config-space.md)
+  - [MSI-X 协议详解](../interrupts/msix.md)

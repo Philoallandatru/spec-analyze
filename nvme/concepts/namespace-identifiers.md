@@ -1,250 +1,79 @@
-# 命名空间标识符（Namespace Identifiers）
+# 命名空间标识符（Namespace Identifiers, NSID）
 
-## 概述
+**NSID（Namespace Identifier）** 是主机在 NVMe 命令（SQE）中用来指定目标命名空间的数字句柄。它**仅在当前子系统会话内有效**，并非命名空间的永久身份；跨重启或跨路径追踪同一物理命名空间需依赖 UUID / NGUID / EUI64 等持久标识符。[PDF pp. 97-99](../_source/pages/page-097.md)
 
-命名空间标识符（Namespace Identifier，简称 NSID）是 NVMe 中用于引用命名空间的数字句柄。需要注意的是，NSID **只是一个临时句柄，而非命名空间的永久身份标识**。理解 NSID 的工作机制对于正确管理 NVMe 存储至关重要。[PDF pp. 97-99](../_source/pages/page-097.md)
+> **类比**：把 NSID 想成**酒店房间号**——每次入住（挂载）可能分到不同房号，但你手里的**身份证/门卡永久编号（UUID）**不会变；预订了房间（子系统已分配）却没办入住（未挂接到当前控制器），房间号对你依然不可用。
 
-### NSID 的核心特性
-
-- **作用域**：NSID 在整个子系统（Subsystem）范围内有效
-- **分配层级**：NSID 的分配是子系统级别的操作
-- **活跃状态**：NSID 的活跃性需要针对每个控制器（Controller）单独评估
-
-简单来说，一个 NSID 在整个子系统中是唯一的标识符，但每个控制器都需要单独判断该命名空间是否可用。
-
-## NSID 的三维分类体系
-
-理解 NSID 需要从三个维度来看：数值范围、分配状态和附加状态。
-
-### 1. 数值空间（Numeric Space）
-
-NSID 的数值范围定义如下：
+## NSID 的三个独立维度
 
 ```text
-数值范围          状态说明
-─────────────────────────────────────────
-0h               无效值（invalid）
-1h ~ NN          有效范围（valid range）
-NN+1 ~ FFFFFFFEh 无效值（invalid）
-FFFFFFFFh        广播值（broadcast）
-                 注意：广播值不是普通的有效 NSID
+子系统视角（Allocation State）         控制器视角（Attachment State）
+┌──────────────────────────────────┐  ┌─────────────────────────────┐
+│ NSID 1: 已分配 (allocated)  ─────┼─→│ 控制器 A: active  (已挂接)   │
+│                                  └─→│ 控制器 B: inactive (未挂接) │
+│ NSID 2: 已分配 (allocated)  ─────┬─→│ 控制器 A: active            │
+│                                  └─→│ 控制器 B: active  (共享)    │
+│ NSID 3: 未分配 (unallocated) ────┴─→│ 所有控制器: inactive        │
+└──────────────────────────────────┘  └─────────────────────────────┘
 ```
 
-**说明**：
-- `NN` 是系统支持的最大有效 NSID 值
-- 广播值 `FFFFFFFFh` 用于特殊用途，可以向所有允许的命名空间发送命令
+1. **数值空间（Numeric Space）**：
+   - `0h`：**无效值（Invalid）**，绝非广播值。
+   - `1h ~ NN`：**有效范围（Valid Range）**，`NN` 为 Identify Controller 报告的最大有效 NSID 值（注意 `NN` 可远大于同时分配的最大命名空间数 `MNAN`，因此 NSID 空间可以是稀疏的）。[PDF pp. 97-99](../_source/pages/page-097.md)
+   - `NN+1 ~ FFFFFFFEh`：**无效值（Invalid）**。
+   - `FFFFFFFFh`：**广播值（Broadcast）**，向该命令允许操作的所有命名空间发送命令（它不是普通有效 NSID）。[PDF p. 97](../_source/pages/page-097.md)
+2. **分配状态（子系统级）**：`allocated`（已指向真实存在的命名空间）vs `unallocated`（空闲编号）。[PDF pp. 97-98](../_source/pages/page-097.md)
+3. **挂接状态（控制器级）**：`active`（已挂接到当前控制器，可访问）vs `inactive`（未挂接到当前控制器，不可访问；未分配的 NSID 对所有控制器必为 `inactive`）。[PDF pp. 97-98](../_source/pages/page-097.md)
 
-### 2. 分配状态（Allocation State）- 子系统视角
+## 命令错误处理与发现机制
 
-在有效范围内（1h ~ NN），从子系统的角度看，每个 NSID 可能处于以下状态之一：
+向控制器发送带 NSID 的命令时，常见响应与排查如下：[PDF p. 97](../_source/pages/page-097.md)
 
-| 状态 | 中文名称 | 说明 |
-|------|---------|------|
-| **allocated** | 已分配 | 该 NSID 指向一个实际存在的命名空间 |
-| **unallocated** | 未分配 | 该 NSID 不指向任何命名空间，是一个空闲编号 |
+| 命令中的 NSID 状态 | 控制器行为 / 返回错误 | 常见原因与排查 |
+|---|---|---|
+| **active** | 正常执行 | 已分配且已挂接到当前控制器 |
+| **inactive** | 拒绝：`Invalid Field in Command` | 命名空间在子系统存在（`nvme list-ns -a` 可见），但未 `attach-ns` 到本控制器 |
+| **invalid**（数值越界或为 `0h`） | 拒绝：`Invalid Namespace or Format` | 填入了 `0h` 或超出 `NN` 的值 |
+| **FFFFFFFFh** | 广播至命令允许的所有命名空间 | 仅用于支持广播语义的管理/特定命令 |
 
-### 3. 附加状态（Attachment State）- 控制器视角
+### Identify 枚举与分页
 
-对于每个控制器来说，一个已分配的 NSID 可能处于：
+主机通过 `Identify` 命令的不同 `CNS`（Controller or Namespace Structure）值发现命名空间，每次列表查询最多返回 1024 个 NSID；若未读完，则以返回的最后一个 NSID 作为下次请求的起点进行分页：[PDF pp. 98-99](../_source/pages/page-098.md)
 
-| 状态 | 中文名称 | 说明 |
-|------|---------|------|
-| **active** | 活跃的 | 该命名空间已附加（attached）到当前控制器，可以访问 |
-| **inactive** | 非活跃的 | 该命名空间未附加到当前控制器，无法访问 |
+| 发现目标 | CNS 值 | 返回内容 |
+|---|---|---|
+| 单个活跃命名空间详情 | `CNS=0h` | 指定 NSID 的 Identify Namespace 数据结构 |
+| 当前控制器的活跃 NSID 列表 | `CNS=2h` | 当前控制器 `active` 的 NSID 列表（≤ 1024 条） |
+| 子系统已分配的 NSID 列表 | `CNS=10h` | 子系统级 `allocated` 的 NSID 列表（≤ 1024 条） |
 
-### 状态关系示意
+## 持久身份、一致性与队列关系
+
+- **持久身份优先级**：由于 NSID 在重启或重新分配后可能变化，跨路径/跨会话识别同一命名空间应按优先级选用：**UUID**（128-bit，RFC 9562，最高） > **NGUID**（128-bit） > **EUI64**（64-bit）；`UIDREUSE` 字段用于提示 NGUID/EUI64 是否允许重用。[PDF p. 99](../_source/pages/page-099.md)
+- **多控制器 NSID 一致性**：若子系统支持 Namespace Management、ANA Reporting 或 NVM Sets 之一，同一 NSID 在所有控制器上必指向同一物理命名空间；否则仅保证共享命名空间的 NSID 在子系统内一致，私有命名空间跨控制器可不唯一。[PDF p. 98](../_source/pages/page-098.md)
+- **与队列无固定绑定**：命名空间与提交队列（SQ）之间没有绑定关系，任一 I/O SQ 都可访问该控制器上所有已挂接的命名空间（主机可按 CPU 核心或业务优先级自由调度）。[PDF p. 99](../_source/pages/page-099.md)
+
+## 变更通知与溢出处理
+
+**Changed Attached Namespace List（日志页 `05h`）** 记录自上次成功读取以来发生 Identify 变化、挂接、解挂或被删除的命名空间：[PDF p. 235](../_source/pages/page-235.md)
 
 ```text
-┌─────────────────────────────────────────────────────┐
-│ 子系统（Subsystem）                                   │
-│                                                     │
-│  NSID 1: 已分配 ────┬─→ 控制器 A: active           │
-│                     └─→ 控制器 B: inactive         │
-│                                                     │
-│  NSID 2: 已分配 ────┬─→ 控制器 A: active           │
-│                     └─→ 控制器 B: active           │
-│                                                     │
-│  NSID 3: 未分配 ────┬─→ 控制器 A: inactive         │
-│                     └─→ 控制器 B: inactive         │
-└─────────────────────────────────────────────────────┘
+正常情况 (变更数 ≤ 1024):  [ NSID 1 | NSID 2 | ... | NSID N ]
+溢出情况 (变更数 > 1024):  [ FFFFFFFFh (溢出标记) | 0 | ... | 0 ]  ──→ 主机必须全量重新枚举
 ```
 
-**重要规则**：
-- 未分配的 NSID 对**所有控制器**都是 inactive 状态
-- 已分配的 NSID 可以在**某些控制器上为 active**，在**另一些控制器上为 inactive**
+## 关联与引申概念
 
-[PDF pp. 97-98](../_source/pages/page-097.md)
+- **SQE（Submission Queue Entry，提交队列条目）**：主机向控制器下发命令的 64 字节结构，其中 DW1 即用于填入目标 `NSID`。
+- **CNS（Controller or Namespace Structure）**：`Identify` 命令中的选择字段，决定返回控制器信息、单个命名空间详情还是 NSID 列表。
+- **相关文档**：
+  - [namespace.md](namespace.md) — 命名空间基础模型
+  - [namespace-access-models.md](namespace-access-models.md) — 共享/私有模型下的 NSID 一致性
+  - [namespace-management-lifecycle.md](namespace-management-lifecycle.md) — 分配与挂接的生命周期操作
+  - [namespace-topology-and-change-logs.md](namespace-topology-and-change-logs.md) — 拓扑变更日志的完整机制
 
-## 命令中使用 NSID 的错误处理
+## 规范依据
 
-当主机（Host）在命令中指定 NSID 时，系统的响应行为如下：
-
-| 命令中指定的 NSID | 系统行为 | 返回错误 |
-|------------------|----------|----------|
-| inactive 的 NSID | 拒绝执行 | `Invalid Field in Command` |
-| invalid 的 NSID（数值范围无效） | 拒绝执行 | `Invalid Namespace or Format` |
-| 广播值 `FFFFFFFFh` | 向该命令允许操作的所有命名空间发送命令 | - |
-| active 的 NSID | 正常执行 | - |
-
-**使用建议**：
-- 在发送 I/O 命令前，确保目标 NSID 对当前控制器是 active 的
-- 使用广播功能时要谨慎，确保理解其影响范围
-- 注意区分 inactive（命名空间存在但未附加）和 invalid（数值本身无效）这两种错误情况
-
-[PDF p. 97](../_source/pages/page-097.md)
-
-## 命名空间的发现与枚举
-
-主机软件需要通过 Identify 命令来发现可用的命名空间。不同的 CNS（Controller or Namespace Structure）值可以获取不同范围的信息：
-
-### 发现方法对照表
-
-| 发现目标 | Identify CNS 值 | 返回内容 | 说明 |
-|---------|----------------|---------|------|
-| 单个控制器的活跃命名空间 | `CNS=0h` | 指定 NSID 的详细信息 | 逐个查询 |
-| 单个控制器的活跃命名空间列表 | `CNS=2h` | 最多 1024 个 NSID 的列表 | 批量查询 |
-| 子系统中已分配的命名空间列表 | `CNS=10h` | 最多 1024 个 NSID 的列表 | 子系统级查询 |
-
-### 分页机制
-
-由于每次查询最多返回 1024 个 NSID，当命名空间数量较多时，需要使用分页机制：
-
-```text
-第一次请求 → 获取前 1024 个 NSID
-    ↓
-判断是否还有更多
-    ↓
-使用最后一个 NSID 作为起点 → 继续请求
-    ↓
-重复直到获取完所有 NSID
-```
-
-**容量规划注意事项**：
-- 最大有效 NSID 值（`NN`）可能远大于同时分配的最大命名空间数量（`MNAN`）
-- 这意味着 NSID 编号空间可能是稀疏的，不一定是连续的
-
-[PDF pp. 98-99](../_source/pages/page-098.md)
-
-## NSID 与持久身份标识
-
-### 为什么需要持久标识符？
-
-NSID 作为临时句柄，**可能在系统掉电或重启后发生变化**。这给跨路径访问或长期跟踪同一命名空间带来了挑战。
-
-### 持久身份标识符
-
-为了在不同时间点或不同访问路径下识别同一个物理命名空间，NVMe 提供了以下持久标识符：
-
-| 标识符类型 | 全称 | 长度 | 优先级 |
-|-----------|------|------|--------|
-| **UUID** | Universally Unique Identifier | 128-bit | 最高 |
-| **NGUID** | Namespace Globally Unique Identifier | 128-bit | 中 |
-| **EUI64** | Extended Unique Identifier | 64-bit | 低 |
-
-**使用策略**：
-- 主机软件应优先使用 UUID（如果可用）
-- 如果没有 UUID，则使用 NGUID
-- 如果都不可用，最后使用 EUI64
-- 可通过 `UIDREUSE` 字段了解 NGUID/EUI64 的重用特性
-
-[PDF p. 99](../_source/pages/page-099.md)
-
-### NSID 在多控制器环境中的一致性
-
-NSID 的一致性保证取决于子系统的功能支持：
-
-| 功能支持情况 | NSID 一致性保证 |
-|-------------|----------------|
-| 支持以下功能之一：<br>• Namespace Management<br>• ANA Reporting<br>• NVM Sets | 同一 NSID 在所有控制器上指向**同一个物理命名空间** |
-| 不支持上述功能 | • 共享命名空间：NSID 在子系统内保持唯一<br>• 私有命名空间：NSID 可能不唯一 |
-
-**实际应用**：
-- 在多路径配置中，使用持久标识符（UUID/NGUID/EUI64）而非 NSID 来识别命名空间
-- 在高可用环境中，依赖 ANA Reporting 或 Namespace Management 功能确保一致性
-
-[PDF p. 98](../_source/pages/page-098.md)
-
-## 命名空间与队列的关系
-
-### 灵活的关联模式
-
-命名空间和提交队列（Submission Queue，简称 SQ）之间**没有固定的绑定关系**。这意味着：
-
-- 主机软件可以自由选择通过哪个提交队列访问某个命名空间
-- 每个 I/O 提交队列都支持访问该控制器上所有已附加的命名空间
-- 主机可以根据性能需求、NUMA 亲和性等因素灵活分配队列
-
-**典型应用场景**：
-```text
-场景 1：按 CPU 核心分配
-  CPU 0 → SQ 0 → 访问 NSID 1, 2, 3
-  CPU 1 → SQ 1 → 访问 NSID 1, 2, 3
-
-场景 2：按命名空间优先级分配
-  高优先级 SQ → NSID 1（关键数据）
-  普通 SQ → NSID 2, 3（一般数据）
-```
-
-[PDF p. 99](../_source/pages/page-099.md)
-
-## 命名空间变更通知机制
-
-### Changed Attached Namespace List
-
-为了让主机软件及时感知命名空间的变化，NVMe 提供了 **Changed Attached Namespace List** 日志页。
-
-### 通知内容
-
-该日志记录自上次成功读取以来，发生以下变化的命名空间：
-
-- Identify 数据发生变化
-- 命名空间被附加到当前控制器
-- 命名空间从当前控制器分离
-- 命名空间被删除
-
-### 日志格式
-
-```text
-正常情况（变化数量 ≤ 1024）：
-┌──────────────┬──────────────┬─────┬──────────────┐
-│ NSID 1       │ NSID 2       │ ... │ NSID N       │
-└──────────────┴──────────────┴─────┴──────────────┘
-
-溢出情况（变化数量 > 1024）：
-┌──────────────┬──────────────┬─────┬──────────────┐
-│ FFFFFFFFh    │ 0            │ ... │ 0            │
-│ (溢出标记)    │              │     │              │
-└──────────────┴──────────────┴─────┴──────────────┘
-```
-
-### 溢出处理
-
-当变更的命名空间数量超过 1024 个时：
-
-1. 第一个条目设置为 `FFFFFFFFh`（溢出标记）
-2. 其余条目全部填充为 0
-3. 主机软件**必须重新枚举所有命名空间**，不能将此列表视为完整
-
-**建议做法**：
-- 定期轮询 Changed Attached Namespace List
-- 检测到溢出标记时，立即执行全量重新扫描
-- 在命名空间管理操作频繁时，增加轮询频率
-
-[PDF p. 235](../_source/pages/page-235.md)
-
-## 最佳实践总结
-
-1. **使用持久标识符**：在需要长期跟踪命名空间时，始终使用 UUID/NGUID/EUI64，而非 NSID
-2. **验证活跃状态**：在发送 I/O 命令前，确认目标 NSID 对当前控制器是 active 的
-3. **处理变更通知**：实现 Changed Attached Namespace List 的监控机制，及时响应拓扑变化
-4. **正确枚举**：使用适当的 CNS 值和分页机制，完整发现所有可用命名空间
-5. **理解一致性边界**：在多控制器环境中，明确 NSID 的一致性保证范围
-
-## 规范引用
-
-以下是本文档涉及的 NVMe 规范页面，供深入研究参考：
-
-- [NSID 有效性、分配状态与附加状态，PDF pp. 97-98](../_source/pages/page-097.md)
-- [NSID 唯一性与枚举机制，PDF pp. 98-99](../_source/pages/page-098.md)
+- [NSID 数值空间、分配与附加状态，PDF pp. 97-98](../_source/pages/page-097.md)
+- [CNS 枚举、唯一性与跨控制器一致性，PDF pp. 98-99](../_source/pages/page-098.md)
 - [持久身份标识符与队列独立性，PDF p. 99](../_source/pages/page-099.md)
 - [Changed Attached Namespace List 与溢出行为，PDF p. 235](../_source/pages/page-235.md)

@@ -1,6 +1,6 @@
 # 存储与互连规范解析
 
-这是一个面向中文读者的技术规范知识库，包含 **NVMe** 和 **PCIe** 两大核心技术的完整文档。我们将官方规范改写为更易理解的中文文档，帮助开发者和工程师快速掌握存储和互连技术。
+这是一个面向中文读者的技术规范知识库，包含 **NVMe**、**PCIe** 与 **主机驱动/系统架构** 三大核心模块。我们将官方规范与系统实现改写为更易理解的中文文档，帮助开发者和工程师快速掌握存储和互连技术。
 
 ## 📚 包含的规范
 
@@ -45,6 +45,21 @@ PCIe（PCI Express）是现代计算机系统中最重要的高速互连总线�
 - [三层协议模型](pcie/wiki/architecture/layering.md) - TL、DLL、PHY 完整解析
 - [配置空间](pcie/wiki/configuration/config-space.md) - 设备配置机制
 - [中断机制](pcie/wiki/interrupts/overview.md) - INTx、MSI、MSI-X
+
+---
+
+### 🟠 主机驱动与系统架构（Host System）
+
+串联固件、Linux 内核驱动、IOMMU 硬件隔离与虚拟化直通，打通从上电枚举到高并发 I/O 的主机侧完整链路。
+
+**快速入口：** [主机系统目录](host-system/README.md)
+
+**核心文档：**
+1. [上电、UEFI/ACPI 与 PCIe 枚举](host-system/boot-and-enumeration.md) - `PERST#`、DFS 遍历与 `MCFG`/`_PRT`/`DMAR`
+2. [Linux PCIe 与 NVMe 驱动模型](host-system/linux-pci-nvme-driver.md) - `pci_driver`、`nvme-pci`、`blk-mq` 与 `io_uring`/SPDK
+3. [IOMMU、DMA 重映射与地址翻译](host-system/iommu-and-dma.md) - IOVA、一致性/流式 DMA 与 `ATS`/`PRI`/`PASID`
+4. [中断重映射、VFIO 与 SR-IOV 虚拟化](host-system/interrupt-remapping-and-vfio.md) - IRTE、Posted Interrupts 与设备直通
+5. [主机侧性能调优与排错 SOP](host-system/host-debug-and-tuning.md) - MPS/MRRS、`iommu=pt` 与掉盘超时定位
 
 ---
 
@@ -98,6 +113,13 @@ spec-repo/
 │   ├── _meta/                   # 元数据
 │   ├── _source/                 # 源规范引用
 │   └── _review/                 # 审阅材料
+├── host-system/                 # 主机驱动与系统架构（6 篇核心文档）
+│   ├── README.md
+│   ├── boot-and-enumeration.md
+│   ├── linux-pci-nvme-driver.md
+│   ├── iommu-and-dma.md
+│   ├── interrupt-remapping-and-vfio.md
+│   └── host-debug-and-tuning.md
 └── pcie/                        # PCIe 5.0 规范
     ├── README.md                # PCIe 项目介绍
     ├── QUICKSTART.md            # 快速开始

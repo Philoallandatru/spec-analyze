@@ -51,20 +51,20 @@
 
 ### 5️⃣ 物理层 (Physical Layer)
 - [物理层概述](physical-layer/overview.md) - 逻辑子块和电气子块
-- [编码方案](physical-layer/encoding.md) - 8b/10b 和 128b/130b
+- [PCS、PMA 与 PIPE 接口](physical-layer/pcs-pma-pipe.md) - 子层划分、弹性缓冲、Deskew 与 EIOS/EIEOS
+- [编码方案](physical-layer/encoding.md) - 8b/10b、128b/130b 与 Gen 6 PAM4/FLIT
 - [LTSSM 状态机](physical-layer/ltssm.md) - 链路训练和状态管理
 - [链路训练](physical-layer/link-training.md) - 速度和宽度协商
 - [链路均衡](physical-layer/link-equalization.md) - 信号质量优化
-- [时钟架构](physical-layer/clocking.md) - 参考时钟和扩频
+- [时钟架构](architecture/clock-architecture.md) - 参考时钟和扩频
 - [Retimer](physical-layer/retimer.md) - PCIe 4.0/5.0 信号中继器
-- [电气规范](physical-layer/electrical.md) - 电压、阻抗、抖动、眼图
+- [电气规范](physical-layer/electrical-spec.md) - 电压、阻抗、抖动、眼图
 
 ### 6️⃣ 配置空间与能力
 - [配置空间布局](configuration/config-space.md) - 256 字节标准 + 4KB 扩展
 - [Type 0/1 Header](configuration/header-types.md) - Endpoint 和 Bridge 配置头
 - [BARs](configuration/bars.md) - 基地址寄存器和地址映射
-- [能力结构](configuration/capabilities.md) - 可扩展的特性声明机制
-- [PCIe 能力](configuration/pcie-capability.md) - PCIe 专有能力详解
+- [能力结构](configuration/capabilities.md) - 可扩展的特性声明机制（含 PCIe 能力详解）
 - [扩展能力](configuration/extended-capabilities.md) - 4KB 配置空间中的高级特性
 
 ### 7️⃣ 中断机制
@@ -79,13 +79,12 @@
 - [AER](error-handling/aer.md) - 高级错误报告机制
 - [错误检测](error-handling/detection.md) - ECRC、LCRC、超时等
 - [错误恢复](error-handling/recovery.md) - 错误后的恢复流程
-- [错误注入](error-handling/injection.md) - 测试和调试
+- [错误注入](error-handling/error-injection.md) - 测试和调试
 
 ### 9️⃣ 电源管理
-- [电源状态](power-management/power-states.md) - L0、L0s、L1、L2/L3
+- [电源状态](power-management/power-states.md) - 设备 D0–D3 与链路 L0–L3 状态
 - [ASPM](power-management/aspm.md) - 主动状态电源管理
 - [L1 子状态](power-management/l1-substates.md) - L1.1 和 L1.2
-- [设备电源状态](power-management/device-states.md) - D0-D3
 - [时钟电源管理](power-management/clkreq.md) - CLKREQ# 信号
 
 ### 🔟 高级特性
@@ -112,7 +111,6 @@
 - [寄存器速查](glossary/register-quick-ref.md) - 常用寄存器快速参考
 - [规范章节索引](glossary/spec-index.md) - 规范文档导航
 - [FAQ](glossary/faq.md) - 常见问题解答
-- [延伸阅读](glossary/further-reading.md) - 推荐资源
 
 ---
 

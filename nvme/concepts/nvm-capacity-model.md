@@ -1,120 +1,70 @@
-# NVM Capacity Model
+# NVM 容量模型（NVM Capacity Model）
 
-The capacity model separates logical capacity allocation from physical Media Unit organization. A subsystem may report capacity at subsystem, Domain, Endurance Group, NVM Set, formatted-namespace, and Media Unit levels; support for any particular reporting level is optional. [PDF pp. 141-142](../_source/pages/page-141.md)
+**NVM 容量模型**将“逻辑容量如何逐层分配”与“物理介质单元（Media Unit）如何经由通道（Channel）组织”彻底解耦。NVMe 支持按 **NVM 子系统 → Domain（域）→ 耐久度组（Endurance Group）→ NVM Set → 格式化命名空间** 五个层级上报与分配容量，每一级均可选支持。[PDF pp. 141-142](../_source/pages/page-141.md)
 
-## Mental model
+> **类比**：把企业级 SSD 想成一座**多电梯立体仓库**——左半边是**仓库账本**（总账 → 楼层 → 温区 → 货架排 → 箱子，层层切分但不必切光）；右半边是**搬运通道**（电梯 Channel ↔ 货架 Media Unit）。两套账相互独立：你可以让一个温区跨所有电梯以榨干带宽，也可以按电梯隔离成多个独立温区。
+
+## 逻辑分配与物理组织
 
 ```text
-NVM Subsystem capacity
-`-- Domain capacity
-    `-- Endurance Group capacity       <- each Media Unit belongs to exactly one
-        `-- NVM Set capacity           <- each Media Unit belongs to exactly one if supported
-            |-- formatted Namespace(s) <- each wholly inside one NVM Set
-            `-- unallocated capacity
-
-Channel(s) <---- data path ----> Media Unit(s)
-   1..*                              1..*
+逻辑容量分配（自上而下，每层可选）          物理数据通路（1..* 双向连接）
+──────────────────────────────────          ────────────────────────────
+NVM Subsystem Capacity (TNVMCAP / UNVMCAP)  Channel(s) <── data path ──> Media Unit(s)
+  └── Domain Capacity                         (每个 Media Unit 恰好属于 1 个 EG；
+      └── Endurance Group Capacity             支持 NVM Set 时，还恰好属于 1 个 NVM Set)
+          └── NVM Set Capacity
+              ├── 格式化命名空间 (整体位于 1 个 NVM Set 内)
+              └── 未分配容量 (Unallocated)
 ```
 
-This explanatory reconstruction was checked against rendered PDF pages 141-143 and the simple organization in Figure 86. Capacity containment and Channel connectivity are different relationships: capacity is allocated down the hierarchy, while Channels connect to Media Units for data transfer. [PDF pp. 141-143](../_source/pages/page-141.md)
+- **核心分配契约**：[PDF p. 142](../_source/pages/page-142.md)
+  - 每一层都不必用尽全部容量，剩余部分保留为未分配容量（注意：`TNVMCAP` 与 `UNVMCAP` 之间的差额可能包含厂商预留的 **OP（Over-Provisioning）**，OP 不参与命名空间分配）。
+  - **Capacity Management** 命令负责创建/分配 Endurance Group、NVM Set 及 Media Unit；**Namespace Management** 命令负责从底层分配格式化命名空间。
+  - 若不支持 NVM Set，所有 `NVMSETID` 字段清零；若不支持 Endurance Group，所有 `ENDGID` 字段清零（支持 NVM Set 隐含必须支持 Endurance Group）。[PDF pp. 142, 145-146](../_source/pages/page-142.md)
 
-## Allocation contract
+## 介质组织权衡与容量上报矩阵
 
-| Source capacity or resource | Allocated to | Required containment |
+不同的 Media Unit 与 Channel 映射方式直接决定带宽与隔离性：[PDF pp. 143-145](../_source/pages/page-143.md)
+
+| 组织方式（规范原图） | Media Unit 分组策略 | 设计权衡 |
 |---|---|---|
-| Domain capacity | one or more Endurance Groups | each Endurance Group remains in one Domain |
-| Endurance Group capacity | one or more NVM Sets | each NVM Set remains in one Endurance Group |
-| NVM Set capacity | one or more formatted namespaces | each namespace remains in one NVM Set |
-| Media Unit | Endurance Group; also NVM Set when supported | exactly one target at each supported level |
+| **简单型（Figure 86）** | 1 个 Endurance Group 与 1 个 NVM Set 跨全部 4 个 Channel（如 16 个 MU） | 最大化单操作聚合带宽 |
+| **垂直型（Figure 87）** | 每个 Channel 的 4 个 MU 各自组成独立的 Endurance Group 与 NVM Set | 4 组完全隔离，但单组带宽受限于单 Channel |
+| **水平双 NAND 型（Figure 88）** | 4 个 Channel 各出 1 个 SLC MU 与 3 个 QLC MU，分别组建 SLC 集与 QLC 集 | 同时获得高耐久/低延迟 SLC 池与大容量 QLC 池的全通道带宽（图中 SLC/QLC 容量调整因子示例为 ~400 与 ~100） |
 
-Allocation need not consume all capacity at any level. Capacity Management creates and allocates Endurance Groups/NVM Sets and their Media Units; Namespace Management allocates formatted namespace capacity. If NVM Sets are unsupported, every `NVMSETID` field is zero; if Endurance Groups are unsupported, every `ENDGID` field is zero. [PDF p. 142](../_source/pages/page-142.md)
+### 容量账目查询与更新层级（Figure 89）
 
-## Media organization and performance
+创建或删除对象后，主机与控制器依据系统支持的层级在对应位置核对可用/已分配容量：[PDF pp. 145-146](../_source/pages/page-145.md)
 
-```text
-Simple maximum-bandwidth example (Figure 86)
-
-one Endurance Group / one NVM Set
-  |-- Channel 0 -> MU MU MU MU
-  |-- Channel 1 -> MU MU MU MU
-  |-- Channel 2 -> MU MU MU MU
-  `-- Channel 3 -> MU MU MU MU
-
-one operation may access Media Units across all Channels
-```
-
-This compact reconstruction of Figure 86 was checked against rendered PDF page 143. The example puts all 16 Media Units in one Endurance Group and one NVM Set to maximize bandwidth. [PDF pp. 142-143](../_source/pages/page-142.md)
-
-| Organization (rendered figure) | Media Unit grouping | Intended tradeoff |
+| 创建/删除的对象 | 系统支持的层级形态 | 查询与更新容量账目的位置 |
 |---|---|---|
-| Simple (Figure 86) | one Endurance Group and one NVM Set span four Channels | maximum aggregate bandwidth |
-| Vertical (Figure 87) | each Channel's four Media Units form a separate Endurance Group and NVM Set | four isolated sets, each bounded by one Channel's bandwidth |
-| Horizontal dual-NAND (Figure 88) | each of four Channels contributes one SLC Media Unit and three QLC Media Units to separate groups/sets | bandwidth across all Channels for both a smaller SLC set and a larger QLC set |
+| **Endurance Group** | 不支持 Domain | NVM 子系统（`TNVMCAP`、`UNVMCAP`、`MEGCAP`） |
+| **Endurance Group** | 支持 Domain | Domain Attributes Entry |
+| **NVM Set** | 同时支持 NVM Set 与 Endurance Group | Endurance Group Information 日志页 |
+| **格式化命名空间** | 既不支持 EG 也不支持 Domain | NVM 子系统 |
+| **格式化命名空间** | 支持 Domain 但不支持 EG | Domain Attributes Entry |
+| **格式化命名空间** | 支持 EG 但不支持 NVM Set | Endurance Group Information 日志页 |
+| **格式化命名空间** | 支持 NVM Set | NVM Set Attributes Entry |
 
-The table is an explanatory compression of rendered Figures 86–88. Figure 88 also uses a Capacity Adjustment Factor of about 400 for the SLC group and 100 for the QLC group; these are example configuration values, not universal SLC/QLC ratios. [PDF pp. 143-145](../_source/pages/page-143.md)
+## 运行时清单与容量配置日志
 
-## Capacity reporting selection
+- **Media Unit Status 日志**：按 Domain 选择（`0` 表示控制器所在 Domain），按 `MUID` 升序报告可访问的 Media Unit 及其所属 Domain/EG/NVM Set、容量调整因子、剩余备用块（Spare）、已用百分比（Percentage Used）及去重升序的 Channel ID 列表。若未选中容量配置，相关归属与通道计数字段清零。[PDF pp. 276-278](../_source/pages/page-276.md)
+- **Supported Capacity Configuration List**：按 Domain 选择并按 `CCID` 升序排列，以嵌套变长描述符展示设备支持的各种容量配置方案（`Capacity Configuration → Endurance Group → NVM Set IDs + Channel → Media Unit`）。其中寿命估计值（Endurance Estimate）以十亿字节（GB）向上取整报告：`0` 表示未上报，全 `1` 饱和值表示“实际值不低于该值”；NVMe 2.1 中 Media Unit Configuration Descriptor 为 8 字节且扩展长度字段为 `0`。[PDF pp. 278-281](../_source/pages/page-278.md)
 
-| Entity being created or deleted | Supported hierarchy | Capacity information consulted and updated |
-|---|---|---|
-| Endurance Group | no Domains | NVM subsystem (`TNVMCAP`, `UNVMCAP`, `MEGCAP`) |
-| Endurance Group | Domains | Domain Attributes Entry |
-| NVM Set | NVM Sets and Endurance Groups | Endurance Group Information log page |
-| Formatted namespace | neither Endurance Groups nor Domains | NVM subsystem |
-| Formatted namespace | Domains but no Endurance Groups | Domain Attributes Entry |
-| Formatted namespace | Endurance Groups but no NVM Sets | Endurance Group Information log page |
-| Formatted namespace | NVM Sets | NVM Set Attributes Entry |
+## 关联与引申概念
 
-This reconstruction of Figure 89 was checked against rendered PDF page 146. “Consulted and updated” means the host uses that level to judge available capacity and the controller changes its allocated/unallocated accounting after creation or deletion. NVM Set support implies Endurance Group support. [PDF pp. 145-146](../_source/pages/page-145.md)
+- **OP（Over-Provisioning，预留空间）**：SSD 固件内部保留用于垃圾回收（GC）、磨损均衡和坏块替换的物理闪存空间，不计入主机可分配容量。
+- **Capacity Adjustment Factor（容量调整因子）**：用于将不同类型介质（如 SLC vs QLC）的物理磨损/容量特性折算到统一逻辑容量账目中的系数。
+- **相关文档**：
+  - [storage-resource-hierarchy.md](storage-resource-hierarchy.md) — 存储资源总体层次结构
+  - [nvm-sets-and-endurance-groups.md](nvm-sets-and-endurance-groups.md) — Endurance Group 与 NVM Set 的隔离与寿命管理
+  - [capacity-management-operations.md](capacity-management-operations.md) — Capacity Management 命令操作流程
+  - [namespace-management-lifecycle.md](namespace-management-lifecycle.md) — 命名空间创建与容量消耗
 
-## Runtime Media Unit inventory
+## 规范依据
 
-```text
-Domain-selected Media Unit Status log
-  `-- Media Unit descriptor (ascending MUID)
-      |-- Domain -> Endurance Group -> NVM Set assignment
-      |-- capacity adjustment + spare + percentage used
-      `-- Channel IDs (ascending, unique)
-```
-
-The Media Unit Status log reports every accessible Media Unit for a selected Domain, the number of accessible Channels, and the active capacity configuration. Identifier scope is Domain-local in a multi-Domain subsystem and subsystem-wide otherwise. A zero Domain selector means the controller's own Domain; inaccessible Domain information makes the log unavailable. [PDF pp. 276-278](../_source/pages/page-276.md)
-
-If no capacity configuration is selected, each descriptor clears its Endurance Group, NVM Set, capacity adjustment, and Channel-count fields. Otherwise the descriptor associates the Media Unit with resource parents and a sorted, duplicate-free Channel list. Spare and percentage-used are Media-Unit-local measurements; their relationship to Endurance Group values is intentionally unspecified. [PDF pp. 277-278](../_source/pages/page-277.md)
-
-## Supported configuration inventory
-
-The Supported Capacity Configuration List is Domain-selected and ordered by unique Capacity Configuration Identifier. Each variable-length configuration contains ordered Endurance Group configuration descriptors; those in turn contain unique ordered NVM Set identifiers and Channel configuration descriptors. [PDF pp. 278-279](../_source/pages/page-278.md)
-
-```text
-Supported Capacity Configuration List
-`-- Capacity Configuration (ascending unique CCID)
-    `-- Endurance Group configuration (ascending unique ENDGID)
-        |-- capacity, spare, adjustment, endurance estimate
-        |-- NVM Set IDs (ascending unique)
-        `-- Channel configuration (ascending unique CHID)
-            `-- Media Unit configuration (ascending unique MUID)
-```
-
-This explanatory hierarchy was checked against rendered Figures 257–260. Descriptors at every nested list may have different lengths. An Endurance Group descriptor reports total/spare byte capacity and a rounded-up lifetime endurance estimate in billions of bytes; zero means not reported. Each Channel descriptor enumerates its attached Media Units, while Revision 2.1 requires the Media Unit descriptor's extension length to be zero. [PDF pp. 279-281](../_source/pages/page-279.md)
-
-```text
-Capacity Configuration
-`-- Endurance Group configuration
-    |-- capacity adjustment / total / spare / endurance estimate
-    |-- ordered NVM Set IDs
-    `-- Channel configuration
-        `-- ordered Media Unit configurations
-```
-
-An Endurance Group configuration combines capacity/endurance estimates with the logical NVM Set list and physical Channel layout. Channel descriptors list their Media Units; each current Base-defined Media Unit Configuration Descriptor is an eight-byte extensible record whose added-length field is zero. Saturating all-ones values mean the stated value and higher, while zero means an optional estimate is not reported. [PDF pp. 279-281](../_source/pages/page-279.md)
-
-## Evidence
-
-- [Capacity-reporting hierarchy and optionality, PDF p. 141](../_source/pages/page-141.md)
-- [Allocation, zero identifiers, Media Units, and Channels, PDF p. 142](../_source/pages/page-142.md)
-- [Rendered Figure 86 and vertical-organization introduction, PDF p. 143](../_source/pages/page-143.md)
-- [Rendered Figures 87-88 and their configuration descriptors, PDF pp. 144-145](../_source/pages/page-144.md)
-- [Rendered Figure 89 capacity-information selection matrix, PDF p. 146](../_source/pages/page-146.md)
-- [Rendered Media Unit Status log and descriptor, PDF pp. 276-278](../_source/pages/page-276.md)
-- [Rendered Supported Capacity Configuration descriptor hierarchy, PDF pp. 278-281](../_source/pages/page-278.md)
-- [Rendered Endurance Group, Channel, and Media Unit configuration descriptor continuation, PDF pp. 279-281](../_source/pages/page-279.md)
+- [容量上报层级与可选性，PDF p. 141](../_source/pages/page-141.md)
+- [分配契约、零值标识符、Media Unit 与 Channel，PDF p. 142](../_source/pages/page-142.md)
+- [Figure 86–88 介质组织示例，PDF pp. 143-145](../_source/pages/page-143.md)
+- [Figure 89 容量信息选择矩阵，PDF p. 146](../_source/pages/page-146.md)
+- [Media Unit Status 与 Supported Capacity Configuration 日志，PDF pp. 276-281](../_source/pages/page-276.md)

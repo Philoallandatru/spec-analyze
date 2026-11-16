@@ -1,57 +1,42 @@
-# Controller Properties
+# 控制器属性（Controller Properties）
 
-A controller property is a dword or qword controller attribute with read, write, or read/write semantics. Properties form the transport-independent control surface; the transport binding defines how the host performs the access. [PDF p. 71](../_source/pages/page-071.md)
+控制器属性（Controller Property）是控制器暴露的一组与传输无关（transport-independent）的 4 字节（dword）或 8 字节（qword）控制平面寄存器表，用于查询能力、配置运行参数与读取状态；传输绑定（PCIe MMIO 或 Fabrics Property Get/Set）仅决定访问路径，不改变属性语义。[PDF pp. 71-73](../_source/pages/page-071.md)
 
-## Mental model
+可以把它想成**智能设备的控制面板**：无论你是站在设备前直接按按钮（PCIe MMIO），还是打电话让前台代按（Fabrics Property Get/Set），操作的都是同一张面板上的旋钮。
+
+## 属性空间布局与访问约定
 
 ```text
-Host software
-    |
-    | one exact-width access at the property's starting offset
-    v
-+---------------- controller property space ----------------+
-| CAP | VS | INTMS | INTMC | CC | CSTS | ... | transport ... |
-+------------------------------------------------------------+
-    ^                                      ^
-    | Property Get/Set                     | binding-defined access
-    | message-based                        | memory-based
+                     控制器属性空间（Controller Property Space）
+   +---------------------------------------------------------------+
+   | 00h CAP | 08h VS | 0Ch INTMS | 10h INTMC | 14h CC | 1Ch CSTS  |  <- 通用区 (< 1000h)
+   | 20h NSSR| 24h AQA| 28h ASQ   | 30h ACQ   | ...                |
+   +---------------------------------------------------------------+
+   | PCIe: 1000h 起为传输私有区（Doorbell 等）                       |  <- 传输/厂商区 (>= 1000h)
+   | Fabrics: 1000h-12FFh 为 Fabrics 区，1300h 起为厂商私有区        |
+   +---------------------------------------------------------------+
+     ^                                      ^
+     | Property Get/Set (Message-Based)     | MMIO 读写 (Memory-Based)
 ```
 
-This explanatory diagram shows the common property map and the transport-dependent access paths; a single access may not span two properties. [PDF pp. 71-73](../_source/pages/page-071.md)
+[PDF pp. 71-73, 479-481](../_source/pages/page-071.md)
 
-## Access contract
+**严格访问规则**：
+- **精确宽度与对齐**：主机必须从属性起始偏移按其声明宽度（dword/qword）发起单次访问；**禁止跨属性访问**。
+- **保留位规则**：保留属性和保留位为只读，读出返回 `0h`；写 0 允许，但软件不应依赖“不支持的访问返回 0”。
+- **Fabrics 访问**：Property Get/Set 发起 4 字节或 8 字节访问（Get 结果在响应字节 0-7，Set 值在命令字节 48-55）；偏移或宽度非法报 `Invalid Field in Command`。[PDF pp. 479-481](../_source/pages/page-479.md)
 
-The host shall use the property's declared width and an offset at its beginning unless a transport specification says otherwise. An access touching any portion of two or more properties is unsupported. Reserved properties and reserved bits are read-only and return `0h`; hosts write reserved bits and properties as zero, but software should not rely on an unsupported access returning zero. [PDF pp. 71, 73](../_source/pages/page-071.md) [PDF p. 73](../_source/pages/page-073.md)
-
-Message-based controllers expose reads through Property Get and writes through Property Set. Memory-based access is defined by the applicable transport binding. The common map below `1000h` is followed by transport-specific and optional vendor-specific regions: memory-based layouts begin transport-specific content at `1000h`, while message-based layouts reserve `1000h`-`12FFh` for Fabrics and begin vendor-specific space at `1300h`. [PDF pp. 71-73](../_source/pages/page-071.md)
-
-| Access notation | Meaning |
+| 访问标记 | 含义 |
 |---|---|
-| `RO` | read only |
-| `RW` | read/write |
-| `RWC` | write `1` to clear |
-| `RWS` | write `1` to set |
-| `Impl Spec` / `HwInit` | implementation-chosen behavior / configuration-dependent default |
+| `RO` / `RW` | 只读 / 读-写 |
+| `RWC` / `RWS` | 写 `1` 清零 / 写 `1` 置位（写 `0` 无效） |
+| `Impl Spec` / `HwInit` | 实现特定 / 硬件初始化默认值 |
 
-Field references use `Property.Field`, with optional sub-fields such as `CAP.CRMS.CRWMS`; array fields include an element offset. [PDF p. 73](../_source/pages/page-073.md)
+## 核心能力属性：`CAP`、`VS` 与 `INTMS/INTMC`
 
-## Capability and configuration handshake
+### `CAP`（Controller Capabilities，偏移 `00h`）
 
-`CAP` reports constraints that configuration must obey: ready modes, memory-page-size range, command-set support, queue limits, arbitration mechanisms, and transport-relevant queue behavior. `CC` selects operating values within those limits. Before setting `CC.EN` to `1`, the host shall choose valid `CC.AMS`, `CC.MPS`, and `CC.CSS` values; queue entry sizes must be initialized before creating I/O queues. [PDF pp. 74-79](../_source/pages/page-074.md)
-
-```text
-read CAP constraints
-        |
-        v
-choose CC.AMS / CC.MPS / CC.CSS / queue entry sizes
-        |
-        v
-set CC.EN=1  ---> controller ready transition uses CAP/CRTO timeout contract
-```
-
-This explanatory sequence connects capability discovery to legal controller enablement; `CAP.TO` is in 500 ms units and is capped at `FFh`, while controllers supporting `CRTO` may report longer enable timeouts there. [PDF pp. 76, 78-79](../_source/pages/page-076.md) [PDF pp. 78-79](../_source/pages/page-078.md)
-
-### CAP bit-field map
+主机在启用控制器前读取 `CAP`，并在其约束范围内配置 `CC.AMS`、`CC.MPS`、`CC.CSS` 及队列条目大小：[PDF pp. 74-79](../_source/pages/page-074.md)
 
 ```text
 63 62 61 60:59 58 57 56 55:52 51:48 47:46 45 44:37 36 35:32 31:24 23:19 18:17 16 15:0
@@ -61,39 +46,39 @@ This explanatory sequence connects capability discovery to legal controller enab
 +----+--+-----+--+--+--+-----+-----+-----+--+-----+--+-----+-----+-----+-----+--+----+
 ```
 
-This compact map is explanatory; Figure 36 supplies the exact access, reset, dependency, and controller-type rules. [PDF pp. 74-77](../_source/pages/page-074.md)
-
-| Encoded field | Interpretation |
+| 关键字段 | 含义与编码 |
 |---|---|
-| `MPSMIN`, `MPSMAX` | host page size = `2^(12 + value)` bytes |
-| `DSTRD` | doorbell stride = `2^(2 + value)` bytes; `0h` means 4 bytes |
-| `TO` | worst-case ready transition in 500 ms units; `FFh` means 127.5 seconds |
-| `MQES` | 0's-based maximum individual queue size; `1h` represents two entries |
+| `MQES` | 0-based 单队列最大条目数（最小 `1h` = 2 条）。PCIe 限制 I/O SQ 和 CQ；Fabrics 仅限制 I/O SQ [PDF p. 77](../_source/pages/page-077.md) |
+| `CQR` | `1` 要求队列物理连续（Fabrics 永远置 1；PCIe 可置 0） |
+| `TO` | 最坏就绪等待时间，单位 500 ms，`FFh` = 127.5 秒；支持 `CRTO` 时可报告更长超时 [PDF pp. 76, 78-79](../_source/pages/page-076.md) |
+| `DSTRD` | Doorbell 步长 = $2^{(2+\text{value})}$ 字节（`0h` 表示 4 字节，非 0 步长） |
+| `MPSMIN` / `MPSMAX` | 主机内存页大小范围 = $2^{(12+\text{value})}$ 字节 |
 
-[PDF pp. 75-77](../_source/pages/page-075.md)
+> **常见排错**：写 `CC.EN=1` 后控制器迟迟不就绪，优先检查 `CC.AMS`/`CC.MPS`/`CC.CSS` 是否超出 `CAP` 允许的范围。
 
-`CAP.MQES` is 0's-based with a minimum encoded value of `1h` (two entries). For PCIe it limits host-created I/O Submission and Completion Queues; for Fabrics it limits only host-created I/O Submission Queues. `CAP.CQR` requires physically contiguous queues when set and is always set for message-based transports. [PDF p. 77](../_source/pages/page-077.md)
+### `VS`（Version）与中断掩码（`INTMS`/`INTMC`）
 
-## Version and interrupt properties
+- **`VS`（偏移 `08h`）**：编码规范版本（如 Revision 2.1 为 `MJR=2h, MNR=1h, TER=0h`）；带字母后缀版本（如 2.1a）共享同一编码。[PDF pp. 77-78](../_source/pages/page-077.md)
+- **`INTMS` / `INTMC`（偏移 `0Ch` / `10h`）**：成对的引脚中断 / MSI 掩码视图，读回当前掩码状态；往 `INTMS` 写 `1` 屏蔽向量，往 `INTMC` 写 `1` 解除屏蔽（写 `0` 无效）。**启用 MSI-X 后禁止访问这两个寄存器**（MSI-X 使用独立掩码表）。[PDF p. 78](../_source/pages/page-078.md)
 
-`VS` encodes major, minor, and tertiary specification version components; Revision 2.1 is encoded as `MJR=2h`, `MNR=1h`, `TER=0h`. Lettered revisions share the listed numeric version. [PDF pp. 77-78](../_source/pages/page-077.md)
+## 概念辨析
 
-`INTMS` and `INTMC` are paired bit-significant views of the controller interrupt mask state: writing `1` to `INTMS` masks a vector, while writing `1` to `INTMC` unmasks it; writing `0` has no effect. Both read back current mask state. They apply to pin-based interrupts and MSI, and must not be accessed while configured for MSI-X, which uses its own mask table. [PDF p. 78](../_source/pages/page-078.md)
+| 容易混淆 | 实际区别 |
+|---|---|
+| `CAP` vs `CC` | `CAP` 是设备声明的静态能力边界；`CC` 是主机选定的运行配置 |
+| `INTMS` vs `INTMC` | 两者读返回值相同；写 `1` 效果相反（屏蔽 vs 解屏蔽） |
+| `MQES` vs 实际深度 | `MQES` 为 0-based 编码，实际最大条目数为 `MQES + 1` |
 
-## Fabrics Property access
+## 关联与引申概念
 
-For message-based transports, Fabrics Property Get/Set carries the same property surface through command capsules. Get and Set select a 4-byte or 8-byte access at one property offset; Get returns the value in response bytes 0-7, while Set embeds the update value in command bytes 48-55. Invalid properties, offsets, or access sizes fail as Invalid Field in Command. [PDF pp. 479-481](../_source/pages/page-479.md)
+- **控制器支持矩阵（[Controller Support Requirements](controller-support-requirements.md)）**：决定不同类型控制器（I/O、Discovery、Administrative）必须或禁止支持哪些属性。
+- **控制器启用与重置（[Controller Enable, Shutdown, and Reset](controller-enable-shutdown-reset.md)）**：详细展开 `CC`、`CSTS`、`NSSR`、`NSSD`、`AQA`/`ASQ`/`ACQ` 的状态机与握手规则。
+- **传输模型（[Transport Models](transport-models.md)）**：对比 PCIe MMIO 与 NVMe-oF Property Get/Set 的底层传输差异。
+- **Doorbell（门铃寄存器）**：位于 PCIe `1000h` 起的传输私有区，步长由 `CAP.DSTRD` 决定，主机写 Doorbell 通知控制器有新 SQE 或已消费 CQE。
 
-```text
-memory-based host -- MMIO/property access ------> controller property
-message-based host -- Property Get/Set capsule -> same property surface
-```
+## 规范依据
 
-This explanatory transport mapping distinguishes access mechanism from property semantics. [PDF pp. 71-73, 479-481](../_source/pages/page-071.md)
-
-## Evidence
-
-- [Property map and access rules, PDF pp. 71-73](../_source/pages/page-071.md)
-- [CAP capability fields, PDF pp. 74-77](../_source/pages/page-074.md)
-- [VS, INTMS, INTMC, and start of CC, PDF pp. 77-78](../_source/pages/page-077.md)
-- [CC enablement and queue-size preconditions, PDF pp. 78-79](../_source/pages/page-078.md)
+- [属性映射与访问规则（Figure 33），PDF 第 71-73 页](../_source/pages/page-071.md)
+- [CAP 能力字段（Figure 36），PDF 第 74-77 页](../_source/pages/page-074.md)
+- [VS、INTMS、INTMC 与 CC 起始部分，PDF 第 77-79 页](../_source/pages/page-077.md)
+- [Fabrics Property Get/Set 命令，PDF 第 479-481 页](../_source/pages/page-479.md)

@@ -50,13 +50,13 @@
 | **三层协议模型** | [layering.md](wiki/architecture/layering.md) | Ch 1.2 | TL、DLL、PHY 分层架构 |
 | **数据包类型** | [packet-types.md](wiki/architecture/packet-types.md) | Ch 2 | TLP、DLLP、Ordered Sets |
 | **地址空间** | [address-space.md](wiki/architecture/address-space.md) | Ch 2.2 | Memory、I/O、Configuration 空间 |
-| **枚举过程** | [enumeration.md](wiki/architecture/enumeration.md) | Ch 6.6 | 设备发现和配置流程 |
-| **时钟架构** | [clock-architecture.md](wiki/architecture/clock-architecture.md) | Ch 4 | 时钟分布和同步机制 |
+| **枚举过程** | [enumeration.md](wiki/architecture/enumeration.md) | Ch 7 | 设备发现和配置流程 |
+| **时钟架构** | [clock-architecture.md](wiki/architecture/clock-architecture.md) | Ch 4 / Ch 8 | 时钟分布和同步机制 |
 
 **相关规范章节**：
 - Chapter 1.2: Layered Architecture
-- Chapter 2: Transaction, Data Link, and Physical Layers
-- Chapter 6.6: Configuration
+- Chapter 2: Transaction Layer
+- Chapter 7: Configuration Space & Enumeration
 
 ---
 
@@ -95,19 +95,20 @@
 #### DLLP 与流控
 | 主题 | 文档 | 规范章节 | 说明 |
 |------|------|----------|------|
-| **DLLP 格式** | [dllp-format.md](wiki/data-link-layer/dllp-format.md) | Ch 2.5 | Flow Control、Ack/Nak、PM |
-| **流控初始化** | [fc-init.md](wiki/data-link-layer/fc-init.md) | Ch 2.5.2 | Credit 初始化过程 |
+| **DLLP 格式** | [dllp-format.md](wiki/data-link-layer/dllp-format.md) | Ch 3 | Flow Control、Ack/Nak、PM |
+| **流控初始化** | [fc-init.md](wiki/data-link-layer/fc-init.md) | Ch 3.3 | Credit 初始化过程 |
 
 #### 可靠传输
 | 主题 | 文档 | 规范章节 | 说明 |
 |------|------|----------|------|
-| **Ack/Nak 协议** | [ack-nak.md](wiki/data-link-layer/ack-nak.md) | Ch 2.6 | 确认和否定应答机制 |
-| **重传缓冲区** | [retry-buffer.md](wiki/data-link-layer/retry-buffer.md) | Ch 2.6.1 | Replay Buffer 实现 |
-| **LCRC** | [lcrc.md](wiki/data-link-layer/lcrc.md) | Ch 2.6.2 | Link CRC 链路级校验 |
+| **Ack/Nak 协议** | [ack-nak.md](wiki/data-link-layer/ack-nak.md) | Ch 3.4 | 确认和否定应答机制 |
+| **重传缓冲区** | [retry-buffer.md](wiki/data-link-layer/retry-buffer.md) | Ch 3.4 | Replay Buffer 实现 |
+| **LCRC** | [lcrc.md](wiki/data-link-layer/lcrc.md) | Ch 3.4 | Link CRC 链路级校验 |
 
 **相关规范章节**：
-- Chapter 2.5: Data Link Layer
-- Chapter 2.6: Link Reliability
+- Chapter 3: Data Link Layer
+- Chapter 3.3: Data Link Control and Management State Machine (DLCMSM) & FC Init
+- Chapter 3.4: Data Link Layer Packet (DLLP) & Ack/Nak Protocol
 
 ---
 
@@ -258,7 +259,10 @@
 ### 参考资料
 | 主题 | 文档 | 说明 |
 |------|------|------|
-| **术语表** | [glossary/index.md](wiki/glossary/index.md) | 200+ 术语速查 |
+| **术语表** | [glossary/index.md](wiki/glossary/index.md) | 核心术语与缩写速查 |
+| **寄存器速查** | [glossary/register-quick-ref.md](wiki/glossary/register-quick-ref.md) | 配置头、Capability 位域与 `setpci` 示例 |
+| **常见问题 (FAQ)** | [glossary/faq.md](wiki/glossary/faq.md) | 高频工程与面试问题解答 |
+| **规范章节速查** | [glossary/spec-index.md](wiki/glossary/spec-index.md) | 规范版本演进与章节映射 |
 | **Wiki 主页** | [wiki/README.md](wiki/README.md) | 完整导航 |
 | **快速开始** | [QUICKSTART.md](QUICKSTART.md) | 入门指南 |
 | **项目总结** | [PROJECT_SUMMARY.md](PROJECT_SUMMARY.md) | 项目进度 |
@@ -270,11 +274,12 @@
 | 章节 | 标题 | 主要内容 | 相关文档 |
 |------|------|----------|----------|
 | **Ch 1** | Introduction | 概述、拓扑、分层 | [overview.md](wiki/introduction/overview.md), [topology.md](wiki/introduction/topology.md), [layering.md](wiki/architecture/layering.md) |
-| **Ch 2** | Transaction/Data Link/Physical | TLP、DLLP、流控 | [tlp-format.md](wiki/transaction-layer/tlp-format.md), [dllp-format.md](wiki/data-link-layer/dllp-format.md) |
-| **Ch 4** | Physical Layer | 物理层规范 | [overview.md](wiki/physical-layer/overview.md), [ltssm.md](wiki/physical-layer/ltssm.md) |
-| **Ch 5** | Power Management | 电源管理 | [power-states.md](wiki/power-management/power-states.md), [aspm.md](wiki/power-management/aspm.md) |
-| **Ch 6** | System Architecture | 中断、错误、高级特性 | [overview.md](wiki/interrupts/overview.md), [error-types.md](wiki/error-handling/error-types.md) |
-| **Ch 7** | Configuration Space | 配置空间 | [config-space.md](wiki/configuration/config-space.md), [bars.md](wiki/configuration/bars.md) |
+| **Ch 2** | Transaction Layer | TLP 格式、路由、流控、排序、ECRC | [tlp-format.md](wiki/transaction-layer/tlp-format.md), [flow-control.md](wiki/transaction-layer/flow-control.md) |
+| **Ch 3** | Data Link Layer | DLLP、流控初始化、Ack/Nak、LCRC | [dllp-format.md](wiki/data-link-layer/dllp-format.md), [ack-nak.md](wiki/data-link-layer/ack-nak.md) |
+| **Ch 4** | Physical Layer | 物理层规范、编码、LTSSM、均衡 | [overview.md](wiki/physical-layer/overview.md), [ltssm.md](wiki/physical-layer/ltssm.md) |
+| **Ch 5** | Power Management | 电源管理、ASPM、L1 Substates | [power-states.md](wiki/power-management/power-states.md), [aspm.md](wiki/power-management/aspm.md) |
+| **Ch 6** | System Architecture | 中断、错误、热插拔、ACS/ARI/IDE | [overview.md](wiki/interrupts/overview.md), [error-types.md](wiki/error-handling/error-types.md) |
+| **Ch 7** | Configuration Space | 配置空间、BAR、Capability | [config-space.md](wiki/configuration/config-space.md), [bars.md](wiki/configuration/bars.md) |
 | **Ch 9** | SR-IOV | 虚拟化 | [sriov.md](wiki/advanced-features/sriov.md) |
 
 ---
@@ -369,33 +374,10 @@
 
 ---
 
-## 代码示例索引
+## 内容规模与状态
 
-### C 语言示例
-- 配置空间读写：[config-space.md](wiki/implementation/config-space.md)
-- MSI/MSI-X 设置：[interrupts.md](wiki/implementation/interrupts.md)
-- DMA 映射：[driver-guide.md](wiki/implementation/driver-guide.md)
-- 错误处理：[aer.md](wiki/implementation/aer.md)
-
-### Verilog HDL 示例
-- TLP 生成：[tlp-format.md](wiki/transaction-layer/tlp-format.md)
-- CRC 计算：[lcrc.md](wiki/data-link-layer/lcrc.md)
-- 8b/10b 编码：[encoding.md](wiki/physical-layer/encoding.md)
-
----
-
-## 统计信息
-
-**内容规模**：
-- 总页面数：72 页
-- 总字数：200,000+ 字
-- 代码示例：600+ 个
-- ASCII 图表：300+ 个
-- 术语条目：200+ 个
-
-**完成度**：100% ✅
-
-**最后更新**：2026-07-07
+- **Wiki 专题页面**：72 篇（覆盖架构、三层协议、配置、中断、错误、电源、安全/虚拟化与实现）
+- **参考速查**：[术语表](wiki/glossary/index.md) · [寄存器速查表](wiki/glossary/register-quick-ref.md) · [FAQ](wiki/glossary/faq.md)
 
 ---
 

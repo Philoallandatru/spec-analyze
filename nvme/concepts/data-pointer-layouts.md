@@ -1,22 +1,26 @@
-# Data Pointer Layouts
+# 数据指针布局（Data Pointer Layouts）
 
-Data pointer layouts describe command data and metadata as controller-addressable memory regions. PRPs use fixed-size physical-memory-page pointers and optional page lists; SGLs use typed descriptors and segments. [PDF pp. 173-175](../_source/pages/page-173.md)
+数据指针布局用于在命令的 `DPTR`（16 字节数据指针区域）中描述主机内存与控制器之间传输的数据和元数据位置。NVMe 提供两种机制：**PRP**（Physical Region Page，物理页指针，简单高效但受限于页对齐）和 **SGL**（Scatter Gather List，分散聚集列表，用带类型描述符支持任意长度与内存布局）。[PDF 第 173-175 页](../_source/pages/page-173.md)
 
-## Mental model
+## 心智模型
+
+在命令的 `PSDT` 字段选择模式后，`DPTR` 会切换为对应布局：
 
 ```text
-PRP form                                  SGL form
-command                                   command
-|-- PRP1 -> first page + optional offset  `-- SGL1 -> data descriptor
-`-- PRP2 -> second page                         or segment descriptor
-          or packed PRP List                         |
-                 |                                  `-> typed descriptors
-                 `-> next list page (if needed)         `-> next/last segment
+PRP 模式（PSDT = 00b）                     SGL 模式（PSDT = 01b / 10b）
+command.DPTR                               command.DPTR
+├── PRP1 -> 第 1 页 + 可选页内偏移         └── SGL1 (16 字节描述符)
+└── PRP2 -> 第 2 页                            ├── Data Block / Bit Bucket
+            或 打包的 PRP List 页              └── Segment -> 下一段 SGL
+                    └── next List 页（如需）           └── Last Segment（终点）
 ```
 
-This explanatory comparison preserves the two indirection models: PRP list length is implied by the command transfer and page size, while an SGL explicitly describes lengths and typed segment links. [PDF pp. 173-175](../_source/pages/page-173.md)
+- **PRP** 像按固定楼层（如 4 KiB 页）搬运：总页数由“命令传输字节数 + 页大小”反推。
+- **SGL** 像带明细的流水单：每个 16 字节描述符显式写明本段地址与长度，支持跳过不需要的字节。
 
-## PRP entry contract
+## PRP 布局与规则
+
+每个 PRP 条目占 8 字节（64 位），dword 对齐，其中 `CC.MPS` 决定页大小及页内偏移（Offset）的位宽（`n = log2(MPS)`）：[PDF 第 173-174 页](../_source/pages/page-173.md)
 
 ```text
 63                         n+1 n                         0
@@ -25,89 +29,54 @@ This explanatory comparison preserves the two indirection models: PRP list lengt
 +-----------------------------+--------------------------+
 ```
 
-This reconstructed bit field follows rendered Figures 109-110. `CC.MPS` determines the offset width; every PRP is 64 bits and dword aligned. Only the command's first PRP entry, and a command field used as the first PRP List pointer where the command permits it, may carry a nonzero in-page offset. [PDF pp. 173-174](../_source/pages/page-173.md)
-
-| PRP position | Offset rule | Role |
+| PRP 位置 | 页内偏移规则 | 作用 |
 |---|---|---|
-| first command PRP | may be nonzero; bits 1:0 are `00b` | begins data at an in-page address |
-| second command PRP | zero | second data page or first PRP List page |
-| entry inside PRP List | zero | one data page, except the chaining entry |
-| next-list pointer | page aligned | points to another packed PRP List page |
+| 命令中 `PRP1` | 允许非零；低 2 位（bit 1:0）必须为 `00b`（dword 对齐） | 指向第 1 页数据起始地址（或特定命令的 List） |
+| 命令中 `PRP2` | 必须为 `0` | 若剩余数据 ≤ 1 页则指向第 2 页；否则指向首个 PRP List 页 |
+| PRP List 内条目 | 必须为 `0` | 指向连续物理页；**不得重复** `PRP1/PRP2` 已包含的数据页 |
+| 链向下一段 List 的条目 | 必须页对齐（偏移为 `0`） | 仅占用本页最后一条可用槽位，指向下一页 PRP List |
 
-If bits 1:0 are nonzero, the controller may report PRP Offset Invalid; if it does not, it behaves as though those bits were zero. A nonzero offset where page alignment is required should also produce PRP Offset Invalid. [PDF p. 174](../_source/pages/page-174.md)
+> 若 `PRP1` bit 1:0 非零或要求页对齐的位置出现非零偏移，控制器可报错 `PRP Offset Invalid`（不报错时按 0 处理）。
 
-## PRP List structure
+## SGL 描述符与段规则
 
-```text
-one memory page containing packed 64-bit entries
-+-----------------------------+
-| data page address 0         |
-| data page address 1         |
-| ...                         |
-| data page address N         |  <- final data entry, or
-| next PRP List page address  |  <- chain when another list page is needed
-+-----------------------------+
-```
-
-A PRP List occupies one contiguous memory page, starts at entry zero, contains no duplicate of PRPs already carried by the command, and uses its last available entry to chain when another list page is required. Data pages named by adjacent entries may be physically contiguous or unrelated; the list shape is unchanged. [PDF p. 174](../_source/pages/page-174.md)
-
-## SGL descriptors and segments
-
-An SGL is one or more qword-aligned contiguous segments containing typed descriptors. Only a segment's last descriptor may link to another Segment or Last Segment, and a last segment contains neither kind of link. Data Block plus Bit Bucket lengths must cover the requested transfer; the controller must not transfer beyond the described total. [PDF p. 175](../_source/pages/page-175.md)
-
-Controllers advertise supported SGL forms and whether Data Block address/length alignment is byte or dword granular. Unsupported descriptor format or illegal segment-link placement requires command abort; a dword-only controller should abort descriptors whose Address or Length has either low bit set. [PDF p. 175](../_source/pages/page-175.md)
+SGL 由一段或多段 qword 对齐的连续数组组成，数组元素为 16 字节描述符（对应规范 Figures 113-116）：[PDF 第 175-177 页](../_source/pages/page-175.md)
 
 ```text
-16-byte generic descriptor
+16 字节通用 SGL 描述符
 +-----------------------------------------------+------+
-| bytes 0:14: descriptor-type-specific content | ID   |
+| 字节 0-14：Descriptor Type Specific (DTS)     | ID   |
 +-----------------------------------------------+------+
-                                                  |  |
-                                           type 7:4  subtype 3:0
+                                                 |    |
+                                           Type(7:4) SubType(3:0)
 ```
 
-This reconstructed byte map follows rendered Figures 113-116. An SGL segment is a packed array of 16-byte descriptors; descriptor type selects data, discard, segment link, keyed data, transport data, or vendor-specific interpretation, while subtype selects address, offset, or transport-specific addressing where legal. [PDF pp. 176-177](../_source/pages/page-176.md)
-
-| Type | Role | Key invariant |
+| 描述符 Type | 名称 | 核心用途与约束 |
 |---|---|---|
-| Data Block | transfer one addressed byte range | zero length is valid; address plus length must not overflow 64 bits |
-| Bit Bucket | discard part of source data for a destination buffer | has no effect for a source buffer |
-| Segment | link to a following non-final segment | link length is nonzero and a multiple of 16 |
-| Last Segment | link to the final segment | target segment contains no further segment link |
-| Keyed Data Block | transfer an addressed range with a 32-bit key | length is encoded in 24 bits |
-| Transport Data Block | delegate transfer mechanism/buffers to the binding | address bytes are reserved in the Base Specification |
+| `0h` | **Data Block** | 真实搬运数据；全零描述符（Address=0, Length=0）是合法的 NULL 描述符 |
+| `1h` | **Bit Bucket** | 占位跳过指定字节数（仅对主机接收/写向主机方向有意义）；SubType 必须为 `0h` |
+| `2h` | **Segment** | 链向下一段 SGL（长度非零且为 16 的倍数）；**只能是当前段的最后一个描述符** |
+| `3h` | **Last Segment** | 链向最后一段 SGL；Last Segment 内不得再包含段链接 |
+| `4h` | **Keyed Data Block** | 带 32 位 Key 与 24 位长度（0 ~ 16 MiB-1），用于 Key-Per-I/O 或 KV 场景 |
+| `5h` | **Transport Data Block** | 将传输缓冲机制交由具体 NVMe-oF 传输绑定层定义 |
 
-The descriptor roles and field boundaries were checked against rendered Figures 117-122. Reserved or unsupported type/subtype combinations become SGL Descriptor Type errors; an all-zero descriptor is a valid zero-length Data Block descriptor. [PDF pp. 176-179](../_source/pages/page-176.md)
+- **SubType**：`0h` 为绝对地址（Address），`1h` 为相对偏移（Offset，PCIe 上不可用）。
+- **总长度契约**：所有 `Data Block` 与 `Bit Bucket` 长度之和必须**精确等于**命令请求的传输长度，控制器不能超额搬运；若不匹配将报 `SGL Data Block Count Mismatch` 或 `Data SGL Length Invalid`。
+- **对齐与传输限制**：Identify Controller 中的 `SGLS` 字段声明控制器支持字节对齐还是仅支持 dword 对齐。**PCIe 上 Admin 命令强制使用 PRP；NVMe-oF 上 Admin 与 I/O 命令强制使用 SGL。**
 
-## SGL transfer coverage example
+## 关联与引申概念
 
-```text
-controller logical data:  [3 KiB][4 KiB][discard 2 KiB][4 KiB] = 13 KiB
-                              |      |                    |
-host destination blocks:     A      B                    C   = 11 KiB
+- **通用命令格式（DPTR / PSDT）**：每个 64 字节 SQE 中 `DPTR` 占字节 24-39，`PSDT` 决定采用 PRP 还是 SGL，见 [通用命令格式](common-command-format.md)。
+- **Key Per I/O**：基于 `Keyed Data Block`（SGL Type `4h`）为每次 I/O 传递加密密钥标签，见 [Key Per I/O](key-per-io.md)。
+- **主机内存缓冲区（HMB）** & **控制器内存窗口（CMW）**：其他主机与控制器共享内存寻址机制，见 [主机内存缓冲区](host-memory-buffer.md) 与 [控制器内存窗口](controller-memory-windows.md)。
+- **元数据区域（Metadata Region）**：用于存放端到端数据保护（PI）等元数据，Base 规范仅定义概念边界，具体格式由 I/O 命令集规范定义。[PDF 第 181 页](../_source/pages/page-181.md)
 
-segment 0: Data(A,3 KiB) -> Segment(1)
-segment 1: Data(B,4 KiB), BitBucket(2 KiB) -> LastSegment(2)
-segment 2: Data(C,4 KiB)
-```
+## 规范依据
 
-This explanatory reconstruction of Figure 123 shows why transfer coverage is not identical to bytes placed in host memory. The command accesses 26 logical blocks of 512 bytes (13 KiB), while three Data Block descriptors receive 11 KiB and a destination Bit Bucket consumes the remaining 2 KiB without storing it. [PDF pp. 179-180](../_source/pages/page-179.md)
-
-## Metadata Region boundary
-
-The Base Specification names the Metadata Region but delegates its applicability and detailed format to the selected I/O Command Set. It is therefore kept as a boundary of this page rather than expanded into a Base-defined layout. [PDF p. 181](../_source/pages/page-181.md)
-
-## Relationships
-
-- `CDW0.PSDT` selects whether the Common Command Format interprets its metadata and data pointers as PRPs or SGLs. [PDF pp. 155-158](../_source/pages/page-155.md)
-- PRP transfer coverage is inferred from command parameters plus `CC.MPS`; SGL coverage is carried in descriptor lengths. [PDF pp. 173-175](../_source/pages/page-173.md)
-- NVMe over Fabrics commands use SGL descriptors rather than PRPs, with transport-specific descriptor forms where applicable. [PDF pp. 43, 159-160](../_source/pages/page-043.md)
-
-## Evidence
-
-- [Rendered Figures 109-110, PRP entry address and offset, PDF pp. 173-174](../_source/pages/page-173.md)
-- [Rendered Figures 111-112, contiguous and non-contiguous PRP Lists, PDF p. 174](../_source/pages/page-174.md)
-- [SGL segment and descriptor contract start, PDF p. 175](../_source/pages/page-175.md)
-- [Rendered Figures 113-122, SGL descriptor layouts, PDF pp. 176-179](../_source/pages/page-176.md)
-- [Rendered Figure 123, chained SGL read with Bit Bucket, PDF pp. 179-180](../_source/pages/page-179.md)
-- [Metadata Region specification boundary, PDF p. 181](../_source/pages/page-181.md)
+- [PRP Entry 与 offset 定义 Figures 109-110，PDF 第 173-174 页](../_source/pages/page-173.md)
+- [PRP List 结构 Figures 111-112，PDF 第 174 页](../_source/pages/page-174.md)
+- [SGL 段与描述符总述，PDF 第 175 页](../_source/pages/page-175.md)
+- [SGL 描述符与子类型 Figures 114-116，PDF 第 176 页](../_source/pages/page-176.md)
+- [Keyed / Transport SGL 描述符 Figures 119-122，PDF 第 177-179 页](../_source/pages/page-177.md)
+- [链式 SGL + Bit Bucket 示例 Figure 123，PDF 第 179-180 页](../_source/pages/page-179.md)
+- [Metadata Region 边界，PDF 第 181 页](../_source/pages/page-181.md)

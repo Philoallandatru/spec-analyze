@@ -1,506 +1,116 @@
 # PCIe 数据包类型
 
-## 概述
+**一句话总结**：PCIe 链路上流动的数据分为三大类——**TLP**（事务层数据包，负责搬运业务数据与读写请求）、**DLLP**（数据链路层包，负责相邻两跳的确认与流控）和 **Ordered Set**（物理层有序集，负责链路训练与时钟同步）。
 
-PCIe 协议栈使用三种主要的数据包类型来实现完整的通信功能：
-- **TLP (Transaction Layer Packet)**：事务层数据包，用于数据传输
-- **DLLP (Data Link Layer Packet)**：数据链路层数据包，用于链路管理
-- **Ordered Set**：物理层有序集，用于链路训练和同步
+> **直观类比**：如果把 PCIe 链路比作一条货运专线：
+> - **TLP** 是装着货物和收发货地址的**集装箱**（端到端送达）；
+> - **DLLP** 是相邻两个收费站之间的**回执单与通行证**（只管这一段路）；
+> - **Ordered Set** 是路上的**交通信号灯与对表口令**（只管车道通畅和时钟对齐）。
 
-## TLP (Transaction Layer Packet)
+---
 
-### TLP 基本结构
+## 三类数据包全景对比
 
-```
-+----------------+
-|  TLP Prefix    |  (可选，PCIe 3.0+)
-+----------------+
-|  TLP Header    |  (3 或 4 DW)
-+----------------+
-|  Data Payload  |  (0-1024 DW)
-+----------------+
-|  Digest (ECRC) |  (可选，1 DW)
-+----------------+
-```
+| 数据包类型 | 所属层次 | 传输范围 | 长度特征 | 核心作用 |
+|-----------|---------|---------|---------|---------|
+| **TLP** (Transaction Layer Packet) | 事务层 | 端到端（可经多个 Switch） | 变长（Header 12/16B + Payload 0~4KB） | 内存/IO/配置读写、中断消息、完成响应 |
+| **DLLP** (Data Link Layer Packet) | 数据链路层 | 仅相邻两端口（逐跳） | 固定 6 字节（含 16 位 CRC） | `Ack/Nak` 重传确认、流控信用更新、电源管理 |
+| **Ordered Set** (有序集) | 物理层 | 仅相邻两端口（逐跳） | 特殊物理层符号序列 | `TS1/TS2` 链路训练、`SKP` 时钟补偿、`EIOS/EIEOS` 休眠唤醒 |
 
-### TLP 类型
+---
 
-| Fmt[2:0] | Type[4:0] | 描述 | 数据负载 |
-|----------|-----------|------|----------|
-| 000 | 00000 | Memory Read Request (3DW) | 无 |
-| 001 | 00000 | Memory Read Request (4DW) | 无 |
-| 010 | 00000 | Memory Write Request (3DW) | 有 |
-| 011 | 00000 | Memory Write Request (4DW) | 有 |
-| 000 | 00001 | Memory Read Lock Request (3DW) | 无 |
-| 001 | 00001 | Memory Read Lock Request (4DW) | 无 |
-| 000 | 00010 | I/O Read Request | 无 |
-| 010 | 00010 | I/O Write Request | 有 |
-| 000 | 00100 | Config Read Type 0 | 无 |
-| 010 | 00100 | Config Write Type 0 | 有 |
-| 000 | 00101 | Config Read Type 1 | 无 |
-| 010 | 00101 | Config Write Type 1 | 有 |
-| 000 | 1xxxx | Message (无数据) | 无 |
-| 010 | 1xxxx | Message (有数据) | 有 |
-| 000 | 01010 | Completion (无数据) | 无 |
-| 010 | 01010 | Completion (有数据) | 有 |
+## 1. TLP（事务层数据包）
 
-### Memory Request TLP
-
-**3DW Header (32-bit 地址)**：
-```
-DW0: [31:30]Fmt [29:24]Type [23]T9 [22:20]TC [19]T8 [18]Attr[2]
-     [17]LN [16]TH [15]TD [14]EP [13:12]Attr[1:0] [11:10]AT [9:0]Length
-
-DW1: [31:16]Requester ID [15:0]Tag
-
-DW2: [31:2]Address[31:2] [1:0]First/Last BE
-```
-
-**4DW Header (64-bit 地址)**：
-```
-DW0: [31:30]Fmt [29:24]Type [23]T9 [22:20]TC [19]T8 [18]Attr[2]
-     [17]LN [16]TH [15]TD [14]EP [13:12]Attr[1:0] [11:10]AT [9:0]Length
-
-DW1: [31:16]Requester ID [15:0]Tag
-
-DW2: [31:0]Address[63:32]
-
-DW3: [31:2]Address[31:2] [1:0]First/Last BE
-```
-
-### Completion TLP
+### TLP 整体封装结构
 
 ```
-DW0: [31:30]Fmt=000/010 [29:24]Type=01010 [23]T9 [22:20]TC [19]T8
-     [18]Attr[2] [17]LN [16]TH [15]TD [14]EP [13:12]Attr[1:0]
-     [11:10]AT [9:0]Byte Count
-
-DW1: [31:16]Completer ID [15:13]Completion Status [12]BCM
-     [11:0]Byte Count (lower)
-
-DW2: [31:16]Requester ID [15:0]Tag
-
-+--- Data Payload (如果 Fmt[0]=1) ---+
+┌──────────────┬──────────────────┬────────────────────┬──────────────┐
+│  TLP Prefix  │    TLP Header    │    Data Payload    │ Digest(ECRC) │
+│ (可选, Gen3+)│   (3 或 4 DW)    │  (可选, 0-1024 DW) │  (可选, 1 DW)│
+└──────────────┴──────────────────┴────────────────────┴──────────────┘
+  * 注：经过数据链路层时，还会在头部前加 2B Sequence#，末尾加 4B LCRC。
+  * 1 DW (Double Word) = 4 字节 = 32 位。
 ```
 
-**Completion Status**：
-- `000`：Successful Completion (SC)
-- `001`：Unsupported Request (UR)
-- `010`：Configuration Request Retry Status (CRS)
-- `100`：Completer Abort (CA)
+### 常见 TLP 类型表（由 DW0 的 `Fmt` 与 `Type` 共同决定）
 
-### Message TLP
+| Fmt[2:0] | Type[4:0] | 事务名称 | 是否带数据 | 事务模型 | 典型场景 |
+|----------|-----------|---------|-----------|---------|---------|
+| `000` / `001` | `00000` | Memory Read (3DW / 4DW) | 无 | Non-Posted | CPU 读 BAR 寄存器；设备 DMA 读内存 |
+| `010` / `011` | `00000` | Memory Write (3DW / 4DW) | 有 | Posted | CPU 写 BAR；设备 DMA 写内存；MSI-X 中断 |
+| `000` / `010` | `00010` | I/O Read / Write | 无 / 有 | Non-Posted | 兼容传统 x86 I/O 端口 |
+| `000` / `010` | `00100` | Config Read / Write Type 0 | 无 / 有 | Non-Posted | 访问当前总线上设备的配置空间 |
+| `000` / `010` | `00101` | Config Read / Write Type 1 | 无 / 有 | Non-Posted | 经由 Bridge 转发访问下游总线配置空间 |
+| `000` / `010` | `1xxxx` | Message (Msg / MsgD) | 无 / 有 | Posted | 错误报告（ERR_*）、电源管理、模拟 INTx |
+| `000` / `010` | `01010` | Completion (Cpl / CplD) | 无 / 有 | Completion | 对 Non-Posted 请求的响应（返回状态或数据） |
 
-```
-DW0: [31:30]Fmt [29:27]Type=10 [26:24]r [23]T9 [22:20]TC [19]T8
-     [18]Attr[2] [17]LN [16]TH [15]TD [14]EP [13:12]Attr[1:0]
-     [11:10]AT [9:0]Length
+> **3DW vs 4DW**：32 位地址（4GB 以下）使用 3DW Header（12 字节）；64 位地址（4GB 以上）使用 4DW Header（16 字节）。
 
-DW1: [31:16]Requester ID [15:0]Tag
+### 关键 TLP Header 字段解读
 
-DW2: [31:24]Message Code [23:16]r [15:8]Target/Vendor [7:0]r
+1. **Memory Request Header（以 4DW 64 位地址为例）**：
+   - **DW0**：`Fmt/Type`（包类型）、`TC`（3 位流量优先级）、`Attr`（如 Relaxed Ordering 宽松排序、No Snoop）、`TD`（是否含 ECRC）、`Length`（10 位负载长度，以 DW 为单位，`0` 代表 1024 DW = 4KB）。
+   - **DW1**：`Requester ID`（发起方的 16 位 BDF）、`Tag`（8/10 位事务标签，用于将返回的 Completion 与原请求配对）、`Last DW BE` / `First DW BE`（首尾双字的字节使能掩码，支持非 4 字节对齐的局部读写）。
+   - **DW2–DW3**：`Address[63:2]`（目标内存地址，最低 2 位隐含为 `00`）。
 
-DW3: [31:0]Lower Address/Data (Message 类型相关)
+2. **Completion TLP（响应包）**：
+   - **DW1**：`Completer ID`（响应方 BDF）、`Status`（3 位完成状态：`000` = `SC` 成功完成、`001` = `UR` 不支持的请求、`010` = `CRS` 配置重试、`100` = `CA` 中止）、`Byte Count`（剩余待传输字节数）。
+   - **DW2**：`Requester ID` + `Tag`（原样带回请求方标识以便匹配）+ `Lower Address[6:0]`（数据起始地址低 7 位）。
 
-+--- Data Payload (可选) ---+
-```
+---
 
-**常见 Message 类型**：
-- `00000`：INTx 中断消息 (ASSERT_INTx/DEASSERT_INTx)
-- `00001`：电源管理消息 (PM_Active_State_Nak)
-- `00011`：错误消息 (ERR_COR/ERR_NONFATAL/ERR_FATAL)
-- `00100`：Locked Memory Read
-- `00101`：Slot Power Limit
-- `01xxx`：Vendor Defined Messages
+## 2. DLLP（数据链路层包）
 
-## DLLP (Data Link Layer Packet)
-
-### DLLP 格式
+DLLP 产生于数据链路层并在相邻端口的链路层被直接消费（**不会上传到事务层，也不会跨 Switch 转发**），固定为 **6 字节（48 位）**：
 
 ```
-+----------------+  ----+
-|  DLLP Type (8) |      |
-+----------------+      |
-|   Reserved (8) |      | 16 bits
-+----------------+  ----+
-|   Seq# (12)    |      |
-| DLLP Data (4)  |      | 16 bits
-+----------------+  ----+
-| CRC-16 DLLP    |      | 16 bits
-+----------------+  ----+
+┌──────────────────┬──────────────────┬──────────────────┐
+│  DLLP Type (8b)  │  控制数据 (24b)  │   CRC-16 (16b)   │
+└──────────────────┴──────────────────┴──────────────────┘
 ```
 
-**总长度**：6 字节（48 位）
+| DLLP 类型编码 | 名称 | 核心用途 |
+|--------------|------|---------|
+| `00h` | **Ack** | 确认已正确收到至 `AckSeq[11:0]` 为止的所有 TLP，通知对方释放 Retry Buffer |
+| `10h` | **Nak** | 报告序列号为 `NakSeq[11:0]` 的 TLP 校验失败，触发对方立即重传 |
+| `40h–4Fh` | **InitFC1 / InitFC2** | 链路初始化时通告各虚拟通道（VC）的 Posted/Non-Posted/Completion 初始信用 |
+| `50h–5Fh` | **UpdateFC** | 运行时动态返还已释放的缓冲信用（`HdrFC` + `DataFC`） |
+| `20h–23h` | **PM_Enter_L1 / L23 等** | 协商链路进入或退出低功耗电源状态 |
 
-### DLLP 类型
+---
 
-| Type | 名称 | 用途 |
-|------|------|------|
-| 00h | Ack DLLP | 确认 TLP 接收成功 |
-| 10h | Nak DLLP | 请求重传 TLP |
-| 20h | PM_Enter_L1 | 进入 L1 电源状态 |
-| 21h | PM_Enter_L23 | 进入 L23 电源状态 |
-| 22h | PM_Active_State_Request_L1 | 请求退出 L1 |
-| 23h | PM_Request_Ack | 电源管理请求确认 |
-| 30h | Vendor Specific | 厂商自定义 |
-| 40h-4Fh | InitFC1-P/NP/Cpl | Flow Control 初始化 |
-| 50h-5Fh | UpdateFC-P/NP/Cpl | Flow Control 更新 |
+## 3. Ordered Set（物理层有序集）
 
-### Ack/Nak DLLP
+Ordered Set 是物理层直接生成和识别的特殊符号序列，用于在数据链路层激活之前完成链路建立，以及在运行期间维持物理同步：
 
-```
-Ack DLLP:
-+----------------+
-|  Type = 00h    |  DLLP Type
-+----------------+
-|  Reserved = 0  |
-+----------------+
-|  AckSeq[11:0]  |  确认序列号
-|  Reserved[3:0] |
-+----------------+
-|  CRC-16        |
-+----------------+
+| 有序集名称 | 核心用途 |
+|-----------|---------|
+| **TS1 / TS2 (Training Sequence 1/2)** | 链路训练期间交换速率能力、Lane 编号、极性与宽度配置，完成比特锁定与符号锁定 |
+| **SKP (Skip Ordered Set)** | 周期性插入数据流，供接收端弹性缓冲区（Elastic Buffer）增删，补偿两端独立时钟的微弱频差 |
+| **FTS (Fast Training Sequence)** | 链路从浅度省电状态 `L0s` 快速唤醒回 `L0` 时用于重新锁定比特与符号边界 |
+| **EIOS / EIEOS** | 通知对端进入电气空闲（`EIOS`，Electrical Idle）或退出电气空闲唤醒链路（`EIEOS`） |
 
-Nak DLLP:
-+----------------+
-|  Type = 10h    |  DLLP Type
-+----------------+
-|  Reserved = 0  |
-+----------------+
-|  NakSeq[11:0]  |  请求重传的序列号
-|  Reserved[3:0] |
-+----------------+
-|  CRC-16        |
-+----------------+
-```
+---
 
-**工作机制**：
-- 接收端接收 TLP 成功 → 发送 Ack DLLP
-- 接收端检测 TLP 错误 → 发送 Nak DLLP
-- 发送端收到 Nak → 从指定序列号重传
+## 实战视角：一次 Memory Read 经历了什么？
 
-### Flow Control DLLP
+假设 CPU 读取 NVMe SSD 的 BAR0 寄存器（4 字节）：
+1. **CPU 侧发送请求**：事务层构造 `MRd`（Memory Read）TLP，填入 `Requester ID = 00:00.0`、`Tag = 0x02`、`Length = 1 DW`、`Addr = 0xF8000400`。
+2. **逐跳传递与确认**：每经过一条物理链路，数据链路层为其加上序列号和 LCRC；对端收到校验无误后回传 **Ack DLLP**。
+3. **SSD 返回数据**：SSD 事务层读取寄存器值 `0xAABBCCDD`，构造 `CplD`（Completion with Data）TLP，填入 `Status = SC`、`Requester ID = 00:00.0`、`Tag = 0x02` 及 4 字节负载发回 CPU。
 
-**InitFC (初始化流控)**：
-```
-+----------------+
-|  Type = 4xh    |  x: 0=P, 4=NP, 8=Cpl
-+----------------+
-|  HdrFC[7:0]    |  Header Credits
-+----------------+
-|  DataFC[11:0]  |  Data Credits
-|  VC[3:0]       |  Virtual Channel
-+----------------+
-|  CRC-16        |
-+----------------+
-```
-
-**UpdateFC (更新流控)**：
-```
-+----------------+
-|  Type = 5xh    |  x: 0=P, 4=NP, 8=Cpl
-+----------------+
-|  HdrFC[7:0]    |  Header Credits
-+----------------+
-|  DataFC[11:0]  |  Data Credits
-|  VC[3:0]       |  Virtual Channel
-+----------------+
-|  CRC-16        |
-+----------------+
-```
-
-## Ordered Set (有序集)
-
-### 基本结构
-
-Ordered Set 是物理层使用的特殊符号序列，用于链路训练、同步和控制。
-
-**格式**：
-```
-+--------+--------+--------+--------+
-|  COM   |  Data0 |  Data1 |  Data2 |
-+--------+--------+--------+--------+
-```
-
-- **COM (K28.5)**：起始符号，值为 `10111100b` (0xBC)
-- **Data0-2**：数据符号或控制符号
-
-### 常用 Ordered Set
-
-**1. TS1 (Training Sequence 1)**：
-```
-COM, TS1 ID, Lane#, N_FTS, Rate ID, Reserved, ...
-```
-- 用于链路训练
-- 交换链路能力
-- 位锁定和符号锁定
-
-**2. TS2 (Training Sequence 2)**：
-```
-COM, TS2 ID, Lane#, N_FTS, Rate ID, Reserved, ...
-```
-- 链路训练后期
-- 确认链路参数
-- 进入 L0 状态前最后一步
-
-**3. FTS (Fast Training Sequence)**：
-```
-COM, FTS, FTS, FTS
-```
-- 从 L0s 快速恢复
-- 恢复位锁定和符号锁定
-- N_FTS 参数决定 FTS 数量
-
-**4. SKIP Ordered Set**：
-```
-COM, SKP, SKP, SKP
-```
-- 时钟容差补偿
-- 每 1180-1538 个符号插入一次
-- 接收端可以添加/删除 SKP
-
-**5. IDLE Ordered Set**：
-```
-COM, IDL, IDL, IDL
-```
-- 链路空闲时发送
-- 保持链路活跃
-- 维持位锁定
-
-**6. EIOS (Electrical Idle Ordered Set)**：
-```
-COM, EIOS, EIOS, EIOS
-```
-- 进入电气空闲状态前发送
-- 准备进入低功耗状态
-
-**7. EIEOS (Electrical Idle Exit Ordered Set)**：
-```
-COM, EIEOS, EIEOS, EIEOS (重复 16 次)
-```
-- 退出电气空闲状态
-- 恢复链路活跃
-
-## 数据包封装和解封装
-
-### 发送路径
-
-```
-应用层数据
-    |
-    v
-+------------------+
-| Transaction Layer |
-+------------------+
-    | 构造 TLP Header + Data + ECRC
-    v
-+------------------+
-| Data Link Layer  |
-+------------------+
-    | 添加 Sequence# + LCRC
-    v
-+------------------+
-| Physical Layer   |
-+------------------+
-    | 添加 Start/End Token, 编码 (8b/10b 或 128b/130b)
-    v
-物理链路传输
-```
-
-### 接收路径
-
-```
-物理链路接收
-    |
-    v
-+------------------+
-| Physical Layer   |
-+------------------+
-    | 解码, 移除 Start/End Token
-    v
-+------------------+
-| Data Link Layer  |
-+------------------+
-    | 校验 LCRC, 发送 Ack/Nak, 移除 Sequence# + LCRC
-    v
-+------------------+
-| Transaction Layer |
-+------------------+
-    | 校验 ECRC, 解析 TLP Header
-    v
-应用层数据
-```
-
-## 物理层帧结构
-
-### Gen 1/2 (8b/10b 编码)
-
-```
-+-------+------+----------+----------+------+-------+
-| STP   | TLP  | Seq#     | LCRC     | END  | SDP   |
-| (K27.7)| Data | (2 bytes)| (4 bytes)|(K29.7)|(K28.5)|
-+-------+------+----------+----------+------+-------+
-```
-
-- **STP (Start of TLP)**：K27.7
-- **SDP (Start of DLLP)**：K28.5
-- **END (End)**：K29.7
-- **Seq#**：数据链路层序列号
-- **LCRC**：链路层 CRC
-
-### Gen 3+ (128b/130b 编码)
-
-```
-+------+-------+------+----------+----------+------+------+
-| Sync | Token | TLP  | Seq#     | LCRC     | Token| Sync |
-|Header|       | Data | (2 bytes)| (4 bytes)|      |Header|
-+------+-------+------+----------+----------+------+------+
-```
-
-- **Sync Header (2-bit)**：`01b` 或 `10b`
-- **Token**：STP/SDP/END 等
-- 数据块：128 位数据 + 2 位同步头
-
-## 实例分析
-
-### Memory Read Request
-
-**场景**：CPU 读取 PCIe 设备的 BAR0 + 0x1000 地址
-
-```
-TLP Header (3DW):
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|1|  DW0
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  Fmt=000 (3DW, No Data)
-      Type=00000 (Memory Read)
-          TC=000, Attr=00, Length=1 (4 bytes)
-
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|  0  1  :  0  0  :  0  0  .  0  |  0  0  :  0  0  :  0  0  1  0 |  DW1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  Requester ID = 01:00.0 (Bus 1, Dev 0, Func 0)
-                                    Tag = 0x02
-
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|  Address[31:2] = 0xF8000400                   |1|1|1|1|  DW2
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-                                                  FirstBE=0xF
-                                                      LastBE=0xF
-
-LCRC: 0x12345678 (示例)
-```
-
-### Completion with Data
-
-**场景**：设备返回读取的数据 0xAABBCCDD
-
-```
-TLP Header (3DW):
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|0|1|0|0|0|1|0|1|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|0|1|  DW0
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  Fmt=010 (3DW, With Data)
-      Type=01010 (Completion)
-          TC=000, Attr=00, Byte Count=4
-
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|  0  2  :  0  0  :  0  0  .  0  |0|0|0|  0  0  0  0  0  0  0  4 |  DW1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  Completer ID = 02:00.0
-                                  Status=000 (SC)
-                                            Byte Count=4
-
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|  0  1  :  0  0  :  0  0  .  0  |  0  0  :  0  0  :  0  0  1  0 |  DW2
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  Requester ID = 01:00.0
-                                    Tag = 0x02
-
-Data Payload:
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|  0xAABBCCDD                                                    |  DW3
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-
-LCRC: 0x87654321 (示例)
-```
-
-### Ack DLLP
-
-```
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|  0x00         |  0x00         |  AckSeq=0x123  |r|r|r|r|       | 6 bytes
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  Type=Ack        Reserved        Sequence #         Reserved
-                                                            CRC-16
-```
-
-## FEMU 实现
-
-### TLP 发送
-
-```c
-// hw/block/nvme.c
-static void nvme_send_completion(NvmeCtrl *n, NvmeRequest *req)
-{
-    PCIDevice *pci_dev = PCI_DEVICE(n);
-    NvmeCqe cqe = req->cqe;
-    
-    // 构造 TLP (由 QEMU PCIe 层自动处理)
-    // 这里只需写入 Guest 内存
-    pci_dma_write(pci_dev, 
-                  cq->dma_addr + cq->tail * sizeof(cqe),
-                  &cqe, sizeof(cqe));
-    
-    // 触发 MSI-X 中断 (发送 Message TLP)
-    msix_notify(pci_dev, cq->vector);
-}
-```
-
-### DMA Read (生成 Memory Read Request TLP)
-
-```c
-static int nvme_dma_read(NvmeCtrl *n, uint8_t *ptr, 
-                          uint32_t len, uint64_t addr)
-{
-    PCIDevice *pci_dev = PCI_DEVICE(n);
-    
-    // 底层会生成 Memory Read Request TLP
-    return pci_dma_read(pci_dev, addr, ptr, len);
-}
-```
-
-## 调试技巧
-
-### 使用 PCIe 分析仪
-
-```
-捕获的 TLP:
-[00:00:01.123] MRd64 Addr=0xF8001000 Length=64 Req=01:00.0 Tag=0x15
-[00:00:01.124] CplD Cpl=02:00.0 Status=SC Req=01:00.0 Tag=0x15 Data=...
-[00:00:01.125] Ack AckSeq=0x125
-```
-
-### Linux 下追踪
+在 Linux 下，可通过内核调试接口或抓包追踪配置访问与 TLP 统计：
 
 ```bash
-# 使用 trace-cmd 追踪 PCIe
-trace-cmd record -e pci_read_config -e pci_write_config
-
-# 查看 TLP 统计
-cat /sys/kernel/debug/pci/0000:01:00.0/stats
+# 使用 trace-cmd 追踪内核 PCI 配置空间读写事件
+sudo trace-cmd record -e pci_read_config -e pci_write_config
 ```
 
-## 总结
+---
 
-PCIe 三种数据包类型各司其职：
+## 关联与引申概念
 
-1. **TLP**：负责实际数据传输，实现内存/IO/配置/消息事务
-2. **DLLP**：负责链路可靠性，实现 Ack/Nak 和流控
-3. **Ordered Set**：负责物理层控制，实现链路训练和同步
-
-参见：
-- [TLP 格式详解](../transaction-layer/tlp-format.md)
-- [DLLP 格式详解](../data-link-layer/dllp-format.md)
-- [LTSSM 状态机](../physical-layer/ltssm.md)
-- [链路训练](../physical-layer/link-training.md)
+- **[三层协议模型](layering.md)**：理解 TLP、DLLP 与 Ordered Set 分别在协议栈哪一层产生与消费。
+- **[时钟架构](clock-architecture.md)**：了解 `SKP` 有序集如何配合弹性缓冲区解决独立时钟频差问题。
+- **[地址空间管理](address-space.md)**：理解 Memory Read/Write TLP 中的目标地址如何对应到设备的 BAR 寄存器或系统内存。
+- **[设备枚举](enumeration.md)**：查看 `Config Read/Write Type 0` 与 `Type 1` TLP 在总线扫描中的实际分工。

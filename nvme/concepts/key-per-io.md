@@ -1,123 +1,58 @@
 # Key Per I/O（基于密钥标签的 I/O 加密）
 
-## 功能概述
+**Key Per I/O** 是 NVMe 2.1 引入的精细化数据加密机制：允许主机在**每一条读写 I/O 命令**中携带一个 16 位的 **密钥标签（Key Tag）**，由控制器用该标签绑定的密钥完成本次传输数据的加解密。密钥本身的注入、轮换与撤销完全由 NVMe 规范之外的外部安全系统（如 KMS/KMIP）管理，主机在 I/O 通路上从不直接接触密钥明文。[PDF pp. 548-549](../_source/pages/page-548.md)
 
-Key Per I/O 是 NVMe 2.1 规范引入的一项加密功能，它允许主机（Host）在执行命名空间（Namespace）的读写操作时，通过指定一个密钥标签（Key Tag）来选择使用哪个加密密钥。这个功能的核心特点是：
+可以把 Key Per I/O 想象成**银行保险箱的"凭标签取件"**：控制器内部是带加密引擎的保险箱，里面每个格子（Key Tag）锁着一把专属密钥；外部金库管理员（KMS）提前把钥匙放进格子并告知主机编号；主机每次发读写快递单时只需写上格子编号（`KEYTAG`），就能实现不同租户、不同敏感度数据的隔离加密与快速密钥轮换。
 
-- **命令级加密选择**：每个 I/O 命令可以独立指定使用的加密密钥
-- **外部密钥管理**：密钥的注入、激活、管理以及标签到密钥的绑定关系，都由 NVMe 规范之外的安全机制负责
-- **命名空间关联**：密钥标签是与特定命名空间相关联的
+## 双层解耦架构与工作流程
 
-简单来说，主机不需要直接处理密钥本身，只需要在发送读写命令时指定一个密钥标签（一个数字 ID），控制器就会使用对应的密钥来加密或解密数据。
-
-> 📖 **规范参考**：[NVMe Base 2.1, PDF pp. 548-549](../_source/pages/page-548.md)
-
-## 工作原理
-
-### 概念模型
-
-Key Per I/O 的工作流程可以分为两个阶段：
-
-**阶段 1：密钥准备（外部安全机制负责）**
 ```text
-外部安全机制
-    ↓
-注入密钥到控制器
-    ↓
-将密钥绑定到 KEYTAG（密钥标签）
+  阶段 1：密钥准备（NVMe 规范外）            阶段 2：I/O 加密选择（NVMe 命令内）
+  +---------------------------+              +--------------------------------+
+  | 外部 KMS / 安全代理        |              | 主机提交 Read / Write 命令      |
+  +-------------+-------------+              +---------------+----------------+
+                |                                            |
+                v                                            v
+     注入密钥并绑定 KEYTAG                      设置 CETYPE=1h (KPIOTAG), CEV=KEYTAG
+                |                                            |
+                v                                            v
+     [控制器 Key Tag 映射表就绪]              控制器查表取密钥 -> 加解密本次 I/O 数据
 ```
 
-**阶段 2：I/O 操作（NVMe 命令层面）**
-```text
-主机发送读写命令
-    ↓
-命令参数：CETYPE=1h (KPIOTAG), CEV=KEYTAG
-    ↓
-控制器根据 KEYTAG 查找对应密钥
-    ↓
-使用该密钥加密/解密 I/O 数据
-```
+| 架构层面 | 职责边界 | 定义方 |
+|---|---|---|
+| **密钥管理层** | 密钥生成、注入、激活、轮换、撤销及与 `KEYTAG` 的绑定 | NVMe 规范之外的安全标准（如 TCG、KMIP） |
+| **命令选择层** | 在 I/O 命令的 Dword 12 中通过 `CETYPE` 和 `CEV` 指定密钥标签 | NVMe 2.1 规范 |
 
-### 架构边界
+## 启用条件、作用域与 `CETYPE` 规则
 
-这个设计刻意将两个层面分离：
+要使用 Key Per I/O，Identify Controller 或 Identify Namespace 中的 **`KPIOS`（Key Per I/O Supported / Enabled）** 必须使能，且命令参数需符合以下规则：[PDF pp. 548-549](../_source/pages/page-548.md)
 
-| 层面 | 职责 | 由谁定义 |
-|------|------|----------|
-| **密钥管理层** | 密钥注入、生命周期管理、标签绑定 | NVMe 规范之外的安全标准 |
-| **命令选择层** | 在 I/O 命令中指定要使用的密钥标签 | NVMe 规范定义 |
+| `CETYPE` 值（CDW12） | 含义 | Key Per I/O 启用时的行为 |
+|---|---|---|
+| `0h` | 无加密 / 保留 | **启用后禁用**：作为保留值，使用会返回 `Invalid Field in Command`（仅在未启用时表示无加密） |
+| `1h` | **`KPIOTAG`** | `CEV` 字段携带 16 位命名空间专属的 `KEYTAG` |
+| `2h–Eh` | 保留 | 返回 `Invalid Field in Command` |
+| `Fh` | 厂商特定 | 行为由控制器厂商自定义 |
 
-这种分离使得 NVMe 协议保持简洁，同时允许灵活集成各种安全解决方案。
+- **Key Tag 越界检查**：使用的 `KEYTAG` 必须在该命名空间的 **Maximum Key Tag（`MAXKT`）** 范围内，超出则返回 `Invalid Field in Command`。[PDF p. 549](../_source/pages/page-549.md)
+- **作用域（Key Per I/O Scope）**：`KPIOC` 区分子系统级启用（整个 NVM 子系统共享启用策略）与命名空间级独立启用。注意**不同命名空间中相同数值的 `KEYTAG` 不一定指向同一个密钥**。[PDF pp. 339, 548-549](../_source/pages/page-548.md)
+- **RPMB 与 Boot Partition 例外**：RPMB（重放保护内存块）使用 Security Send/Receive 命令，Boot Partition 使用专用读写接口，均不使用标准命名空间 I/O 命令，因此不受 Key Per I/O 影响。[PDF p. 549](../_source/pages/page-549.md)
 
-> 📖 **规范参考**：[PDF pp. 548-549](../_source/pages/page-548.md)
+## 典型应用场景
 
-## 使用规则
+- **多租户隔离加密**：云存储中为每个租户分配独立 `KEYTAG`，租户密钥撤销时无需整盘擦除。
+- **数据分级与在线轮换**：同一命名空间内按文件敏感度使用不同密钥，或在不停止业务的前提下逐步将新写入切换到新 `KEYTAG`。
 
-### 功能启用条件
+## 规范依据
 
-要使用 Key Per I/O 功能，需要满足以下条件：
+- [Key Per I/O 能力、标签选择与作用域，PDF p. 548](../_source/pages/page-548.md)
+- [CETYPE 字段定义表、支持条件与错误处理，PDF p. 549](../_source/pages/page-549.md)
+- [Identify Controller KPIOC 与 Identify Namespace KPIOS/MAXKT，PDF pp. 339, 359-360](../_source/pages/page-339.md)
 
-| 条件项 | 说明 |
-|--------|------|
-| **控制器能力** | 控制器的 `KPIOS` 字段必须为 `1`，表示支持 Key Per I/O |
-| **命令参数** | 在读写命令中设置 `CETYPE=1h`，表示 `CEV` 字段包含的是密钥标签 |
-| **标签范围** | 使用的密钥标签值必须在该命名空间的 Maximum Key Tag 范围内 |
+## 关联与引申概念
 
-**术语说明：**
-- **CETYPE**（Command Encryption Type，命令加密类型）：指示加密方式的字段
-- **CEV**（Command Encryption Value，命令加密值）：当 CETYPE=1h 时，此字段存储 16 位的密钥标签
-- **KEYTAG**（Key Tag，密钥标签）：一个数字标识符，用于引用特定的加密密钥
-
-### 作用域规则
-
-Key Per I/O 的作用范围由 **Key Per I/O Scope** 位决定，有两种模式：
-
-1. **子系统级别**：在整个子系统（Subsystem）的所有命名空间中启用
-2. **命名空间级别**：按每个命名空间独立启用
-
-**重要提示**：
-- 不同命名空间中相同数值的密钥标签，**不一定**指向同一个密钥
-- RPMB（Replay Protected Memory Block）和 Boot Partition 访问**不受影响**，因为它们不使用标准的命名空间读写命令
-
-> 📖 **规范参考**：[PDF pp. 548-549](../_source/pages/page-548.md)
-
-### 错误处理
-
-当 Key Per I/O 功能启用后，如果命令使用了不合规的参数，控制器会按以下规则处理：
-
-| 错误场景 | 返回状态 |
-|----------|----------|
-| 使用了保留的 `CETYPE` 值（0h、2h-Eh）| `Invalid Field in Command` |
-| 密钥标签超出该命名空间的 Maximum Key Tag | `Invalid Field in Command` |
-| `CETYPE=Fh` | 保留给厂商特定用途，行为由供应商定义 |
-
-这些检查确保命令参数的有效性，防止误用保留字段。
-
-> 📖 **规范参考**：[NVMe Base 2.1, PDF p. 549](../_source/pages/page-549.md)
-
-## CETYPE 字段取值
-
-当 Key Per I/O 启用时，`CETYPE` 字段的含义如下：
-
-| CETYPE 值 | 含义 | 说明 |
-|-----------|------|------|
-| `0h` | 无加密 | 保留值，如果 Key Per I/O 启用则不可使用 |
-| `1h` | KPIOTAG | `CEV` 字段包含 16 位的命名空间专属密钥标签 |
-| `2h-Eh` | 保留 | 未来扩展使用，当前不可用 |
-| `Fh` | 厂商特定 | 由 NVMe 控制器供应商自定义用途 |
-
-## 应用场景
-
-Key Per I/O 功能适用于以下场景：
-
-1. **多租户存储**：不同租户的数据使用不同密钥加密，提高数据隔离性
-2. **分级加密**：根据数据敏感度使用不同强度或类型的密钥
-3. **密钥轮换**：在不停机的情况下逐步迁移到新密钥
-4. **合规要求**：满足某些行业标准对数据加密粒度的要求
-
-## 规范引用
-
-完整的技术细节和实现要求可参考以下规范章节：
-
-- [功能能力、标签选择与作用范围，PDF p. 548](../_source/pages/page-548.md)
-- [CETYPE 字段定义表、支持条件与错误处理规则，PDF p. 549](../_source/pages/page-549.md)
+- **RPMB（Replay Protected Memory Block）**：通过认证防重放计数器保护的受控存储区域，独立于 Key Per I/O 机制。详见 [重放保护内存块](replay-protected-memory-block.md)。
+- **安全协议交换（Security Send/Receive）**：用于在主机与控制器之间传递 TCG/外部安全协议报文（如密钥配置通道）。详见 [安全协议交换](security-protocol-exchange.md)。
+- **数据指针布局（Keyed SGL）**：SGL 类型 `4h`（Keyed Data Block）用于传输层/内存密钥校验，与命令级数据加密的 Key Per I/O 属于不同层次。详见 [数据指针布局](data-pointer-layouts.md)。
+- **命名空间写保护**：Key Per I/O 与写保护正交，密文写入同样受写保护状态约束。详见 [命名空间写保护](namespace-write-protection.md)。

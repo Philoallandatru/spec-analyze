@@ -1,180 +1,82 @@
 # 容量管理操作（Capacity Management Operations）
 
-## 概述
+**容量管理命令（Capacity Management）** 用于在 NVM 子系统中组织和分配存储容量层级（`Domain → Endurance Group → NVM Set → Namespace`）。它提供**固定配置**（选择预定义方案）和**动态分配**（按字节数创建/删除）两种模式。[PDF pp. 203-206](../_source/pages/page-203.md)
 
-容量管理操作是 NVMe 规范中用于配置存储容量分配的机制。它允许管理员通过两种方式来组织和分配 NVM 子系统（NVM Subsystem）的存储容量：
-
-- **固定配置模式**：选择预定义的容量配置方案
-- **动态分配模式**：按需创建和删除容量实体，灵活调整存储架构
-
-通过这些操作，可以配置持久性组（Endurance Group）和 NVM 集合（NVM Set）的容量分配关系。[PDF pp. 203-206](../_source/pages/page-203.md)
-
-## 两种管理模式
-
-### 核心概念对比
-
-NVMe 容量管理提供了两种不同的管理思路，它们在配置方式和灵活性上各有特点：
-
-```text
-┌─────────────────────────────────┬─────────────────────────────────┐
-│       固定配置模式               │       动态分配模式               │
-│   (Fixed Configuration)         │   (Variable Allocation)         │
-├─────────────────────────────────┼─────────────────────────────────┤
-│  使用容量配置 ID                 │  指定具体的字节容量大小          │
-│  (Capacity Configuration ID)    │  (64-bit byte capacity)         │
-│              ↓                  │              ↓                  │
-│  选择预定义的 Endurance Group    │  在 Domain 中创建 Endurance Group│
-│              ↓                  │              ↓                  │
-│  选择预定义的 NVM Set            │  在 Endurance Group 中创建 NVM Set│
-└─────────────────────────────────┴─────────────────────────────────┘
-```
-
-**关键术语说明：**
-- **Domain（域）**：存储资源的顶层容器
-- **Endurance Group（持久性组）**：管理存储介质耐久性和寿命的逻辑单元
-- **NVM Set（NVM 集合）**：可以包含多个命名空间的存储资源集合
-- **Namespace（命名空间）**：对主机可见的存储卷
-
-### 层级包含关系
-
-**重要特性：删除操作具有级联效应**
-
-当删除一个父级对象时，其下属的所有子对象都会被自动删除：
-
-- 删除 Endurance Group → 同时删除其下的所有 NVM Set 和 Namespace
-- 删除 NVM Set → 同时删除其下的所有 Namespace
-
-这种设计遵循容量管理的包含语义，确保资源管理的一致性。[PDF pp. 203-205](../_source/pages/page-203.md)
-
-## 操作命令详解
-
-### 操作类型与参数
-
-容量管理命令通过操作码（Operation Code）来区分不同的操作类型。下表详细说明了每种操作及其参数含义：
-
-| 操作类型 | `ELID` 字段的含义 | 容量字段用途 |
-|---|---|---|
-| **选择容量配置**<br/>Select Configuration | 容量配置标识符<br/>（Capacity Configuration Identifier）<br/>• `0h` = 清除当前配置 | 保留字段<br/>(reserved) |
-| **创建持久性组**<br/>Create Endurance Group | Domain 标识符<br/>（Domain Identifier）<br/>• `0h` = 由控制器自动选择 | 请求的容量大小<br/>（64 位字节数） |
-| **删除持久性组**<br/>Delete Endurance Group | 要删除的 Endurance Group 标识符 | 保留字段<br/>(reserved) |
-| **创建 NVM 集合**<br/>Create NVM Set | 父级 Endurance Group 标识符<br/>• `0h` = 由控制器自动选择 | 请求的容量大小<br/>（64 位字节数） |
-| **删除 NVM 集合**<br/>Delete NVM Set | 要删除的 NVM Set 标识符 | 保留字段<br/>(reserved) |
-
-**命令格式说明：**
-- **CDW10**（Command Dword 10）包含 `ELID` 字段和操作码
-- **CDW11** 和 **CDW12** 分别包含容量值的低 32 位（`CAPL`）和高 32 位（`CAPU`）
-- 容量字段仅在创建操作时有效，用于指定请求的 64 位字节容量
-- 这些字段的定义对应规范中的图 156-158
-
-[PDF pp. 203-204](../_source/pages/page-203.md)
-
-## 固定配置模式工作流程
-
-### 配置选择生命周期
-
-固定配置模式使用预定义的配置描述符（Configuration Descriptor）来一次性配置整个存储架构：
-
-```text
-[初始状态：无已选配置]
-        |
-        | 执行操作：选择一个有效的配置描述符
-        ↓
-[自动创建阶段]
-  按照描述符依次创建：
-  1. 创建每个 Endurance Group
-  2. 创建每个 NVM Set
-        |
-        ├── 情况 1：重复选择同一个配置 ID
-        |      → 操作成功，但不会产生任何变化
-        |
-        └── 情况 2：选择配置 ID = 0h（清除配置）
-               → 按顺序执行删除：
-                 1) 删除所有 Namespace
-                 2) 删除所有 NVM Set
-                 3) 删除所有 Endurance Group
-                 4) 清空"已选配置"状态
-               → 返回到初始状态
-```
-
-**重要限制：**
-- 当已有配置生效时，不能直接切换到另一个非零配置 ID
-- 必须先选择 `0h` 清除当前配置，然后才能选择新的配置
-- 尝试选择未知的配置标识符会被拒绝，不会改变任何 Media Unit 的配置状态
-
-这些规则确保了配置变更的可控性和安全性。[PDF p. 204](../_source/pages/page-204.md)
-
-## 动态分配模式详解
-
-### 容量分配机制
-
-动态分配模式允许按需创建存储资源，遵循以下分配逻辑：
-
-**创建 Endurance Group 时：**
-1. 如果指定了 Media Unit（媒体单元），则选择该 Media Unit
-2. 否则，从指定的 Domain 中分配请求的容量
-
-**创建 NVM Set 时：**
-1. 如果指定了 Media Unit，则选择该 Media Unit
-2. 否则，从父级 Endurance Group 中分配请求的容量
-
-[PDF p. 205](../_source/pages/page-205.md)
-
-### 错误处理与失败场景
-
-在动态分配过程中，可能会遇到以下错误情况：
-
-| 失败场景 | 返回的完成状态 | 详细说明 |
-|---|---|---|
-| **标识符耗尽** | Identifier Unavailable | 系统中没有可用的非零 Endurance Group 或 NVM Set 标识符 |
-| **容量不足** | Insufficient Capacity | 请求的容量超过了可用的最大容量或剩余容量<br/>错误信息日志（Error Information Log）可能会报告可创建的最大容量值 |
-| **删除操作参数错误** | Invalid Field in Command | 使用了零值标识符或不存在的标识符 |
-| **不支持 NVM Set 功能** | Invalid Field in Command | 执行了 NVM Set 相关操作，但控制器不支持 NVM Set 功能 |
-
-**创建成功时的返回值：**
-
-当成功创建 Endurance Group 或 NVM Set 后，完成队列项（Completion Queue Entry, CQE）的 Dword 0 的位 15:0 会返回新创建实体的标识符。这个标识符可用于后续的管理操作。其他操作类型的返回值字段为保留字段。
-
-[PDF pp. 205-206](../_source/pages/page-205.md)
-
-## 与其他功能的关联
-
-### NVM 容量模型
-
-容量管理操作直接修改 NVM 容量模型（NVM Capacity Model）中描述的分配层级关系：
-
-```
-Domain → Endurance Group → NVM Set → Namespace
-```
-
-这个四层的容量分配架构是 NVMe 规范中存储资源组织的核心模型。容量管理命令通过创建和删除操作来改变这个层级结构中的实体及其关系。[PDF pp. 141-146, 203-205](../_source/pages/page-141.md)
-
-### 配置描述符
-
-在固定配置模式下，系统会：
-- 读取支持的容量配置描述符（Supported Capacity Configuration Descriptor）
-- 更新 Media Unit 状态（Media Unit Status）中的"已选配置"字段值
-
-这些描述符定义了预定义配置方案的具体内容。[PDF p. 204](../_source/pages/page-204.md)
-
-### 错误信息日志
-
-当容量不足导致命令失败时：
-- 命令完成状态码会返回 `Insufficient Capacity`
-- 错误信息日志（Error Information Log）中会包含命令特定的容量信息
-- 这些信息帮助管理员了解可用的最大容量限制
-
-[PDF pp. 205-206](../_source/pages/page-205.md)
-
-## 规范引用索引
-
-本文档内容基于 NVMe 规范的以下部分：
-
-- **操作命令格式**：[图 156-157、操作码与容量字段定义，PDF p. 203](../_source/pages/page-203.md)
-- **固定配置流程**：[图 158 与配置选择序列，PDF p. 204](../_source/pages/page-204.md)
-- **分配与失败规则**：[Endurance Group 和 NVM Set 的创建/删除规则，PDF p. 205](../_source/pages/page-205.md)
-- **完成状态与返回值**：[图 159-160、命令状态码与创建的标识符，PDF p. 206](../_source/pages/page-206.md)
+> **类比理解**：把容量管理想成餐厅的包间划分——整栋楼是 NVM 子系统，楼层是 Domain（故障隔离边界），包间区是 Endurance Group（寿命管理边界），包间是 NVM Set（容量池），餐位是 Namespace。固定配置就像直接选"二人间/四人间"标准套餐；动态分配则是现场按面积砌墙隔出包间。
 
 ---
 
-**文档说明：**  
-本文档是对 NVMe 规范中容量管理操作部分的中文解读，旨在帮助中文读者更好地理解相关概念。在实际实现时，请务必参考 NVMe 官方规范原文以获取权威和完整的技术细节。
+## 两种管理模式与层级模型
+
+```text
+层级架构：Domain → Endurance Group → NVM Set → Namespace
+
+                  Capacity Management 命令 (CDW10: ELID[31:16] + OPER[3:0])
+                          |
+            +-------------+-------------+
+            |                           |
+   OPER=0h (Select)              OPER=1h..4h (Create/Delete)
+   [固定配置模式]                [动态分配模式]
+            |                           |
+   ELID = 配置描述符 ID          ELID = 父级 ID 或目标 ID
+   (0h = 清除当前全部配置)        CDW11(CAPL) + CDW12(CAPU) = 64 位字节容量
+            |                           |
+   自动创建 EG 和 NVM Set        按需创建/删除 EG 或 NVM Set
+   切换前必须先 ELID=0h 清除      删除父级会级联删除其下所有子对象与 NS
+```
+
+- **固定配置模式（Fixed Configuration）**：通过 `OPER=0h` 选择预定义的容量配置描述符（Supported Capacity Configuration Descriptor），控制器自动创建对应的 Endurance Group（EG）和 NVM Set，并更新 Media Unit 状态中的"已选配置"字段。重复选择同一非零 ID 成功但无变化；**已有配置生效时不能直接切换到另一个非零 ID**，必须先选 `ELID=0h` 清除全部配置（依次删除 Namespace → NVM Set → EG → 清空状态）。[PDF p. 204](../_source/pages/page-204.md)
+- **动态分配模式（Variable Allocation）**：按 64 位字节容量动态创建或删除 EG 与 NVM Set；创建时可指定 Media Unit，否则从指定的父级资源中分配。[PDF p. 205](../_source/pages/page-205.md)
+- **级联删除语义**：删除 EG 会同时删除其下所有 NVM Set 和 Namespace；删除 NVM Set 会同时删除其下所有 Namespace。[PDF pp. 203-205](../_source/pages/page-203.md)
+
+---
+
+## 操作码、参数与返回值
+
+| `OPER`（`CDW10[3:0]`） | 操作名称 | `ELID`（`CDW10[31:16]`）含义 | 容量字段（`CDW11..12`） |
+|---|---|---|---|
+| `0h` | Select Capacity Configuration | 容量配置描述符 ID（`0h` = 清除当前配置） | 保留 |
+| `1h` | Create Endurance Group | Domain ID（`0h` = 由控制器自动选择） | 请求的 64 位字节容量 |
+| `2h` | Delete Endurance Group | 要删除的 Endurance Group ID | 保留 |
+| `3h` | Create NVM Set | 父级 Endurance Group ID（`0h` = 控制器自选） | 请求的 64 位字节容量 |
+| `4h` | Delete NVM Set | 要删除的 NVM Set ID | 保留 |
+
+- **创建返回值**：成功创建 EG 或 NVM Set 时，**CQE DW0[15:0]** 返回新分配实体的标识符；其他 `OPER` 下该字段保留。[PDF pp. 205-206](../_source/pages/page-205.md)
+- **常见错误码**：
+  - `Identifier Unavailable`：可用的非零 EG 或 NVM Set ID 耗尽。
+  - `Insufficient Capacity`：请求容量超出可用上限；**Error Information Log** 可报告当前可创建的最大容量。
+  - `Invalid Field in Command`：删除时传入零值或不存在的 ID，或控制器不支持 NVM Set 时执行 `OPER=3h/4h`；选择未知配置 ID 也会被拒且不改变任何 Media Unit 状态。
+
+---
+
+## 易混概念对比
+
+| 易混概念 | 实际区别 |
+|---|---|
+| **Domain vs Endurance Group** | `Domain` 是故障与上电隔离边界；`Endurance Group` 是闪存磨损均衡与寿命管理边界 |
+| **Endurance Group vs NVM Set** | `EG` 管理寿命和物理介质池；`NVM Set` 是逻辑容量分配单元，可包含多个 Namespace |
+| **Create NVM Set vs Create Namespace** | Capacity Management 创建底层 EG / NVM Set；Namespace Management 在 NVM Set 之上创建 Namespace |
+| **CAP 字段 vs 实际大小** | `CDW11..12` 是"请求容量"，控制器可能因对齐要求内部向上或向下取整 |
+
+---
+
+## 关联与引申概念
+
+- **NVM 容量模型（NVM Capacity Model）**：由 `Domain → Endurance Group → NVM Set → Namespace` 构成的四层存储资源组织架构。[PDF p. 141](../_source/pages/page-141.md)
+- **Media Unit Status Log**：记录物理介质单元分配情况及当前"已选容量配置"的日志页。
+- **Error Information Log**：记录最近失败命令的详细信息；容量不足时可从中查询最大可分配容量。
+- **延伸阅读**：
+  - [domains-and-divisions.md](domains-and-divisions.md) — Domain 到 Endurance Group 的容量层级详解
+  - [format-nvm-lifecycle.md](format-nvm-lifecycle.md) — Namespace 所属 NVM Set 的格式化规则
+  - [exported-and-underlying-resources.md](exported-and-underlying-resources.md) — 底层物理资源与导出资源的分层
+  - [admin-command-model.md](admin-command-model.md) — Capacity Management 所属的 Admin 命令模型
+
+---
+
+## 规范依据
+
+- [Capacity Management 命令与 OPER/容量字段（Figures 156-157），PDF p. 203](../_source/pages/page-203.md)
+- [固定配置模式 Select 流程（Figure 158），PDF p. 204](../_source/pages/page-204.md)
+- [动态分配模式 Create/Delete 规则，PDF p. 205](../_source/pages/page-205.md)
+- [完成状态码与 CQE 返回值（Figures 159-160），PDF p. 206](../_source/pages/page-206.md)
+- [NVM Capacity Model 层级定义，PDF p. 141](../_source/pages/page-141.md)

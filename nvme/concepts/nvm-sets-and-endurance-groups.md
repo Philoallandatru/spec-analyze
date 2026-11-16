@@ -1,89 +1,66 @@
-# NVM Sets and Endurance Groups
+# NVM Set 与耐久度组（NVM Sets and Endurance Groups）
 
-An NVM Set is a logically, and potentially physically, separate collection of NVM from which namespaces are created. An Endurance Group is the boundary across which endurance is managed; it may contain one NVM Set or coordinate endurance across several NVM Sets. [PDF pp. 99-102](../_source/pages/page-099.md)
+**NVM Set** 是从子系统中划出的逻辑（或物理）独立容量池，命名空间从中分配创建；**耐久度组（Endurance Group，EG）** 则是寿命与磨损管理的边界——一个 Endurance Group 可以只包含单个 NVM Set（按集算寿命），也可以跨多个 NVM Set 统一协调寿命。[PDF pp. 99-102](../_source/pages/page-099.md)
 
-## Containment and inheritance
+> **类比**：把企业级 SSD 想成一座**带分温区的冷库**——**Endurance Group** 是“温区”（同温区内统一做温度/寿命均衡），**NVM Set** 是温区里的“货架排”（按排切分容量池），而**命名空间**则是货架上的“箱子”（继承所在货架排的最优写入大小等属性）。
 
-```text
-Domain
-`-- Endurance Group Y          endurance managed together
-    |-- NVM Set A
-    |   |-- Namespace A1       inherits Set A attributes
-    |   |-- Namespace A2
-    |   `-- unallocated NVM
-    `-- NVM Set B
-        |-- Namespace B1
-        `-- unallocated NVM
-
-Domain
-`-- Endurance Group Z
-    `-- NVM Set C              endurance local to this set
-```
-
-A formatted namespace is wholly contained in exactly one NVM Set and inherits attributes such as optimal write size. Every NVM Set belongs to exactly one Endurance Group, and every Endurance Group belongs to exactly one Domain. [PDF pp. 99-102](../_source/pages/page-099.md)
-
-## Identifiers
-
-| Identifier | Width | Scope | Zero value |
-|---|---:|---|---|
-| NVM Set Identifier | 16 bits | unique within NVM subsystem | reserved / invalid |
-| Endurance Group Identifier | 16 bits | unique within NVM subsystem | reserved / invalid |
-
-Unless a command says otherwise, supplying zero where one of these identifiers is required causes `Invalid Field in Command`. [PDF p. 101](../_source/pages/page-101.md)
-
-## Capacity view
+## 层级包含关系与标识符
 
 ```text
-NVM Set total capacity
-+-----------------------------------------------+
-| namespaces containing formatted storage      |
-+-------------------------------+---------------+
-| allocated                     | unallocated   |
-+-------------------------------+---------------+
+Domain (域)
+  ├── Endurance Group Y (寿命跨 Set A/B 统一管理)
+  │     ├── NVM Set A
+  │     │     ├── Namespace A1 (整体位于 Set A 内，继承 Set A 属性)
+  │     │     └── 未分配容量 (Unallocated NVM)
+  │     └── NVM Set B
+  │           └── Namespace B1
+  └── Endurance Group Z (寿命仅在 Set C 内管理)
+        └── NVM Set C
+              └── Namespace C1
 ```
 
-The NVM Set List reports identifier, optimal write size, total capacity, unallocated capacity, and associated Endurance Group. [PDF pp. 100-101](../_source/pages/page-100.md)
+| 核心规则 | 具体要求 |
+|---|---|
+| **包含与继承** | 每个已格式化命名空间完全属于且仅属于 1 个 NVM Set（继承其最优写入大小等属性）；每个 NVM Set 属于 1 个 EG；每个 EG 属于 1 个 Domain。[PDF pp. 99-102](../_source/pages/page-099.md) |
+| **标识符规格** | `NVM Set ID` 和 `Endurance Group ID` 均为 **16 位**、子系统内唯一；`0h` 为保留/无效值，在需要时填 `0h` 会返回 `Invalid Field in Command`。[PDF p. 101](../_source/pages/page-101.md) |
+| **退化路径** | 若设备不支持 NVM Set，所有 `NVMSETID` 字段清零，寿命管理直接按 EG 进行；若也不支持 EG，则退化至 Domain 级。[PDF pp. 100-102](../_source/pages/page-100.md) |
+| **感知控制路径** | Identify（含 NVM Set List）、Capacity Management、Namespace Management、部分 Feature（如 Read Recovery）、Connect、Create I/O SQ 及日志页均支持携带/暴露 `NVMSETID`。[PDF pp. 100-102](../_source/pages/page-100.md) |
 
-## NVM-Set-aware control paths
-
-Identify, Capacity Management, Namespace Management, selected Features, Connect, Create I/O Submission Queue, and selected log pages carry or expose an NVM Set Identifier. If NVM Sets are unsupported, identifier fields are cleared to zero and Endurance Groups may still define endurance boundaries directly. [PDF pp. 100-102](../_source/pages/page-100.md)
-
-## Endurance events
-
-Endurance Group Event Configuration (`18h`) selects which non-reserved critical-warning bits cause the specified Endurance Group to enter the aggregate event log. `ENDGID=0` disables the warning mask for the operation; nonexistent groups or reserved warning bits are invalid. Enabling a notice while its condition is already true sends the event. [PDF p. 410](../_source/pages/page-410.md)
+## 耐久度监控与事件聚合
 
 ```text
-Set Features per Endurance Group
-        | configure selected critical events
-        v
-Endurance Group event occurs
-        |
-        +--> entry in Event Aggregate log
-        `--> optional Asynchronous Event notice to host
+Set Features (Feature 18h, 按 EG 配置告警掩码)
+        │
+        ▼ (若启用时条件已为真，立即触发)
+Endurance Group 告警事件发生
+        ├──→ 写入 Endurance Group Event Aggregate 日志 (按 EG ID 升序)
+        └──→ 可选：向主机发送异步事件通知 (Asynchronous Event)
+                │
+                ▼
+主机以 RAE=0 读取该 EG 的 Endurance Group Information 日志 (512B) ──→ 确认并移除聚合条目
 ```
 
-The Endurance Group Information log describes group state, while the aggregate log identifies groups with outstanding events. [PDF pp. 102-103](../_source/pages/page-102.md)
+- **Endurance Group Event Configuration（Feature `18h`）**：按 EG 选择哪些非保留的 Critical Warning（关键告警）位会进入聚合日志；`ENDGID=0` 用于关闭该次操作的告警掩码。[PDF p. 410](../_source/pages/page-410.md)
+- **Endurance Group Information 日志（512 字节）**：通过 `Get Log Page` 的 16 位 `ENDGID` 选择，覆盖该组内已分配给 NVM Set 的容量及未分配容量：[PDF pp. 246-248](../_source/pages/page-246.md)
+  - **健康与告警**：剩余备用空间（Spare）、阈值、已用寿命百分比，以及组级只读、可靠性降级、备用空间低于阈值三类告警（若所有 EG 均触发同一告警，SMART/Health 也会同步上报子系统级告警）。
+  - **写入放大估算**：`Host Data Units Written` 不含控制器内部写，而 `Media Units Written` 包含垃圾回收（GC）等内部写，两者对比可看出组级**写放大（Write Amplification）**。读写量与耐久度均以“向上取整的十亿字节”为单位，`0` 表示可选估计值或计数器未上报。[PDF pp. 247-248](../_source/pages/page-247.md)
+- **Endurance Group Event Aggregate 日志**：按升序列出有挂起事件的 EG ID；主机以 `RAE=0` 成功读取对应 EG 的 Information 日志即视为确认并移除该条目，超出列表部分返回全 `0`。[PDF p. 275](../_source/pages/page-275.md)
 
-The Endurance Group Information log is a 512-byte lifetime view selected by the 16-bit Endurance Group Identifier in the Get Log Page Log Specific Identifier. It covers capacity that is already assigned to NVM Sets as well as unallocated capacity still owned by the group. [PDF p. 246](../_source/pages/page-246.md)
+## 关联与引申概念
 
-```text
-Endurance Group health
-  |-- current: spare / threshold / life used / warning bits
-  |-- lifetime: host reads+writes / media writes / integrity errors
-  `-- capacity: total / unallocated / endurance estimate
-```
+- **Write Amplification（写放大，WA）**：闪存介质实际写入量与主机下发写入量之比（由于垃圾回收、磨损均衡等后台搬移导致 $WA \ge 1$）。
+- **Optimal Write Size（最优写入大小）**：NVM Set 暴露给命名空间的建议写入对齐/粒度，按此大小写入可减少跨单元读写与写放大。
+- **相关文档**：
+  - [storage-resource-hierarchy.md](storage-resource-hierarchy.md) — 存储资源总体层次
+  - [nvm-capacity-model.md](nvm-capacity-model.md) — 容量在 EG 与 NVM Set 间的分配模型
+  - [flexible-data-placement-configurations.md](flexible-data-placement-configurations.md) — FDP（灵活数据放置）配置与隔离
+  - [common-controller-features.md](common-controller-features.md) — Feature 配置与 Read Recovery
 
-Warnings cover group-wide read-only state, degraded reliability, and spare below threshold; if the same warning applies to every Endurance Group, SMART/Health reflects the corresponding subsystem warning. The log also identifies rotational-media groups and their containing Domain. [PDF p. 247](../_source/pages/page-247.md)
+## 规范依据
 
-Read/write and endurance values use rounded-up billions of bytes. Host data-unit counters exclude controller-internal traffic, while Media Units Written includes controller writes such as garbage collection; comparing host writes with media writes therefore exposes write amplification at group scope. Zero means a particular optional estimate/counter is not reported. [PDF pp. 247-248](../_source/pages/page-247.md)
-
-The Endurance Group Event Aggregate is an ascending list of group identifiers with pending enabled events. Adding a group generates an asynchronous event; a successful `RAE=0` read of that group's Endurance Group Information log acknowledges the detail and removes the aggregate entry. Reads beyond the identifier-bounded list return zeroes. [PDF p. 275](../_source/pages/page-275.md)
-
-## Evidence
-
-- [NVM Set containment and command-set binding, PDF pp. 99-100](../_source/pages/page-099.md)
-- [NVM Set attributes/requirements and Endurance Group model, PDF p. 101](../_source/pages/page-101.md)
-- [Endurance Group requirements and event configuration, PDF p. 102](../_source/pages/page-102.md)
-- [Endurance Group Information log selection and lifetime scope, PDF p. 246](../_source/pages/page-246.md)
-- [Rendered Endurance Group warning, endurance, activity, error, and capacity fields, PDF pp. 247-248](../_source/pages/page-247.md)
-- [Endurance Group event aggregation and acknowledgment, PDF p. 275](../_source/pages/page-275.md)
+- [NVM Set 包含关系与命令集绑定，PDF pp. 99-100](../_source/pages/page-099.md)
+- [NVM Set 属性/要求与 Endurance Group 模型，PDF p. 101](../_source/pages/page-101.md)
+- [Endurance Group 要求与事件配置，PDF p. 102](../_source/pages/page-102.md)
+- [Endurance Group Information 日志字段与写放大，PDF pp. 246-248](../_source/pages/page-246.md)
+- [Endurance Group 事件聚合与确认，PDF p. 275](../_source/pages/page-275.md)
+- [Endurance Group Event Configuration (18h)，PDF p. 410](../_source/pages/page-410.md)

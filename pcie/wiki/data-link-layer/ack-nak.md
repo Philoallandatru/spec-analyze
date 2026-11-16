@@ -1,572 +1,144 @@
 # ACK/NAK 协议详解
 
-Data Link Layer 的 ACK/NAK 协议是 PCIe 可靠传输的核心机制，通过确认应答和重传机制确保 TLP 的可靠交付。
+**ACK/NAK 协议**是 PCIe 数据链路层（Data Link Layer, DLL）在**相邻两个端口之间**实现可靠传输的核心机制：发送方给每个 TLP 贴上 12 位序列号并保留副本，接收方校验无误后回复 `Ack`，发现错误则回复 `Nak` 触发硬件自动重传，整个过程对上层软件完全透明。
+
+> **直观类比**：就像快递站之间的"扫码交接"——发件站给每个包裹编上流水号（`Seq#`）并留底（Replay Buffer）；收件站核对封条（LCRC）没破损且编号连续，就回传一张"已收到 102 号及之前所有包裹"的回执（`Ack`）；如果发现 101 号破损，就回传"只收到 100 号，请从 101 号起补发"（`Nak`）。
 
 ---
 
-## 概述
+## 1. 在协议栈中的位置
 
-**ACK/NAK 协议**是数据链路层实现可靠数据传输的关键技术，类似于 TCP 协议中的确认机制。
-
-**核心功能**：
-- **错误检测**：通过 LCRC (Link CRC) 检测传输错误
-- **确认应答**：接收方发送 ACK DLLP 确认正确接收
-- **请求重传**：检测到错误时发送 NAK DLLP 请求重传
-- **序列号管理**：使用 12 位序列号跟踪和匹配 TLP
-- **重传缓冲区**：发送方保存已发送但未确认的 TLP
-
-**在协议栈中的位置**：
 ```
 ┌─────────────────────────────────────────┐
-│  Transaction Layer                      │
-│  生成 TLP                               │
-└──────────────┬──────────────────────────┘
-               │ TLP
-┌──────────────▼──────────────────────────┐
-│  Data Link Layer                        │
-│  ┌─────────────────────────────────┐   │
-│  │  ACK/NAK 协议                   │   │
-│  │  • 添加 Seq# 和 LCRC            │   │
-│  │  • 维护重传缓冲区               │   │
-│  │  • 发送 ACK/NAK DLLP            │   │
-│  └─────────────────────────────────┘   │
-└──────────────┬──────────────────────────┘
-               │ TLP + Seq# + LCRC
-┌──────────────▼──────────────────────────┐
-│  Physical Layer                         │
-│  编码和传输                             │
+│  Transaction Layer (事务层)              │  生成 TLP
+└───────────────────┬─────────────────────┘
+                    │ TLP
+┌───────────────────▼─────────────────────┐
+│  Data Link Layer (数据链路层)            │
+│  • 发送侧：分配 12-bit Seq#，计算 LCRC，  │
+│    存入 Replay Buffer，接收 Ack/Nak      │
+│  • 接收侧：校验 LCRC 与 Seq# 连续性，     │
+│    回发 Ack / Nak DLLP                  │
+└───────────────────┬─────────────────────┘
+                    │ Seq# + TLP + LCRC (或 DLLP)
+┌───────────────────▼─────────────────────┐
+│  Physical Layer (物理层)                 │  添加 STP/SDP 帧定界并编码传输
 └─────────────────────────────────────────┘
 ```
 
 ---
 
-## ACK/NAK 协议原理
+## 2. 序列号与 Ack/Nak DLLP 格式
 
-### DLLP 格式
+### 2.1 TLP 序列号（Sequence Number）
 
-**Data Link Layer Packet (DLLP)** 是数据链路层的控制包，用于链路管理，不包含数据负载。
+数据链路层为每个待发送的 TLP 分配一个 **12 位序列号**（范围 `0 ~ 4095`，模 4096 循环使用）：
 
-**DLLP 基本结构**（8 字节）：
 ```
-Byte 0-1: DLLP Type + Reserved
-Byte 2-3: Type-Specific Data
-Byte 4-5: Type-Specific Data (续)
-Byte 6-7: CRC-16 (DLLP 校验)
-
-┌──────────────┬──────────────┬──────────────┬──────────────┐
-│  DLLP Type   │   Reserved   │  Seq Number  │  CRC-16      │
-│  (8 bits)    │   (8 bits)   │  (varies)    │  (16 bits)   │
-└──────────────┴──────────────┴──────────────┴──────────────┘
+物理层帧定界          数据链路层        事务层          数据链路层
+┌──────────┬──────────────────┬──────────────┬──────────────┬──────────┐
+│   STP    │  Seq# (12 bits)  │  TLP Header  │ Data Payload │   LCRC   │
+│ (帧起始)  │  + Reserved (4b) │  (3 ~ 4 DW)  │ (0 ~ 1024 DW)│ (32-bit) │
+└──────────┴──────────────────┴──────────────┴──────────────┴──────────┘
 ```
 
-**ACK/NAK DLLP 类型**：
+- **作用域**：每条 PCIe 链路独立维护自己的发送/接收序列号，穿越 Switch 时每跳重新编号。
+- **回绕比较**：采用模 4096 算术比较大小（例如 `4095` 的下一个是 `0`）。
 
-| DLLP Type | 二进制 | 功能 | 包含字段 |
-|-----------|--------|------|----------|
-| **Ack** | 0000_0000b | 确认接收 | AckSeq#: 已确认的序列号 |
-| **Nak** | 0001_0000b | 请求重传 | NakSeq#: 需要重传的序列号 |
+### 2.2 Ack / Nak DLLP 结构（6 字节核心 + 2 字节物理层定界）
 
-**Ack DLLP 格式**：
+DLLP（Data Link Layer Packet）是数据链路层内部的控制包，本身**不分配序列号、也不需要被对方 Ack**。其 6 字节核心结构如下：
+
 ```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-┌───────────────┬───────────────┬───────────────────────────────┐
-│  Type=0x00    │   Reserved    │      AckSeq# (12 bits)        │
-│  (Ack DLLP)   │   (8 bits)    │      + Reserved (4 bits)      │
-└───────────────┴───────────────┴───────────────┬───────────────┘
-┌───────────────────────────────────────────────┴───────────────┐
-│                    CRC-16                                      │
-│                   (16 bits)                                    │
-└────────────────────────────────────────────────────────────────┘
-
-AckSeq#: 接收方期望的下一个 TLP 序列号 (已接收 AckSeq#-1)
+ Byte 0             Byte 1          Byte 2               Byte 3         Byte 4-5
+┌──────────────────┬───────────────┬────────────────────┬──────────────┬──────────────┐
+│ Type             │ Reserved (0)  │ Rsvd(4b) │ AckNak_Seq_Num[11:0]   │   CRC-16     │
+│ 0x00=Ack         │               │          │ (12 bits)              │  (16 bits)   │
+│ 0x10=Nak         │               │          │                        │              │
+└──────────────────┴───────────────┴────────────────────┴──────────────┴──────────────┘
 ```
 
-**Nak DLLP 格式**：
-```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-┌───────────────┬───────────────┬───────────────────────────────┐
-│  Type=0x10    │   Reserved    │      NakSeq# (12 bits)        │
-│  (Nak DLLP)   │   (8 bits)    │      + Reserved (4 bits)      │
-└───────────────┴───────────────┴───────────────┬───────────────┘
-┌───────────────────────────────────────────────┴───────────────┐
-│                    CRC-16                                      │
-│                   (16 bits)                                    │
-└────────────────────────────────────────────────────────────────┘
+| DLLP 类型 | Type 编码 | `AckNak_Seq_Num` 语义 | 发送方收到后的动作 |
+|-----------|-----------|----------------------|------------------|
+| **Ack** | `0x00` | 接收方**已成功接收**的最后一个连续 TLP 序列号 `N`（累积确认） | 从 Replay Buffer 释放所有 `Seq# ≤ N` 的 TLP，重置 Replay Timer |
+| **Nak** | `0x10` | 接收方在出错前**最后正确收到**的 TLP 序列号 `N` | 从 Replay Buffer 中自 `N + 1` 起重传所有未确认的 TLP |
 
-NakSeq#: 需要重传的 TLP 序列号
-```
-
-### 序列号机制
-
-**序列号（Sequence Number）** 用于标识和跟踪每个 TLP。
-
-**关键特性**：
-- **长度**：12 位（0-4095）
-- **循环使用**：4096 后回绕到 0
-- **作用域**：每个链路独立维护序列号空间
-- **递增规则**：每发送一个 TLP，序列号加 1
-
-**序列号在 TLP 中的位置**：
-```
-物理层添加的帧头：
-┌─────────┬───────────┬─────────────┐
-│  STP    │  Seq#     │  TLP Header │  ...
-│ (Start) │ (12 bits) │   (3-4 DW)  │
-└─────────┴───────────┴─────────────┘
-
-STP (Start of TLP): 物理层帧定界符
-Seq#: 数据链路层添加的序列号
-```
-
-**序列号比较**：
-- PCIe 使用**模运算**比较序列号
-- 允许回绕：Seq# 4095 的下一个是 Seq# 0
-
-**示例**：
-```
-发送方发送 3 个 TLP：
-  TLP1: Seq# = 100
-  TLP2: Seq# = 101
-  TLP3: Seq# = 102
-
-接收方正确接收所有 TLP 后：
-  发送 Ack DLLP: AckSeq# = 103 (期望接收 103)
-```
-
-### ACK 机制
-
-**Ack 语义**：累积确认（Cumulative Acknowledgment）
-
-**AckSeq# = N 的含义**：
-- 接收方已成功接收所有序列号 **< N** 的 TLP
-- 接收方期望接收序列号 **= N** 的 TLP
-
-**Ack 发送时机**：
-1. **周期性 Ack**：即使没有新 TLP，也定期发送 Ack 更新状态
-2. **接收 TLP 后**：正确接收 TLP 并通过 LCRC 校验后发送
-3. **Replay Timer 更新**：帮助发送方释放重传缓冲区
-
-**示例场景**：
-```
-时间轴：
-T0: 发送方发送 TLP(Seq#=10)
-T1: 接收方接收，LCRC 正确
-T2: 接收方发送 Ack(AckSeq#=11)
-T3: 发送方接收 Ack，释放 TLP(Seq#=10) 的重传缓冲区
-```
-
-### NAK 机制
-
-**Nak 语义**：选择性重传请求
-
-**NakSeq# = N 的含义**：
-- 接收方检测到序列号 **= N** 的 TLP 有错误（LCRC 失败）
-- 或检测到序列号不连续（跳号）
-- 请求发送方重传从 N 开始的所有 TLP
-
-**Nak 发送时机**：
-1. **LCRC 错误**：接收到 TLP 但 LCRC 校验失败
-2. **序列号不连续**：接收到 Seq# = N+2，但未接收 Seq# = N+1
-3. **TLP 格式错误**：Malformed TLP
-
-**Nak 触发重传**：
-- 发送方收到 Nak(NakSeq#=N) 后，从序列号 N 开始重传所有未确认的 TLP
-
-**示例场景**：
-```
-时间轴：
-T0: 发送方发送 TLP(Seq#=10), TLP(Seq#=11), TLP(Seq#=12)
-T1: 接收方接收 TLP(Seq#=10) ✓
-T2: 接收方接收 TLP(Seq#=11)，LCRC 错误 ✗
-T3: 接收方发送 Nak(NakSeq#=11)
-T4: 接收方接收 TLP(Seq#=12)，但序列号不连续，丢弃
-T5: 发送方收到 Nak，重传 TLP(Seq#=11) 和 TLP(Seq#=12)
-T6: 接收方正确接收重传的 TLP
-T7: 接收方发送 Ack(AckSeq#=13)
-```
+> **注意**：`Ack` 是**累积确认**——接收方连续收到 `100, 101, 102` 后，只需回一个 `Ack(102)` 即可确认全部 3 个包；同理，`Nak(100)` 表示 `100` 正常、`101` 及之后需要重传。
 
 ---
 
-## 可靠传输机制
+## 3. 正常确认、错误重传与超时恢复
 
-### 重传缓冲区（Replay Buffer）
+### 3.1 正常传输（累积确认）
 
-**作用**：发送方保存已发送但未确认的 TLP，以便在收到 NAK 时重传。
-
-**缓冲区管理**：
 ```
-发送方维护：
-┌──────────────────────────────────────────────────┐
-│  Replay Buffer (重传缓冲区)                      │
-│                                                  │
-│  [Seq#=10] [Seq#=11] [Seq#=12] [Seq#=13] ...   │
-│     ↑                                            │
-│     └─ AckSeq# (已确认，可释放之前的 TLP)        │
-└──────────────────────────────────────────────────┘
-
-缓冲区操作：
-• 发送 TLP → 加入 Replay Buffer
-• 收到 Ack(AckSeq#=N) → 释放所有 Seq# < N 的 TLP
-• 收到 Nak(NakSeq#=N) → 从 Seq#=N 开始重传所有 TLP
+发送方 (TX)                                      接收方 (RX)
+  │──── TLP (Seq#=100) ───────────────────────────▶│  LCRC ✓, Seq 连续
+  │──── TLP (Seq#=101) ───────────────────────────▶│  LCRC ✓, Seq 连续
+  │                                                │  (可合并延迟发送 Ack)
+  │◀─── Ack DLLP (AckNak_Seq_Num = 101) ───────────│
+  │  释放 Replay Buffer 中 Seq# ≤ 101 的 TLP       │
 ```
 
-**缓冲区大小**：
-- 规范未强制规定大小
-- 典型实现：足够容纳链路延迟期间发送的所有 TLP
-- 过小：限制链路利用率
-- 过大：浪费硬件资源
+### 3.2 LCRC 失败或跳号（Nak 触发重传）
 
-**缓冲区溢出**：
-- 如果缓冲区满且未收到 Ack，发送方停止发送新 TLP
-- 等待 Ack 释放缓冲区空间
+当接收方遇到以下情况时，丢弃错误 TLP 并发送 `Nak`：
+1. **LCRC 校验失败**（链路传输出现比特翻转）。
+2. **序列号跳号**（例如期望 `101`，却收到 `102`）。
 
-### 超时机制
-
-**Replay Timer（重传定时器）**：防止 Ack/Nak 丢失导致死锁。
-
-**工作原理**：
 ```
-发送方：
-1. 发送 TLP 后启动 Replay Timer
-2. 收到 Ack/Nak 后重置 Timer
-3. Timer 超时 → 触发重传所有未确认的 TLP
-
-┌─────────────────────────────────────────────────┐
-│  Replay Timer 超时流程                          │
-│                                                 │
-│  发送 TLP → 启动 Timer                          │
-│      │                                          │
-│      ├─→ 收到 Ack → 重置 Timer                 │
-│      │                                          │
-│      └─→ 超时 (未收到 Ack) → 重传所有 TLP      │
-│                                 └─→ 重启 Timer  │
-└─────────────────────────────────────────────────┘
+发送方 (TX)                                      接收方 (RX)
+  │──── TLP (Seq#=100) ───────────────────────────▶│  LCRC ✓ → 更新期望为 101
+  │──── TLP (Seq#=101) ───────────────────────────▶│  LCRC ✗ → 丢弃！
+  │──── TLP (Seq#=102) ───────────────────────────▶│  非期望 101 → 丢弃！
+  │◀─── Nak DLLP (AckNak_Seq_Num = 100) ───────────│  报告最后正确包为 100
+  │                                                │
+  │  从 Replay Buffer 重传 Seq# ≥ 101 的 TLP：      │
+  │──── TLP (Seq#=101) [重传] ─────────────────────▶│  LCRC ✓
+  │──── TLP (Seq#=102) [重传] ─────────────────────▶│  LCRC ✓
+  │◀─── Ack DLLP (AckNak_Seq_Num = 102) ───────────│
+  │  释放 100~102                                  │
 ```
 
-**超时时间**：
-- **典型值**：根据链路速度和延迟动态计算
-- **Gen 1/2**：约 300-400 纳秒
-- **Gen 3+**：更短，适应更高速度
+### 3.3 Ack 丢失与 Replay Timer 超时
 
-**超时计数器（Replay Number）**：
-- 记录连续超时次数
-- 如果超过阈值（如 4 次），认为链路故障
-- 触发链路重新训练或错误报告
+由于 DLLP 本身没有重传机制，如果 `Ack` 或 `Nak` 在半路损坏被丢弃，发送方依靠 **Replay Timer（重传定时器）** 防止死锁：
 
-### 完整传输流程
-
-**正常传输流程（无错误）**：
-```mermaid
-sequenceDiagram
-    participant TX as 发送方
-    participant RX as 接收方
-    
-    TX->>RX: TLP (Seq#=100)
-    Note over TX: 加入 Replay Buffer<br/>启动 Replay Timer
-    Note over RX: LCRC 校验 ✓
-    RX->>TX: Ack (AckSeq#=101)
-    Note over TX: 释放 Seq#<101 的 TLP<br/>重置 Replay Timer
-    
-    TX->>RX: TLP (Seq#=101)
-    Note over RX: LCRC 校验 ✓
-    RX->>TX: Ack (AckSeq#=102)
-    Note over TX: 释放 Seq#<102 的 TLP
-```
-
-**错误重传流程**：
-```mermaid
-sequenceDiagram
-    participant TX as 发送方
-    participant RX as 接收方
-    
-    TX->>RX: TLP (Seq#=100)
-    TX->>RX: TLP (Seq#=101)
-    TX->>RX: TLP (Seq#=102)
-    Note over TX: 所有 TLP 在<br/>Replay Buffer
-    
-    Note over RX: Seq#=100 ✓<br/>Seq#=101 LCRC 错误 ✗
-    RX->>TX: Nak (NakSeq#=101)
-    
-    Note over TX: 收到 Nak<br/>从 Seq#=101 重传
-    TX->>RX: TLP (Seq#=101) [重传]
-    TX->>RX: TLP (Seq#=102) [重传]
-    
-    Note over RX: 两个 TLP 都正确
-    RX->>TX: Ack (AckSeq#=103)
-    Note over TX: 释放所有 TLP
-```
-
-**超时重传流程**：
-```mermaid
-sequenceDiagram
-    participant TX as 发送方
-    participant RX as 接收方
-    
-    TX->>RX: TLP (Seq#=100)
-    Note over TX: 启动 Replay Timer
-    Note over RX: LCRC 校验 ✓
-    RX->>TX: Ack (AckSeq#=101)
-    Note over TX,RX: Ack 在传输中丢失
-    
-    Note over TX: Replay Timer 超时<br/>未收到 Ack
-    TX->>RX: TLP (Seq#=100) [重传]
-    Note over RX: 检测到重复 Seq#<br/>丢弃但发送 Ack
-    RX->>TX: Ack (AckSeq#=101)
-    Note over TX: 收到 Ack<br/>释放 TLP
-```
+1. 发送方每当发送未确认 TLP 时启动 `Replay Timer`。
+2. 收到有效的 `Ack`（推进了确认窗口）时重置 Timer。
+3. 若超时仍未收到 `Ack`：发送方主动重传 Replay Buffer 中所有未确认 TLP，并将 **Replay Number** 计数器加 1。
+4. 若连续超时/重传达到阈值（规范定义 `REPLAY_NUM` 翻转，每 4 次重传触发一次计数翻转并通知物理层进入 **LTSSM Recovery** 重新训练链路）。
 
 ---
 
-## FEMU 实现参考
+## 4. 调试与故障排查
 
-### 数据链路层错误检测
+在 Linux 中可通过 `lspci` 或 `setpci` 查看 **AER（Advanced Error Reporting，高级错误报告）** 寄存器定位链路层重传问题：
 
-```c
-// hw/pci/pcie_aer.c - PCIe 高级错误报告
-// LCRC 错误处理
-
-// Data Link Protocol Error - LCRC 校验失败
-#define PCI_ERR_UNC_DLP         0x00000010  // Bit 4
-
-// 错误注入函数（用于测试）
-void pcie_aer_inject_error(PCIDevice *dev, const PCIEAERErr *err)
-{
-    uint8_t *config = dev->config + dev->exp.aer_cap;
-    
-    if (err->flags & PCIE_AER_ERR_IS_CORRECTABLE) {
-        // 可纠正错误（如 Bad TLP）
-        pci_long_test_and_set_mask(config + PCI_ERR_COR_STATUS,
-                                     err->status);
-    } else {
-        // 不可纠正错误（如 LCRC 错误）
-        pci_long_test_and_set_mask(config + PCI_ERR_UNCOR_STATUS,
-                                     err->status);
-        
-        // 记录错误详情
-        if (err->status & PCI_ERR_UNC_DLP) {
-            // Data Link Protocol Error (LCRC 失败)
-            // 接收方应发送 NAK DLLP
-        }
-    }
-}
-```
-
-### 重传缓冲区相关
-
-```c
-// hw/pci/pcie.c - PCIe 能力和链路管理
-
-// 链路状态寄存器
-#define PCI_EXP_LNKSTA_DLLLA    0x2000  // Data Link Layer Link Active
-
-// 链路重新训练（链路故障后）
-void pcie_cap_lnkctl_write(PCIDevice *dev, uint32_t old, uint32_t new)
-{
-    if (new & PCI_EXP_LNKCTL_RL) {
-        // Retrain Link - 链路重新训练
-        // 当重传失败次数过多时触发
-        pcie_cap_deverr_reset(dev);
-    }
-}
-```
-
-### 错误计数器
-
-```c
-// include/standard-headers/linux/pci_regs.h
-
-// AER 错误计数寄存器
-#define PCI_ERR_CAP_ECRC_GENC   0x00000020  // ECRC Generation Capable
-#define PCI_ERR_CAP_ECRC_GENE   0x00000040  // ECRC Generation Enable
-#define PCI_ERR_CAP_ECRC_CHKC   0x00000080  // ECRC Check Capable
-#define PCI_ERR_CAP_ECRC_CHKE   0x00000100  // ECRC Check Enable
-
-// Replay Number 和 Replay Timer 超时会记录在这里：
-#define PCI_ERR_COR_REP_ROLL    0x00000100  // Replay Num Rollover
-#define PCI_ERR_COR_REP_TIMER   0x00001000  // Replay Timer Timeout
-```
-
----
-
-## 实际应用场景
-
-### 场景 1：数据中心服务器
-
-**环境**：高速 NVMe SSD (PCIe Gen 4 x4) 连接到 CPU
-
-**挑战**：
-- 高带宽 (16 GB/s) 对可靠性要求极高
-- 任何数据损坏都可能导致文件系统错误
-
-**ACK/NAK 作用**：
-- LCRC 检测传输中的比特翻转
-- NAK 触发立即重传，避免数据损坏
-- Replay Buffer 大小优化以匹配链路延迟
-
-**观测**：
 ```bash
-# 查看 PCIe 错误统计
-lspci -vvv -s 01:00.0 | grep -A 10 "Advanced Error Reporting"
-    UESta:  DLP- SDES- TLP- FCP- CmpltTO- CmpltAbrt- UnxCmplt- RxOF- ...
-    CEsta:  RxErr- BadTLP- BadDLLP- Rollover- Timeout- NonFatalErr-
-    
-# DLP (Data Link Protocol Error) = LCRC 错误导致 NAK
-# Rollover = Replay Number 溢出（重传过多）
-# Timeout = Replay Timer 超时
+# 查看设备的 AER 错误状态（Uncorrectable / Correctable）
+lspci -vvv -s 01:00.0 | grep -A 6 "Advanced Error Reporting"
 ```
 
-### 场景 2：热插拔设备
+| AER 状态位 | 寄存器类型 | 含义与常见原因 |
+|------------|-----------|--------------|
+| **DLP** (Data Link Protocol Error) | Uncorrectable | 严重的数据链路协议错误（如流控制/序列号异常） |
+| **BadTLP** | Correctable | 收到 LCRC 错误或格式异常的 TLP（已触发 Nak 重传） |
+| **BadDLLP** | Correctable | 收到 CRC-16 错误的 DLLP（已被静默丢弃） |
+| **Rollover** (Replay Num Rollover) | Correctable | 重传次数连续达到 4 次，链路质量可能恶化 |
+| **Timeout** (Replay Timer Timeout) | Correctable | Replay Timer 超时，常见于对端未及时回发 Ack |
 
-**环境**：热插拔 PCIe 设备（如 GPU）
-
-**挑战**：
-- 插入瞬间链路可能不稳定
-- 需要重新建立可靠连接
-
-**ACK/NAK 作用**：
-- 链路训练完成后初始化序列号
-- 初期可能有较多 NAK（链路质量建立中）
-- Replay Timer 帮助检测连接是否稳定
-
-### 场景 3：长距离 PCIe 扩展
-
-**环境**：通过 PCIe 线缆或光纤扩展器连接设备
-
-**挑战**：
-- 信号衰减和噪声增加
-- 链路延迟增大
-
-**ACK/NAK 优化**：
-- 增大 Replay Buffer 以适应更长的往返时间 (RTT)
-- 调整 Replay Timer 超时时间
-- 可能需要更频繁的 Ack 更新
+**排查路径**：
+- `BadTLP` / `BadDLLP` 高 → 物理信号完整性问题（线缆、插槽接触、EMI），可尝试检查金手指或降速测试。
+- `Timeout` 高 → 对端设备挂起或链路时钟/唤醒异常。
+- `Rollover` 伴随链路降速 → 触发了 LTSSM Recovery 重新训练。
 
 ---
 
-## 实用技巧
+## 5. 关联与引申概念
 
-### 调试 ACK/NAK 问题
-
-**1. 查看 AER 错误统计**：
-```bash
-# 读取 AER 可纠正错误状态
-setpci -s 01:00.0 ECAP_AER+0x10.L
-# Bit 8: Replay Number Rollover
-# Bit 12: Replay Timer Timeout
-
-# 读取不可纠正错误状态
-setpci -s 01:00.0 ECAP_AER+0x04.L
-# Bit 4: Data Link Protocol Error (LCRC 错误)
-```
-
-**2. 使用 PCIe 协议分析仪**：
-- 捕获 DLLP 流量
-- 观察 Ack/Nak 模式
-- 测量 Replay Timer 时间
-
-**3. 内核日志**：
-```bash
-dmesg | grep -i "pcie.*error\|corrected\|uncorrected"
-# 查找 PCIe 错误报告
-```
-
-### 性能优化
-
-**1. 减少 NAK 触发**：
-- 改善链路信号质量（更好的线缆、屏蔽）
-- 降低环境噪声
-- 检查 PCIe 插槽接触
-
-**2. 优化 Replay Buffer**：
-- 太小：限制带宽利用率
-- 太大：浪费硬件资源
-- 公式：`Buffer Size ≥ 链路带宽 × 往返时间`
-
-**3. 监控错误率**：
-```bash
-# 持续监控错误计数
-watch -n 1 'lspci -vvv -s 01:00.0 | grep -A 2 "CEsta\|UESta"'
-```
-
-### 故障排查流程
-
-```
-发现性能下降或错误
-    ↓
-检查 AER 错误状态
-    ↓
-┌─────────────────────┐
-│ DLP 错误高？        │ → 是 → LCRC 问题（信号质量）
-│ (Bit 4 UESta)       │         • 检查线缆和连接
-└─────────────────────┘         • 降低链路速度测试
-    ↓ 否
-┌─────────────────────┐
-│ Replay Timeout？    │ → 是 → Ack 未返回（链路阻塞）
-│ (Bit 12 CEsta)      │         • 检查对端设备
-└─────────────────────┘         • 检查链路训练状态
-    ↓ 否
-┌─────────────────────┐
-│ Replay Rollover？   │ → 是 → 重传过多（持续错误）
-│ (Bit 8 CEsta)       │         • 链路重新训练
-└─────────────────────┘         • 可能硬件故障
-```
-
----
-
-## 总结
-
-### 关键要点
-
-1. ✅ **ACK/NAK 提供可靠传输**：通过确认和重传机制确保 TLP 正确交付
-2. ✅ **序列号跟踪 TLP**：12 位序列号空间，循环使用
-3. ✅ **累积确认**：Ack(AckSeq#=N) 表示已接收所有 Seq# < N 的 TLP
-4. ✅ **选择性重传**：Nak(NakSeq#=N) 触发从 N 开始的重传
-5. ✅ **Replay Buffer 必需**：发送方保存未确认的 TLP
-6. ✅ **Replay Timer 防止死锁**：超时触发重传
-7. ✅ **LCRC 检测错误**：Link CRC 是 NAK 的主要触发原因
-
-### ACK/NAK vs 上层协议对比
-
-| 特性 | ACK/NAK (数据链路层) | TCP (传输层) |
-|------|---------------------|--------------|
-| **作用范围** | 单个 PCIe 链路 | 端到端网络连接 |
-| **序列号** | 12 位（循环） | 32 位 |
-| **确认类型** | 累积确认 | 累积 + 选择性 |
-| **重传单位** | TLP（数据包） | TCP Segment |
-| **超时控制** | 硬件固定 | 动态调整 (RTT) |
-| **透明性** | 对上层透明 | 应用层可见 |
-
----
-
-## 下一步学习
-
-- [DLLP 格式详解](dllp-format.md) - 完整的 DLLP 类型和格式
-- [LCRC 计算](lcrc.md) - Link CRC 的计算方法
-- [链路训练](../physical-layer/link-training.md) - LTSSM 状态机和初始化
-- [流控制机制](flow-control.md) - 信用制流控制
-- [TLP 格式](../transaction-layer/tlp-format.md) - 事务层包格式
-
----
-
-## 参考资料
-
-- **规范**：PCIe Base Spec Chapter 3 (Data Link Layer)
-- **相关章节**：
-  - Section 3.2: Data Link Control State Machine
-  - Section 3.3: DLLP Processing
-  - Section 3.4: Sequence Number Management
-- **图表**：Figure 3-5 (ACK/NAK Protocol Flow)
-- **实现**：`/hw/pci/pcie_aer.c` (FEMU)
-
----
-
-**相关页面**：
-- [← 数据链路层概述](README.md)
-- [流控制初始化 →](flow-control-init.md)
-- [返回首页](../README.md)
-
----
-
-*最后更新：2026-07-06*
+- **LCRC（Link CRC）**：数据链路层为每个 TLP 附加的 32 位校验码，用于逐跳检测传输比特错误；与事务层可选的端到端校验 **ECRC** 不同。详见 [LCRC 详解](lcrc.md) 与 [ECRC 详解](../transaction-layer/ecrc.md)。
+- **Replay Buffer（重传缓冲区）**：发送方暂存已发未确认 TLP 的环形缓冲区，是 `Nak` 与超时重传得以实现的前提。详见 [重试缓冲区](retry-buffer.md)。
+- **DLLP（Data Link Layer Packet）**：除 Ack/Nak 外，还承载流控制（InitFC/UpdateFC）与电源管理（PM）信令。详见 [DLLP 格式详解](dllp-format.md)。
+- **LTSSM（Link Training and Status State Machine）**：物理层链路训练状态机；当 `REPLAY_NUM` 连续超限时，数据链路层会请求物理层进入 `Recovery` 状态重新训练链路。
+- **AER（Advanced Error Reporting）**：PCIe 扩展配置空间中的标准化错误日志与上报机制，用于向操作系统暴露 `BadTLP`、`Rollover` 等硬件事件。

@@ -1,690 +1,150 @@
-# LTSSM 状态机详解
+# LTSSM 状态机详解 (Link Training and Status State Machine)
 
-Link Training and Status State Machine (LTSSM) 是 PCIe 物理层的核心状态机，负责链路初始化、训练、电源管理和错误恢复。
+**LTSSM（链路训练与状态机）** 是 PCIe 物理层的大脑，负责管理一条链路从上电探测、参数协商、全速通信、空闲省电到异常恢复的全生命周期。如果把 PCIe 链路比作一条双向高速公路，LTSSM 就是交通调度中心：先确认对面通车了，再对齐车道与限速，空闲时关闭部分照明省电，遇到拥堵或故障时迅速重整车流。
 
 ---
 
-## 概述
+## LTSSM 在协议栈中的位置
 
-LTSSM 是 PCIe 链路生命周期的控制中心，管理从设备上电到正常通信的整个过程。
-
-**LTSSM 的核心职责**：
-- **链路初始化**：检测对端设备并建立物理连接
-- **速度协商**：确定最优的链路速度（2.5/5.0/8.0/16.0/32.0 GT/s）
-- **宽度协商**：确定激活的 Lane 数量（x1/x2/x4/x8/x16/x32）
-- **电源管理**：在不同功耗状态间切换
-- **错误恢复**：检测并修复链路错误
-
-**在协议栈中的位置**：
-```
-┌─────────────────────────────────────┐
-│  Transaction Layer                  │
-├─────────────────────────────────────┤
-│  Data Link Layer                    │
-├─────────────────────────────────────┤
-│  Physical Layer - Logical           │
-│  ┌──────────────────────────────┐   │
-│  │     LTSSM 状态机             │◄──┼─ 控制链路行为
-│  └──────────────────────────────┘   │
-├─────────────────────────────────────┤
-│  Physical Layer - Electrical        │  差分信号传输
-└─────────────────────────────────────┘
+```text
++---------------------------------------+
+|  Transaction Layer (事务层)            |
++---------------------------------------+
+|  Data Link Layer (数据链路层)          |
++---------------------------------------+
+|  Physical Layer - Logical (物理层逻辑) |
+|  +---------------------------------+  |
+|  |           LTSSM 状态机           |  | ◀── 控制建链、调速、省电、复位
+|  +---------------------------------+  |
++---------------------------------------+
+|  Physical Layer - Electrical (电气层)  |
++---------------------------------------+
 ```
 
 ---
 
-## LTSSM 状态概览
+## 11 个核心状态与转换关系
 
-LTSSM 定义了 11 个主要状态，每个状态有特定的功能和子状态。
-
-### 状态分类
-
-```
-启动阶段：
-  Detect → Polling → Configuration → L0
-
-运行阶段：
-  L0 (正常运行)
-  
-省电状态：
-  L0s (快速省电) ← → L0
-  L1 (深度省电) ← → L0
-  L2 (更深省电)
-  
-维护状态：
-  Recovery (错误恢复)
-  Hot Reset (热复位)
-  Loopback (环回测试)
-  Disabled (禁用)
-```
-
-### LTSSM 状态转换图
+LTSSM 共定义了 **11 个主状态**，按功能可分为 4 类：
+- **建链启动**：`Detect` → `Polling` → `Configuration` → `L0`
+- **正常运行**：`L0`
+- **低功耗省电**：`L0s`、`L1`（含 `L1.1`/`L1.2`）、`L2`
+- **维护与异常**：`Recovery`、`Hot Reset`、`Loopback`、`Disabled`
 
 ```mermaid
 stateDiagram-v2
     [*] --> Detect
-    Detect --> Polling: 检测到接收端
-    Detect --> Disabled: 超时/禁用
-    
-    Polling --> Configuration: 位锁定成功
-    Polling --> Detect: 失败
-    
-    Configuration --> L0: 配置完成
-    Configuration --> Recovery: 错误
-    
-    L0 --> L0s: 进入快速省电
-    L0s --> L0: 退出省电
-    
-    L0 --> L1: 进入深度省电
-    L1 --> L0: 退出省电
-    L1 --> L2: 更深省电
-    
-    L0 --> Recovery: 链路错误
-    L1 --> Recovery: 唤醒
-    Recovery --> L0: 恢复成功
+    Detect --> Polling: 检测到对端接收端阻抗
+    Detect --> Disabled: 禁用或超时
+
+    Polling --> Configuration: 位锁定与符号锁定成功
+    Polling --> Detect: 训练失败/超时
+
+    Configuration --> L0: 宽度/Lane号/极性配置完成
+    Configuration --> Recovery: 配置出错
+
+    L0 --> L0s: 短暂空闲 (单向快速省电)
+    L0s --> L0: 发送 FTS 快速唤醒
+
+    L0 --> L1: 较长空闲 (双向深度省电)
+    L1 --> Recovery: 唤醒退出 L1
+    L1 --> L2: 进入系统休眠 (辅助供电)
+
+    L0 --> Recovery: 误码/调速/重训练请求
+    Recovery --> L0: 恢复/调速成功
     Recovery --> Detect: 恢复失败
-    
-    L0 --> Hot_Reset: 复位请求
+
+    L0 --> Hot_Reset: 收到热复位请求
     Hot_Reset --> Detect: 复位完成
-    
-    L0 --> Loopback: 测试模式
-    Loopback --> Detect: 测试完成
-    
-    Disabled --> Detect: 重新使能
+
+    L0 --> Loopback: 进入环回测试
+    Loopback --> Detect: 退出测试
+
+    Disabled --> Detect: 重新使能链路
 ```
 
 ---
 
-## 主要状态详解
+## 各状态详解
 
 ### 1. Detect（检测）
-
-**目的**：检测链路对端是否存在设备
-
-**行为**：
-- 发送方驱动差分信号，检测接收端阻抗变化
-- 如果检测到接收端（负载阻抗从高到低），进入 Polling
-- 超时后保持在 Detect 或进入 Disabled
-
-**子状态**：
-- `Detect.Quiet`：静默期，准备检测
-- `Detect.Active`：主动驱动信号并检测
-
-**超时时间**：12 ms（典型值）
-
-**实际应用**：
-- 热插拔时，设备插入后进入此状态
-- 系统启动时，Root Complex 扫描所有端口
+- **职责**：判断对端是否插有 PCIe 设备，无需通信即可探测。
+- **原理**：在 `Detect.Quiet` 短暂静默后进入 `Detect.Active`，发送端在差分线上施加电压脉冲，检测对端 50 Ω 端接阻抗的 RC 充电时间变化。一旦检测到接收端存在，立即进入 `Polling`。
 
 ### 2. Polling（轮询）
-
-**目的**：建立位锁定和符号锁定，初步同步双方
-
-**行为**：
-- 发送训练序列（Training Sequence - TS1/TS2）
-- 接收端尝试锁定比特流边界
-- 双方交换链路和 Lane 信息
-
-**子状态**：
-- `Polling.Active`：发送 TS1 序列
-- `Polling.Configuration`：发送 TS2 序列
-- `Polling.Compliance`：合规性测试模式
-
-**TS1/TS2 序列内容**：
-
-| 字段 | 含义 |
-|------|------|
-| Link Number | 链路编号 |
-| Lane Number | Lane 编号（用于去倾斜） |
-| Data Rate | 支持的速度标识 |
-| Training Control | 训练控制位 |
-
-**关键点**：
-- TS1：初始训练序列，建立比特锁定
-- TS2：配置训练序列，准备进入 Configuration
+- **职责**：建立**位锁定（Bit Lock）**和**符号锁定（Symbol Lock）**，并交换初步速率能力。
+- **子状态**：
+  - `Polling.Active`：持续发送 **TS1** 训练序列，让对端 CDR 锁定比特边界和 `K28.5`/Sync Header 边界。
+  - `Polling.Configuration`：收到足够多有效 TS1 后切换发送 **TS2**，确认双方准备就绪。
+  - `Polling.Compliance`：合规性测试模式（仅用于实验室仪器测试）。
 
 ### 3. Configuration（配置）
-
-**目的**：协商链路宽度、速度和其他参数
-
-**行为**：
-- 确定激活的 Lane 数量（降宽或全宽）
-- 配置 Lane 反转（Lane Reversal）
-- 协商链路编号和扰码（Scrambling）
-- 设置链路控制寄存器
-
-**子状态**：
-- `Configuration.Linkwidth.Start`：开始宽度协商
-- `Configuration.Linkwidth.Accept`：接受宽度配置
-- `Configuration.Lanenum.Accept`：接受 Lane 编号
-- `Configuration.Complete`：配置完成
-- `Configuration.Idle`：等待数据链路层初始化
-
-**宽度协商示例**：
-
-```
-发送端支持：x16
-接收端支持：x8
-协商结果：  x8 (取较小值)
-
-可能的宽度降级：
-x16 → x8 → x4 → x2 → x1
-```
-
-**关键点**：
-- **Lane 反转**：如果 PCB 布线反转，硬件自动检测并调整
-- **去倾斜**：补偿不同 Lane 的传播延迟差异
+- **职责**：协商最终的**链路宽度（Link Width）**、**Lane 编号**，并自动处理布线问题。
+- **关键动作**：
+  - 取双方支持宽度的交集（如 x16 对 x8 → 协商为 x8）。
+  - 自动检测并纠正 **Lane 反转（Lane Reversal）** 与 **差分极性反转（Polarity Inversion）**。
+  - 完成多 Lane **去偏斜（Deskew）**，并协商是否启用扰码（Scrambling）。
 
 ### 4. L0（正常运行）
+- **职责**：链路完全激活，正常传输 TLP 和 DLLP。
+- **说明**：初始进入 `L0` 时通常运行在 **Gen 1（2.5 GT/s）**；若双方均支持更高速率，会立即通过 `Recovery` 状态切换至 Gen 2/3/4/5/6。
 
-**目的**：链路完全激活，可以传输 TLP 和 DLLP
+### 5. L0s / L1 / L2（低功耗状态）
 
-**行为**：
-- 事务层可以发送和接收数据包
-- 链路处于全功率状态
-- 监控链路质量，必要时进入 Recovery
+| 状态 | 唤醒延迟 | 节电幅度 | 行为特征 |
+| :--- | :--- | :--- | :--- |
+| **L0s** | < 1 μs | ~20%–30% | **单向独立**进入电气空闲；PLL 保持锁定，退出时发 FTS 即可快速恢复 |
+| **L1** | 2–4 μs | ~50%–70% | **双向同步**进入；关闭内部 PLL，退出需经过 `Recovery` 重锁定 |
+| **L1.1 / L1.2** | 10–100 μs | ~70%–90% | L1 子状态：通过 `CLKREQ#` 关闭 100 MHz 参考时钟（L1.2 还会关闭共模电压） |
+| **L2** | > 10 ms | 仅辅助供电 | 对应系统睡眠（S3/S4），主电源关闭，唤醒必须从 `Detect` 重新训练 |
 
-**性能指标**：
+### 6. Recovery（恢复）
+- **职责**：在不复位整个设备的前提下，重新对齐时钟、修复瞬时误码，或**动态切换链路速度/宽度**。
+- **子状态**：
+  - `Recovery.RcvrLock`：重新锁定 CDR 与符号边界。
+  - `Recovery.Equalization`（Gen 3+）：执行发送端和接收端链路均衡调优。
+  - `Recovery.Speed`：双方同步切换 PLL 到目标速率。
+  - `Recovery.RcvrCfg` / `Recovery.Idle`：确认参数并回到 `L0`。
 
-| 速度 (Gen) | 数据率 | 编码 | 有效带宽 (x16) |
-|-----------|--------|------|---------------|
-| Gen 1 | 2.5 GT/s | 8b/10b | 4 GB/s |
-| Gen 2 | 5.0 GT/s | 8b/10b | 8 GB/s |
-| Gen 3 | 8.0 GT/s | 128b/130b | 15.75 GB/s |
-| Gen 4 | 16.0 GT/s | 128b/130b | 31.5 GB/s |
-| Gen 5 | 32.0 GT/s | 128b/130b | 63 GB/s |
-
-**退出条件**：
-- 进入省电状态（L0s/L1）
-- 发生链路错误（→ Recovery）
-- 软件请求复位（→ Hot Reset）
-
-### 5. L0s（快速省电）
-
-**目的**：快速低功耗状态，适合短暂空闲
-
-**特点**：
-- **进入延迟**：< 1 μs
-- **退出延迟**：< 1 μs
-- **功耗节省**：20%-30%
-- **独立方向**：TX 和 RX 可独立进入
-
-**行为**：
-- 停止发送数据，进入电气空闲（Electrical Idle）
-- 保持 PLL 锁定，时钟不停止
-- 快速恢复到 L0
-
-**适用场景**：
-- 突发流量的间隙
-- DMA 传输的准备阶段
-- 轻载应用（如网络适配器空闲时）
-
-**配置示例**：
-```c
-// 启用 L0s（通过 ASPM 控制寄存器）
-// Offset: PCIe Capability + 0x10 (Link Control)
-pci_write_config_word(dev, cap + PCI_EXP_LNKCTL,
-    PCI_EXP_LNKCTL_ASPM_L0S);  // Bit 0
-```
-
-### 6. L1（深度省电）
-
-**目的**：更深的低功耗状态，适合较长空闲期
-
-**特点**：
-- **进入延迟**：2-4 μs
-- **退出延迟**：2-4 μs
-- **功耗节省**：50%-70%
-- **双向同步**：TX 和 RX 必须同时进入
-
-**行为**：
-- 关闭 PLL，停止比特流
-- 保持链路训练信息
-- 需要通过 TS1 序列快速重训练恢复
-
-**适用场景**：
-- 设备长时间空闲（如存储设备无 IO）
-- 移动设备节能模式
-- 数据中心空闲服务器
-
-**L1 子状态（PCIe 3.0+）**：
-
-| 状态 | 退出延迟 | 功耗 | 说明 |
-|------|---------|------|------|
-| L1.0 | 2-4 μs | 中 | 标准 L1 |
-| L1.1 | ~10 μs | 低 | PLL 关闭，保持参考时钟 |
-| L1.2 | ~100 μs | 极低 | 主参考时钟关闭 |
-
-### 7. L2（深度休眠）
-
-**目的**：系统级低功耗状态（对应 ACPI S3/S4）
-
-**特点**：
-- 主电源可能关闭（仅保持辅助电源）
-- 退出需要完整的链路重训练
-- 通常与系统睡眠配合
-
-**进入方式**：
-- 软件通过电源管理接口请求
-- 从 L1 接收 PM_Enter_L23 消息
-
-**退出路径**：
-```
-L2 → L3 (准备状态) → Detect → Polling → Configuration → L0
-```
-
-### 8. Recovery（恢复）
-
-**目的**：从链路错误中恢复，重新同步
-
-**触发条件**：
-- 比特错误率（BER）过高
-- 接收到错误的 DLLP/TLP
-- 超时事件
-- 速度切换请求
-
-**子状态**：
-- `Recovery.RcvrLock`：重新建立接收锁定
-- `Recovery.RcvrCfg`：重新配置接收端
-- `Recovery.Idle`：等待链路空闲
-- `Recovery.Speed`：速度切换
-
-**速度切换示例**：
-```
-初始：Gen 3 (8.0 GT/s)
-   ↓ 检测到链路不稳定
-Recovery.Speed 阶段
-   ↓ 降速到 Gen 2 (5.0 GT/s)
-返回 L0 (更稳定的速度)
-```
-
-**实际应用**：
-- **自动纠错**：临时信号干扰后自动恢复
-- **速度优化**：根据链路质量动态调整速度
-- **主动重训练**：软件触发链路重训练
-
-### 9. Hot Reset（热复位）
-
-**目的**：在不断电的情况下复位链路
-
-**行为**：
-- 发送热复位信号（持续 2 ms）
-- 清除数据链路层状态
-- 保持链路电源
-- 重新进行完整训练
-
-**使用场景**：
-- 设备挂起后恢复
-- 错误恢复失败
-- 驱动重新加载
-
-### 10. Loopback（环回）
-
-**目的**：硬件测试和诊断
-
-**模式**：
-- **主环回**（Master Loopback）：发送端环回到接收端
-- **从环回**（Slave Loopback）：接收端环回到发送端
-
-**用途**：
-- 制造测试
-- 现场诊断
-- 协议分析仪校准
-
-### 11. Disabled（禁用）
-
-**目的**：链路被软件或硬件禁用
-
-**原因**：
-- 软件显式禁用（写入链路控制寄存器）
-- 多次初始化失败
-- 硬件错误
-
-**恢复**：
-- 软件重新使能
-- 系统复位
+### 7. Hot Reset / Loopback / Disabled
+- **Hot Reset（热复位）**：通过带内 TS1 控制位通知对端复位，不断电清除链路层/事务层状态并回到 `Detect`。
+- **Loopback（环回）**：将接收到的数据直接环回发送，用于芯片量产测试或误码率（BERT）诊断。
+- **Disabled（禁用）**：软件写入 Link Control 寄存器禁用链路，或多次训练失败后的停机状态。
 
 ---
 
-## ASPM（主动状态电源管理）
+## ASPM（主动状态电源管理）权衡
 
-ASPM 是利用 LTSSM 的省电状态实现的节能机制。
+**ASPM（Active State Power Management）** 是硬件自动利用 `L0s` 和 `L1` 省电的机制，无需操作系统频繁干预：
 
-### ASPM 状态转换
-
-```
-          无流量超时
-L0 ───────────────────→ L0s
- ↑                        │
- │    有数据包需要发送      │
- └────────────────────────┘
- 
-          更长空闲
-L0 ───────────────────→ L1
- ↑                       │
- │    唤醒事件/数据到达   │
- └───────────────────────┘
-```
-
-### ASPM 配置
-
-**Linux 内核代码示例**：
-
-```c
-// drivers/pci/pcie/aspm.c
-static void pcie_config_aspm_link(struct pcie_link_state *link, u32 state)
-{
-    u32 reg_val = 0;
-    
-    // L0s 使能
-    if (state & ASPM_STATE_L0S)
-        reg_val |= PCI_EXP_LNKCTL_ASPM_L0S;
-    
-    // L1 使能
-    if (state & ASPM_STATE_L1)
-        reg_val |= PCI_EXP_LNKCTL_ASPM_L1;
-    
-    // 写入链路控制寄存器
-    pcie_capability_write_word(link->pdev, PCI_EXP_LNKCTL, reg_val);
-}
-```
-
-### ASPM 性能权衡
-
-| 策略 | 延迟 | 节能效果 | 适用场景 |
-|------|------|---------|---------|
-| 禁用 ASPM | 最低 | 无节能 | 高性能计算、实时系统 |
-| 仅 L0s | 低 | 20-30% | 平衡性能和节能 |
-| L0s + L1 | 中 | 50-70% | 移动设备、轻载服务器 |
-| L1 子状态 | 高 | 70-90% | 极低功耗需求 |
+| ASPM 策略 | 延迟影响 | 节能效果 | 适用场景 |
+| :--- | :--- | :--- | :--- |
+| **关闭（Off）** | 零额外延迟 | 无 | 高性能计算、低延迟 NVMe SSD、实时网卡 |
+| **仅 L0s** | 极低（< 1 μs） | 轻度 | 兼顾响应速度与功耗 |
+| **L0s + L1 / L1.2** | 中到高（数 μs–100 μs） | 显著 | 笔记本电脑、移动设备、轻载服务器 |
 
 ---
 
-## FEMU 代码中的 LTSSM 实现
-
-虽然 FEMU 作为虚拟环境不完全模拟物理层，但保留了关键的链路管理接口。
-
-### 链路能力设置
-
-```c
-// hw/pci/pcie.c
-void pcie_cap_fill_link_ep_usp(PCIDevice *dev, uint8_t offset,
-                                uint8_t max_link_speed,
-                                uint8_t max_link_width)
-{
-    uint32_t lnkcap = 0;
-    
-    // 设置最大链路速度
-    lnkcap |= (max_link_speed & PCI_EXP_LNKCAP_SLS);
-    
-    // 设置最大链路宽度
-    lnkcap |= (max_link_width << PCI_EXP_LNKCAP_MLW_SHIFT);
-    
-    // 写入链路能力寄存器
-    pci_set_long(dev->config + offset + PCI_EXP_LNKCAP, lnkcap);
-    
-    // 设置链路状态（模拟已训练完成）
-    uint16_t lnksta = 0;
-    lnksta |= (max_link_speed << PCI_EXP_LNKSTA_CLS_SHIFT);
-    lnksta |= (max_link_width << PCI_EXP_LNKSTA_NLW_SHIFT);
-    lnksta |= PCI_EXP_LNKSTA_DLLLA;  // Data Link Layer Active
-    pci_set_word(dev->config + offset + PCI_EXP_LNKSTA, lnksta);
-}
-```
-
-### ASPM 状态读取
-
-```c
-// hw/pci/pcie.c
-uint8_t pcie_cap_get_aspm_state(PCIDevice *dev)
-{
-    uint32_t pos = pci_find_capability(dev, PCI_CAP_ID_EXP);
-    if (!pos) {
-        return 0;
-    }
-    
-    uint16_t lnkctl = pci_get_word(dev->config + pos + PCI_EXP_LNKCTL);
-    return lnkctl & PCI_EXP_LNKCTL_ASPMC;  // ASPM Control bits
-}
-```
-
-### Linux 内核链路重训练
-
-```c
-// drivers/pci/pcie/portdrv_pci.c
-int pcie_retrain_link(struct pci_dev *pdev)
-{
-    u16 lnkctl;
-    
-    // 读取链路控制寄存器
-    pcie_capability_read_word(pdev, PCI_EXP_LNKCTL, &lnkctl);
-    
-    // 设置重训练位（触发 Recovery）
-    lnkctl |= PCI_EXP_LNKCTL_RL;
-    pcie_capability_write_word(pdev, PCI_EXP_LNKCTL, lnkctl);
-    
-    // 等待训练完成
-    return pcie_wait_for_link_training(pdev);
-}
-```
-
----
-
-## 实用技巧
-
-### 1. 查看链路状态
-
-**使用 lspci 查看当前链路状态**：
+## 常用观测与调试命令
 
 ```bash
-# 查看链路速度和宽度
-lspci -vvv -s 01:00.0 | grep -i "lnk"
+# 1. 查看设备支持的 ASPM 能力及当前开启状态
+lspci -vvv -s 01:00.0 | grep -E "LnkCap|LnkCtl|LnkSta"
 
-输出示例：
-    LnkCap: Port #0, Speed 8GT/s, Width x4, ASPM L0s L1
-    LnkCtl: ASPM L1 Enabled; RCB 64 bytes
-    LnkSta: Speed 8GT/s (ok), Width x4 (ok)
-```
+# 2. 手动触发一次链路重训练（会进入 Recovery 状态，短暂中断链路）
+# 向 Link Control (CAP_EXP + 0x10) 写入 Bit 5 (Retrain Link)
+sudo setpci -s 01:00.0 CAP_EXP+10.w=0x0020
 
-**解读**：
-- `LnkCap`：设备支持的最大能力
-- `LnkCtl`：当前配置的控制参数
-- `LnkSta`：当前实际链路状态
-
-### 2. 调试链路训练问题
-
-**常见问题和解决方案**：
-
-| 现象 | 可能原因 | 调试方法 |
-|------|---------|---------|
-| 链路无法建立 | 硬件连接问题 | 检查 Detect 状态，测量信号完整性 |
-| 速度低于预期 | 信号质量差 | 查看 Recovery 次数，尝试降低插槽位置 |
-| 宽度降级 | Lane 失败 | 检查 Lane Error Status 寄存器 |
-| 频繁 Recovery | 时钟抖动/干扰 | 检查 BER，改善屏蔽和电源 |
-
-**查看 PCIe 错误计数**：
-
-```bash
-# 使用 pcieport 驱动的 AER 统计
-cat /sys/bus/pci/devices/0000:01:00.0/aer_dev_correctable
-cat /sys/bus/pci/devices/0000:01:00.0/aer_dev_fatal
-```
-
-### 3. 优化 ASPM 配置
-
-**性能敏感场景**（如 NVMe SSD）：
-
-```bash
-# 禁用 ASPM 以获得最低延迟
-setpci -s 01:00.0 CAP_EXP+10.w=0x0000
-
-# 或在内核启动参数中
-pcie_aspm=off
-```
-
-**节能场景**（如笔记本电脑）：
-
-```bash
-# 启用全部 ASPM 状态
-echo powersave > /sys/module/pcie_aspm/parameters/policy
-```
-
-### 4. 手动触发链路重训练
-
-**使用 setpci 触发重训练**：
-
-```bash
-# 读取当前链路控制
-setpci -s 01:00.0 CAP_EXP+10.w
-
-# 设置重训练位（Bit 5）
-setpci -s 01:00.0 CAP_EXP+10.w=0x0020
-
-# 注意：重训练会短暂中断链路（<100ms）
-```
-
-### 5. 监控链路稳定性
-
-**实时监控脚本**：
-
-```bash
-#!/bin/bash
-# 监控 PCIe 链路状态
-DEV="01:00.0"
-while true; do
-    lspci -vvv -s $DEV | grep -E "LnkSta|CESta|UESta"
-    sleep 1
-done
+# 3. 检查是否因信号不稳频繁触发 Recovery（查看 AER 可纠正/不可纠正错误）
+lspci -vvv -s 01:00.0 | grep -A6 "Advanced Error Reporting"
 ```
 
 ---
 
-## 实际应用场景
+## 关联与引申概念
 
-### 场景 1：NVMe SSD 热插拔
-
-```
-1. 用户插入 NVMe 设备
-   → LTSSM: Detect (检测到设备)
-   
-2. 链路初始化
-   → LTSSM: Polling (建立比特锁定)
-   → LTSSM: Configuration (协商 x4, Gen3)
-   
-3. 链路激活
-   → LTSSM: L0 (开始数据传输)
-   
-4. 操作系统枚举设备
-   → 加载 NVMe 驱动
-   → 挂载文件系统
-```
-
-### 场景 2：笔记本电脑进入睡眠
-
-```
-1. 用户合上笔记本盖子
-   → 操作系统准备进入 S3 睡眠
-   
-2. 设备驱动保存状态
-   → 发送 PM_Turn_Off 消息
-   
-3. PCIe 设备进入低功耗
-   → LTSSM: L0 → L1 → L2
-   
-4. 系统进入睡眠
-   → 主电源关闭，辅助电源保持
-```
-
-### 场景 3：高速网卡间歇性丢包
-
-```
-问题：网卡间歇性丢包，延迟抖动
-
-诊断：
-1. 检查 ASPM 状态
-   → 发现 L0s 启用，频繁进入/退出
-   
-2. 测量退出延迟
-   → L0s 退出需要 800ns，影响低延迟流量
-   
-解决：
-3. 禁用 ASPM
-   → 性能恢复正常，延迟稳定
-```
-
-### 场景 4：GPU 训练失败
-
-```
-问题：高端 GPU 无法初始化到 Gen4 x16
-
-诊断：
-1. 查看链路状态
-   → 实际：Gen3 x16（低于预期 Gen4）
-   
-2. 检查主板 BIOS
-   → PCIe 插槽配置为 Gen3 最大
-   
-3. 更新 BIOS
-   → 启用 Gen4 支持
-   
-结果：
-4. 重新训练
-   → LTSSM: Recovery.Speed
-   → 成功协商到 Gen4 x16
-```
-
----
-
-## 总结
-
-### 关键要点
-
-1. ✅ **LTSSM 是 PCIe 链路的生命周期管理者**，从检测到正常运行的全流程
-2. ✅ **11 个主要状态**涵盖初始化、运行、省电、恢复
-3. ✅ **Detect → Polling → Configuration → L0** 是标准启动序列
-4. ✅ **L0s 和 L1** 是 ASPM 的核心省电状态
-5. ✅ **Recovery 状态**提供错误恢复和速度切换能力
-6. ✅ **理解 LTSSM** 对诊断链路问题、优化性能至关重要
-
-### LTSSM 与其他层的关系
-
-```
-LTSSM (Physical Layer)
-  ↓ 提供稳定的物理链路
-Data Link Layer
-  ↓ 提供可靠的包传输
-Transaction Layer
-  ↓ 提供事务语义
-Software / Driver
-```
-
----
-
-## 下一步学习
-
-- [链路速度与编码](link-speed-encoding.md) - 8b/10b 和 128b/130b 编码详解
-- [训练序列详解](training-sequences.md) - TS1/TS2 格式和功能
-- [电源管理](../power-management/aspm.md) - ASPM 深度剖析
-- [错误恢复机制](error-recovery.md) - Recovery 状态的详细流程
-- [物理层概览](overview.md) - Physical Layer 整体架构
-
----
-
-## 参考资料
-
-- **规范**：PCIe Base Spec Chapter 4 (Physical Layer Logical)
-- **图表**：Figure 4-12 to 4-14 (LTSSM 状态图)
-- **表格**：Table 4-14 (状态转换条件)
-- **实现**：`/hw/pci/pcie.c` (FEMU)
-- **Linux**：`drivers/pci/pcie/aspm.c` (内核 ASPM 实现)
-
----
-
-**相关页面**：
-- [← 物理层概览](overview.md)
-- [链路速度与编码 →](link-speed-encoding.md)
-- [返回首页](../README.md)
-
----
-
-*最后更新：2026-07-06*
+- **链路训练全流程**：从上电到高速 L0 的分步交互与 TS1/TS2 字段解析，详见 [链路训练过程](link-training.md)。
+- **链路均衡（Link Equalization）**：Gen 3+ 在 `Recovery` 阶段调优 TX/RX 滤波器的过程，详见 [链路均衡](link-equalization.md)。
+- **链路宽度与反转**：`Configuration` 阶段如何协商 x1–x16 宽度及纠正 Lane/极性反转，详见 [链路宽度](link-width.md)。
+- **Retimer**：链路上插入重定时器时，如何透明参与 LTSSM 训练，详见 [Retimer 详解](retimer.md)。
+- **AER（高级错误报告）**：记录物理层 `Receiver Error`、`Bad TLP` 等异常的寄存器机制。

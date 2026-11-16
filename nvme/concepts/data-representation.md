@@ -1,41 +1,55 @@
-# Data Representation
+# 数据表示（Data Representation）
 
-Revision 2.1 defines conventions for encoded counts, units, strings, numeric notation, and byte ordering. Values are 1-based unless a field is explicitly described as 0's based; a 0's-based encoded value `n` represents the quantity `n + 1` and cannot represent zero. [PDF p. 25](../_source/pages/page-025.md)
+NVMe 规范统一规定了数值写法、字节序、计数基数、单位换算和字符串填充方式，确保主机软件与控制器在解析命令、寄存器和日志时不会产生歧义。[PDF 第 25-27 页](../_source/pages/page-025.md)
 
-## Mental model
+## 字节序与字宽
 
-Explanatory little-endian dword view, reconstructed from Figure 3:
+除非规范另有说明（如 Fabrics 中部分网络字段），**所有多字节结构均采用小端字节序（Little-Endian）**——即最低有效字节（LSB）存放在最低内存地址。[PDF 第 27 页](../_source/pages/page-027.md)
 
 ```text
 bit 31                         bit 0
 +--------+--------+--------+--------+
-| byte 3 | byte 2 | byte 1 | byte 0 |
+| byte 3 | byte 2 | byte 1 | byte 0 |   <-- 1 个 dword = 4 字节
 +--------+--------+--------+--------+
    MSB                         LSB
 ```
 
-Unless a structure says otherwise, multi-byte data is little-endian; a word is two bytes, a dword is four bytes, and a qword is four words. [PDF p. 27, Figure 3](../_source/pages/page-027.md)
+- **字（word）** = 2 字节（16 位）
+- **双字（dword）** = 4 字节（32 位）
+- **四字（qword）** = 8 字节（64 位）
+- **保留字段（Reserved）**：写入时必须清零；接收方通常不检查，写入非零保留值会导致未定义行为。
 
-## Numeric and unit conventions
+## 计数约定：1-based vs 0's based
 
-| Form | Convention | Example |
-|---|---|---|
-| Hexadecimal | lower-case `h` suffix; underscore each eight digits when longer | `80h`, `1E_DEADBEEFh` |
-| Binary | lower-case `b` suffix; underscore each four digits when longer | `10b`, `1000_0101b` |
-| Decimal | digits with neither suffix; period decimal separator | `175`, `1.5` |
-| Decimal units | `k`, `M`, `G`, ... use powers of 10 | `k = 10^3` |
-| Binary units | `Ki`, `Mi`, `Gi`, ... use powers of 2 | `Ki = 2^10` |
+- **默认 1-based**：除非字段说明中明确标注，否则计数值直接代表实际数量（例如 `5` 就是 5 个）。
+- **0's based（零基编码）**：编码值 `n` 实际表示的数量为 `n + 1`，**无法表示 0**。常见于队列大小、块数（NLB）、传输 dword 数（NUMD）等“至少为 1”的字段，用来节省 1 个比特位。[PDF 第 25 页](../_source/pages/page-025.md)
+  - 排查“数量总是差 1”的问题时，优先确认该字段是否为 0's based。
 
-The complete decimal/binary unit table extends through `Y = 10^24` and `Yi = 2^80`. [PDF pp. 25-26, Figure 2](../_source/pages/page-025.md) [PDF p. 26](../_source/pages/page-026.md)
+## 数值写法与单位约定
 
-## String rules
+| 类型 | 规范约定 | 示例 | 易错对比 |
+|---|---|---|---|
+| **十六进制** | 小写 `h` 后缀；超 8 位时每 8 位加下划线 | `80h`、`1E_DEADBEEFh` | 规范不用 C 语言的 `0x` 前缀 |
+| **二进制** | 小写 `b` 后缀；超 4 位时每 4 位加下划线 | `10b`、`1000_0101b` | — |
+| **十进制** | 无后缀，小数点用 `.` | `175`、`1.5` | — |
+| **十进制单位** | `k`、`M`、`G` ... `Y`，以 $10^3$ 为底 | `1 KB = 1000 B` | 严格区分 `KB` 与 `KiB` |
+| **二进制单位** | `Ki`、`Mi`、`Gi` ... `Yi`，以 $2^{10}$ 为底 | `1 KiB = 1024 B` | 规范中磁盘容量/页大小多用 `KiB`/`MiB` |
 
-ASCII strings use code values `20h` through `7Eh`; UTF-8 strings use `20h` through `7Eh`, `80h` through `BFh`, and `C2h` through `F4h`. Both are left justified and, unless null-terminated, padded on the right with spaces. Padding after a null-terminated string should use null bytes. [PDF pp. 25-26](../_source/pages/page-025.md) [PDF p. 26](../_source/pages/page-026.md)
+## 字符串与填充规则
 
-An admin label applies one of those string forms to identify a host, NVM subsystem, or namespace, for example by physical location or DNS name. [PDF pp. 27-28](../_source/pages/page-027.md) [PDF p. 28](../_source/pages/page-028.md)
+- **字符集**：ASCII 允许码值 `20h`–`7Eh`；UTF-8 允许 `20h`–`7Eh`、`80h`–`BFh`、`C2h`–`F4h`。[PDF 第 25-26 页](../_source/pages/page-025.md)
+- **对齐与填充**：字符串采用**左对齐（Left Justified）**。若非 null 结尾，右侧统一用空格（`20h`）填充；若以 null 结尾，结束符之后的剩余字节用 `00h` 填充。
+- **管理标签（Admin Label）**：用于以可读字符串（如物理机位或 DNS 名）标识主机、NVM 子系统或命名空间，必须遵循上述字符串规则。[PDF 第 27-28 页](../_source/pages/page-027.md)
 
-## Evidence
+## 关联与引申概念
 
-- [Encoded counts, units, and ASCII rules, PDF p. 25](../_source/pages/page-025.md)
-- [UTF-8, padding, and numeric notation, PDF p. 26](../_source/pages/page-026.md)
-- [Byte/word/dword layout and admin labels, PDF p. 27](../_source/pages/page-027.md)
+- **通用命令格式**：命令双字（CDW0–CDW15）按小端 dword 组织，大量使用 `NUMD` 等 0's based 字段，见 [通用命令格式](common-command-format.md)。
+- **数据指针布局**：PRP 页内偏移依赖 `CC.MPS`（以 `KiB` 等二进制单位计算），见 [数据指针布局](data-pointer-layouts.md)。
+- **控制器特性寄存器**：CAP、CC、CSTS 等寄存器按位编号（bit 0 为 LSB），见 [通用控制器特性](common-controller-features.md)。
+- **命名空间标识符（NSID）**：以 32 位小端无符号整数编码，见 [命名空间标识符](namespace-identifiers.md)。
+
+## 规范依据
+
+- [编码计数、单位（Figure 2）与 ASCII 规则，PDF 第 25 页](../_source/pages/page-025.md)
+- [UTF-8、填充与数值表示法，PDF 第 26 页](../_source/pages/page-026.md)
+- [字节/字/双字布局（Figure 3）与管理标签，PDF 第 27-28 页](../_source/pages/page-027.md)

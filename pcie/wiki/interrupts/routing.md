@@ -1,470 +1,91 @@
-# PCIe 中断路由
+# PCIe 中断路由与亲和性
 
-## 概述
+**PCIe 中断路由决定了设备发出的中断信号如何穿越总线拓扑、硬件中断控制器（IOAPIC / Local APIC）以及虚拟化隔离层（IOMMU），最终精准投递到目标 CPU 核心**。
 
-中断路由决定了设备中断如何从设备传递到 CPU。PCIe 支持三种中断机制（INTx、MSI、MSI-X），每种都有不同的路由方式。
+> **直观类比**：如果中断是一封加急信件，**INTx** 就像寄往“片区总站”（IOAPIC）再由站长查表（`_PRT`）转交；**MSI/MSI-X** 就像在信封上直接写明了收件人门牌号（目标 CPU 的 Local APIC ID），直达本人；而开启**中断重映射（Interrupt Remapping）**则相当于在大楼入口加装了智能门禁（IOMMU），既能防止伪造信件攻击，又能把寄给虚拟机的信件直接转进对应的虚拟房间（vCPU）。
 
-## 中断路由架构
+---
 
-### 整体架构
-
-```
-设备层
-  ├── INTx 消息
-  ├── MSI 内存写
-  └── MSI-X 内存写
-      ↓
-Root Complex
-  ├── INTx → IOAPIC/PIC
-  ├── MSI → LAPIC
-  └── MSI-X → LAPIC
-      ↓
-中断控制器 (APIC)
-  ├── Local APIC (每个 CPU)
-  └── I/O APIC (系统)
-      ↓
-CPU 中断处理
-```
-
-## INTx 路由
-
-### 路由表 (_PRT)
-
-ACPI _PRT 方法定义 INTx 路由：
+## 1. 中断路由整体架构
 
 ```
-设备地址 + 中断引脚 → IRQ 号
-
-示例：
-Device 0x1C (Bridge)
-  INTA# → IRQ 16
-  INTB# → IRQ 17
-  INTC# → IRQ 18
-  INTD# → IRQ 19
-
-Device 0x00 (下游设备)
-  INTA# → IRQ 16 (与 Bridge 共享)
+PCIe 设备
+  ├── [INTx]      ──▶ Assert_INTx Msg TLP ──▶ Root Complex ──▶ IOAPIC (查 RTE 表) ──┐
+  │                                                                                  ▼
+  └── [MSI/MSI-X] ──▶ Posted MemWr TLP ──────▶ Root Complex ──▶ [IOMMU 重映射?] ──▶ Local APIC ──▶ CPU 核心
+                      (0xFEExxxxx)                              (可选，VT-d/AMD-Vi)
 ```
 
-### 内核实现
+- **IOAPIC（I/O 高级可编程中断控制器）**：负责接收传统物理/模拟中断线（INTx），通过内部的**重定向表项（RTE）**将其转换为中断向量并转发给指定 CPU 的 Local APIC。
+- **Local APIC（本地 APIC）**：每个 CPU 核心内置的中断接收单元。MSI/MSI-X 写往 `0xFEExxxxx` 的内存写请求会被 Root Complex 直接路由到目标核心的 Local APIC，绕过 IOAPIC。
 
-```c
-// 查询 ACPI 路由表
-static int query_acpi_prt(struct pci_dev *pdev)
-{
-    acpi_handle handle;
-    struct acpi_prt_entry *entry;
-    u8 pin;
-    int irq;
-    
-    // 读取 Interrupt Pin
-    pci_read_config_byte(pdev, PCI_INTERRUPT_PIN, &pin);
-    if (pin == 0)
-        return -EINVAL;
-    
-    // 获取 ACPI handle
-    handle = ACPI_HANDLE(&pdev->dev);
-    
-    // 查询 _PRT
-    entry = acpi_pci_irq_lookup(pdev, pin - 1);
-    if (!entry) {
-        dev_err(&pdev->dev, "No _PRT entry found\n");
-        return -ENODEV;
-    }
-    
-    irq = entry->index;
-    
-    // 写入 Interrupt Line
-    pci_write_config_byte(pdev, PCI_INTERRUPT_LINE, irq);
-    
-    dev_info(&pdev->dev, "INT%c# routed to IRQ %d\n",
-             'A' + pin - 1, irq);
-    
-    return irq;
-}
-```
+---
 
-## MSI/MSI-X 路由
+## 2. INTx 路由：ACPI `_PRT` 与 IOAPIC
 
-### 地址映射
+由于 INTx 消息里只包含设备地址（BDF）和引脚编号（INTA#–INTD#），系统需要通过两级映射找到目标 CPU：
+
+1. **ACPI `_PRT`（PCI Routing Table）**：主板固件（BIOS/UEFI）在 ACPI 表中声明“某条总线上的哪个设备、哪根引脚对应系统中的哪个全局中断号（GSI / IRQ）”。
+2. **IOAPIC RTE（Redirection Table Entry）**：OS 内核读取 `_PRT` 后配置 IOAPIC 的对应表项，指定该 IRQ 的触发方式（PCIe INTx 必须为 **Level-Triggered 电平触发、Active-Low 低电平有效**）、分配的中断向量号以及目标 CPU 的 APIC ID。
+
+---
+
+## 3. MSI / MSI-X 路由：Local APIC 直接寻址
+
+MSI 和 MSI-X 不经过 `_PRT` 和 IOAPIC，路由信息直接编码在设备的配置空间（MSI）或 BAR 内存表（MSI-X）中：
+
+- **Message Address（x86/x64）**：`0xFEE00000 | (Destination_APIC_ID << 12)`，其中的 `Destination ID` 直接指明接收该中断的 CPU 核心。
+- **Message Data**：低 8 位存放 CPU 中断向量号（`0x20–0xFF`），投递模式通常为 `Fixed`（`000b`），触发模式为 `Edge`（边沿触发）。
+
+---
+
+## 4. 中断重映射（Interrupt Remapping）与虚拟化
+
+在现代服务器与虚拟化环境中，设备直接向 `0xFEExxxxx` 写任意地址会带来安全与隔离隐患。开启 **IOMMU（Intel VT-d / AMD-Vi）** 的中断重映射后，硬件会在 Root Complex 处拦截所有 MSI/MSI-X 写请求：
 
 ```
-MSI/MSI-X Message Address 格式 (x86):
-
-0xFEE00000 + [Destination ID] + [Flags]
-
-示例：
-目标 CPU 0 (APIC ID = 0):
-  Address = 0xFEE00000
-
-目标 CPU 4 (APIC ID = 4):
-  Address = 0xFEE04000
-
-Message Data:
-  Vector = 中断向量号 (0-255)
-  Delivery Mode = 通常是 Fixed (000)
+物理/直通设备 ──(Remapped MSI: Handle 索引)──▶ IOMMU 查 IRTE 表 ──(真实 Vector + 目标 pCPU)──▶ Local APIC
 ```
 
-### 内核分配
+- **安全隔离**：设备不再能自行指定目标 CPU 和向量号，只能携带一个受控的 **Handle（索引）**；IOMMU 根据内核维护的 **IRTE（Interrupt Remapping Table Entry）** 翻译出真正的物理目标，防止恶意设备或故障固件向系统注入伪造中断。
+- **虚拟化直通与 Posted Interrupts**：当 PCIe 设备直通（VFIO）给虚拟机时，结合硬件 **Posted Interrupts** 技术，IOMMU 可将设备中断直接写入虚拟机的内存描述符并注入正在运行的 vCPU，无需触发昂贵的 VM-Exit 陷入 Hypervisor 转发。
 
-```c
-// 为 MSI 分配地址和向量
-static int allocate_msi_vector(struct pci_dev *pdev, int vector_index)
-{
-    struct msi_desc *desc;
-    struct msi_msg msg;
-    int vector;
-    
-    // 分配中断向量
-    vector = alloc_interrupt_vector();
-    
-    // 构造 MSI Message
-    msg.address_hi = 0;
-    msg.address_lo = 0xFEE00000;  // APIC base
-    
-    // 设置目标 CPU (Destination ID)
-    int cpu = vector_index % num_online_cpus();
-    int apic_id = per_cpu(x86_cpu_to_apicid, cpu);
-    msg.address_lo |= (apic_id << 12);
-    
-    // 设置 Message Data
-    msg.data = vector;  // 中断向量
-    msg.data |= (0 << 8);  // Delivery Mode: Fixed
-    
-    // 写入设备配置
-    write_msi_msg(pdev, &msg);
-    
-    dev_info(&pdev->dev,
-             "MSI vector %d: addr=0x%08x data=0x%04x CPU=%d\n",
-             vector_index, msg.address_lo, msg.data, cpu);
-    
-    return vector;
-}
-```
+---
 
-## IOAPIC 路由
+## 5. 中断亲和性与多队列负载均衡
 
-### IOAPIC 架构
+合理规划中断路由对高吞吐存储和网络设备至关重要：
 
-```
-Legacy 设备 → IOAPIC → Local APIC → CPU
+- **CPU 亲和性（IRQ Affinity）**：对于支持 MSI-X 的设备，OS 可将每个队列的 MSI-X Table Entry 指向不同的 CPU 核心（例如 NVMe `Queue i → CPU i`），使 I/O 提交与完成中断落在同一个核心上，最大化 L1/L2 缓存命中率。
+- **NUMA 感知**：在多路服务器上，应优先将 PCIe 设备的中断绑定到该设备物理直连的 **NUMA 节点** 内的 CPU 核心上，避免跨插槽通信延迟。
+- **网卡 RSS（Receive Side Scaling）**：网卡硬件根据数据包的五元组哈希值将不同流分散到多个接收队列，再配合每个队列独立的 MSI-X 中断路由到不同 CPU，实现多核线性扩展。
+- **自动均衡（`irqbalance`）**：通用服务器常运行 `irqbalance` 守护进程动态调整各 IRQ 的亲和性；但在超低延迟或高性能存储调优场景下，通常会关闭 `irqbalance` 并手动静态绑核。
 
-IOAPIC 重定向表项 (RTE):
-+-------+--------+--------+--------+
-| Vector| Dest  | Mode   | Status |
-| 8-bit | 8-bit | 3-bit  | 2-bit  |
-+-------+--------+--------+--------+
+---
 
-示例配置：
-IRQ 16:
-  Vector = 0x30 (48)
-  Destination = 0x00 (CPU 0)
-  Delivery Mode = 000 (Fixed)
-  Trigger = Level
-```
-
-### 配置 IOAPIC
-
-```c
-// 配置 IOAPIC RTE
-void setup_ioapic_routing(int irq, int vector, int dest_cpu)
-{
-    struct io_apic_irq_attr attr;
-    int apic_id = per_cpu(x86_cpu_to_apicid, dest_cpu);
-    
-    attr.ioapic = 0;  // 第一个 IOAPIC
-    attr.pin = irq;
-    attr.trigger = IOAPIC_LEVEL;  // Level-triggered
-    attr.polarity = IOAPIC_POL_LOW;  // Active low
-    
-    // 设置 RTE
-    io_apic_set_pci_routing(&attr, irq, vector, apic_id);
-    
-    pr_info("IRQ %d → Vector %d → CPU %d (APIC %d)\n",
-            irq, vector, dest_cpu, apic_id);
-}
-```
-
-## 中断亲和性
-
-### CPU 亲和性设置
-
-```c
-// 设置中断亲和性
-static void set_interrupt_affinity(struct pci_dev *pdev, int vector, int cpu)
-{
-    int irq = pci_irq_vector(pdev, vector);
-    const struct cpumask *mask = cpumask_of(cpu);
-    
-    // 设置硬件亲和性
-    irq_set_affinity_hint(irq, mask);
-    
-    // 强制设置（需要权限）
-    irq_set_affinity(irq, mask);
-    
-    dev_info(&pdev->dev, "IRQ %d pinned to CPU %d\n", irq, cpu);
-}
-
-// 按 NUMA 节点分配
-static void distribute_irqs_by_numa(struct pci_dev *pdev, int nvec)
-{
-    int node = dev_to_node(&pdev->dev);
-    const struct cpumask *node_cpus = cpumask_of_node(node);
-    int cpu, i = 0;
-    
-    for_each_cpu(cpu, node_cpus) {
-        if (i >= nvec)
-            break;
-        
-        set_interrupt_affinity(pdev, i, cpu);
-        i++;
-    }
-}
-```
-
-### 自动负载均衡
+## 6. 实用 CLI 调试命令
 
 ```bash
-# 启用 irqbalance 服务
-systemctl start irqbalance
+# 1. 查看各中断号的触发次数、控制器类型（IO-APIC vs IR-PCI-MSI）及 CPU 分布
+cat /proc/interrupts | grep -E "CPU0|nvme|eth"
 
-# 配置策略
-# /etc/sysconfig/irqbalance
-IRQBALANCE_ONESHOT=0
-IRQBALANCE_BANNED_CPUS=
+# 2. 查看并手动修改某个 IRQ 的 CPU 亲和性（示例：将 IRQ 130 绑定到 CPU 2）
+cat /proc/irq/130/smp_affinity_list
+echo 2 | sudo tee /proc/irq/130/smp_affinity_list
 
-# 查看当前分配
-cat /proc/irq/*/smp_affinity_list
+# 3. 实时监控中断分布是否均衡
+watch -n 1 'cat /proc/interrupts | grep nvme'
 ```
 
-## 中断重映射 (Interrupt Remapping)
+> **提示**：在 `/proc/interrupts` 中看到 `IR-PCI-MSI` 前缀，说明系统已启用 **Interrupt Remapping（IR）**；若看到 `IO-APIC` 且带 `fasteoi`，则说明该设备正在使用共享的 Legacy INTx。
 
-### VT-d 中断重映射
+---
 
-```
-传统路由：
-设备 → [MSI Addr/Data] → APIC → CPU
+## 关联与引申概念
 
-中断重映射：
-设备 → [Remapped Addr/Data] → VT-d → [Real Addr/Data] → APIC → CPU
-
-优势：
-- 安全性：设备不能直接指定任意地址
-- 灵活性：软件可以动态重映射
-- 虚拟化：支持设备直通
-```
-
-### 重映射配置
-
-```c
-// Intel VT-d 中断重映射
-struct irte {
-    u64 present     : 1;
-    u64 fpd         : 1;  // Fault Processing Disable
-    u64 dst_mode    : 1;  // Destination Mode
-    u64 rh          : 1;  // Redirection Hint
-    u64 tm          : 1;  // Trigger Mode
-    u64 dlvry_mode  : 3;  // Delivery Mode
-    u64 avail       : 4;
-    u64 reserved    : 3;
-    u64 irte_mode   : 1;
-    u64 vector      : 8;
-    u64 reserved2   : 8;
-    u64 dest_id     : 32;
-};
-
-// 配置 IRTE
-static int setup_irte(struct intel_iommu *iommu,
-                       int index, struct irte *irte)
-{
-    struct irq_2_iommu *irq_iommu;
-    
-    // 分配 IRTE 索引
-    irq_iommu = alloc_irte(iommu, index);
-    
-    // 配置 IRTE
-    irte->present = 1;
-    irte->dst_mode = 0;  // Physical
-    irte->tm = 0;        // Edge
-    irte->dlvry_mode = 0;  // Fixed
-    irte->vector = 0x30;  // 中断向量
-    irte->dest_id = 0;    // CPU 0
-    
-    // 写入 IRTE 表
-    write_irte(iommu, index, irte);
-    
-    return 0;
-}
-```
-
-## 多队列中断分发
-
-### 队列与 CPU 绑定
-
-```c
-// NVMe 多队列中断分发示例
-static int nvme_setup_irq_distribution(struct nvme_dev *dev)
-{
-    int nr_queues = dev->online_queues;
-    int nr_cpus = num_online_cpus();
-    int i;
-    
-    // 为每个队列分配中断向量
-    for (i = 0; i < nr_queues; i++) {
-        int cpu = i % nr_cpus;
-        int vector = i;
-        
-        // 设置亲和性
-        set_interrupt_affinity(dev->pdev, vector, cpu);
-        
-        // 配置队列
-        dev->queues[i]->cpu = cpu;
-        dev->queues[i]->vector = vector;
-        
-        dev_info(&dev->pdev->dev,
-                 "Queue %d → Vector %d → CPU %d\n",
-                 i, vector, cpu);
-    }
-    
-    return 0;
-}
-```
-
-### RSS (Receive Side Scaling)
-
-```c
-// 网卡 RSS 配置
-struct rss_config {
-    u32 hash_key[10];  // 320-bit key
-    u8  indirection_table[128];  // CPU 映射表
-    u32 hash_types;    // 启用的哈希类型
-};
-
-static void configure_rss(struct net_device *netdev, int num_queues)
-{
-    struct rss_config rss;
-    int i;
-    
-    // 生成随机哈希密钥
-    netdev_rss_key_fill(rss.hash_key, sizeof(rss.hash_key));
-    
-    // 配置间接表（轮询分配到队列）
-    for (i = 0; i < 128; i++) {
-        rss.indirection_table[i] = i % num_queues;
-    }
-    
-    // 启用哈希类型
-    rss.hash_types = RSS_HASH_TYPE_TCP_IPV4 |
-                     RSS_HASH_TYPE_TCP_IPV6 |
-                     RSS_HASH_TYPE_UDP_IPV4 |
-                     RSS_HASH_TYPE_UDP_IPV6;
-    
-    // 写入硬件
-    write_rss_config(netdev, &rss);
-}
-```
-
-## 虚拟化中的中断路由
-
-### 设备直通
-
-```
-Guest VM 中的中断路由：
-
-VM 中的设备 → VT-d 重映射 → Host APIC → vCPU
-
-Posted Interrupts (Posted-interrupt processing):
-1. 设备产生中断
-2. VT-d 将中断记录到 Posted Interrupt Descriptor
-3. 发送通知向量到 pCPU
-4. pCPU 在 VM-Entry 时注入中断到 vCPU
-```
-
-### VFIO 中断路由
-
-```c
-// VFIO 设备中断配置
-static int vfio_pci_set_msi_trigger(struct vfio_pci_device *vdev,
-                                     int index, int start, int count)
-{
-    struct vfio_irq_set *hdr;
-    int *fds;
-    int i, ret;
-    
-    // 分配 eventfd
-    fds = kmalloc_array(count, sizeof(int), GFP_KERNEL);
-    
-    for (i = 0; i < count; i++) {
-        // 创建 eventfd
-        fds[i] = eventfd_create(0, EFD_CLOEXEC);
-        
-        // 配置 MSI-X
-        ret = vfio_msi_set_vector_signal(vdev, start + i, fds[i]);
-        if (ret)
-            goto err_cleanup;
-    }
-    
-    return 0;
-
-err_cleanup:
-    while (--i >= 0)
-        eventfd_ctx_put(eventfd_ctx_fdget(fds[i]));
-    kfree(fds);
-    return ret;
-}
-```
-
-## 调试和监控
-
-### 查看中断路由
-
-```bash
-# 查看中断路由表
-cat /proc/interrupts
-
-# 查看特定设备的中断
-lspci -vv -s 01:00.0 | grep "Interrupt:"
-
-# 查看 IOAPIC 配置
-cat /proc/ioapic
-
-# 查看 MSI/MSI-X 路由
-cat /sys/kernel/debug/pci/0000:01:00.0/msi_irqs
-```
-
-### 性能分析
-
-```bash
-# 中断统计
-perf stat -e irq:* -a sleep 10
-
-# 中断延迟
-trace-cmd record -e irq_handler_entry -e irq_handler_exit
-
-# 中断不均衡检测
-watch -n 1 'cat /proc/interrupts | grep mydriver'
-```
-
-## 最佳实践
-
-1. **MSI-X 优先**：提供最好的性能和灵活性
-2. **CPU 亲和性**：绑定中断到特定 CPU 提高缓存命中率
-3. **NUMA 感知**：将中断路由到设备所在的 NUMA 节点
-4. **负载均衡**：使用 irqbalance 或手动分配
-5. **避免中断风暴**：合理配置中断合并
-
-## 总结
-
-PCIe 中断路由的关键点：
-
-1. **三种机制**：INTx（IOAPIC）、MSI/MSI-X（LAPIC）
-2. **地址映射**：MSI 通过特殊地址直接写 APIC
-3. **亲和性控制**：将中断绑定到特定 CPU
-4. **中断重映射**：VT-d 提供安全和灵活性
-5. **多队列支持**：RSS、多队列网卡/存储
-
-参见：
-- [中断概述](overview.md)
-- [MSI 详解](msi.md)
-- [MSI-X 详解](msix.md)
-- [Legacy INTx](intx.md)
+| 概念 | 简要说明 | 相关文档 |
+|------|----------|----------|
+| **PCIe 中断概述** | 总结 INTx、MSI、MSI-X 三代中断机制的原理差异与选型策略。 | [中断机制概述](overview.md) |
+| **Legacy INTx** | 依赖 ACPI `_PRT` 与 IOAPIC 路由的共享电平模拟中断。 | [Legacy INTx 详解](intx.md) |
+| **MSI / MSI-X** | 通过 `0xFEExxxxx` Posted 写事务直接路由到 Local APIC。 | [MSI 详解](msi.md) · [MSI-X 详解](msix.md) |
+| **ACS / SR-IOV（IOMMU 隔离）** | 虚拟化直通时与中断重映射配合使用，确保 DMA 与 P2P 流量的安全隔离。 | [扩展能力详解](../configuration/extended-capabilities.md) |

@@ -1,399 +1,173 @@
-# PCIe 配置空间头部类型
+# PCIe 配置空间头部类型（Type 0 vs Type 1）
 
-## 概述
+**PCIe 配置空间的前 64 字节（`0x00–0x3F`）称为配置空间头部（Header）**，根据设备在总线拓扑中扮演的角色不同，分为 **Type 0（端点设备）** 和 **Type 1（桥接设备）** 两种格式。
 
-PCIe 配置空间的前 64 字节称为配置空间头部（Configuration Space Header），定义了设备的基本标识和控制信息。根据设备类型不同，头部分为两种格式：
+> **直观类比**：如果把 PCIe 树比作城市交通网，**Type 0** 就像终点站或商店（NVMe SSD、网卡、显卡），关心的是“自己占多大一块地皮（BAR）”；**Type 1** 就像立交桥或路由器（Root Port、Switch Port），关心的是“下游连着哪几条路（总线号范围）以及哪些地址的车辆该往桥下放行（地址窗口）”。
 
-- **Type 0 Header**：用于 PCIe 端点设备（Endpoint）
-- **Type 1 Header**：用于 PCIe 桥接设备（Bridge/Switch）
+---
 
-头部类型由配置空间偏移 0x0E 处的 Header Type 字段标识。
+## 1. 通用头部（前 16 字节，0x00–0x0F）
 
-## 通用头部字段（前 16 字节）
+无论 Type 0 还是 Type 1，前 16 字节布局完全一致，核心在于偏移 `0x0E` 的 **Header Type** 字段：
 
-无论 Type 0 还是 Type 1，配置空间的前 16 字节（0x00-0x0F）格式相同：
+| 偏移 | 位宽 | 字段 | 说明 |
+|------|------|------|------|
+| `0x00` | 16b | **Vendor ID** | 厂商 ID（全 `0xFFFF` 表示设备不存在） |
+| `0x02` | 16b | **Device ID** | 设备型号 ID |
+| `0x04` | 16b | **Command** | 设备控制开关（Memory Space、Bus Master、INTx Disable） |
+| `0x06` | 16b | **Status** | 设备状态（Bit 4 指示是否存在 Capability 链表） |
+| `0x08` | 8b | **Revision ID** | 硬件修订版本号 |
+| `0x09` | 24b | **Class Code** | 设备分类（如 `0x010802` 为 NVMe，`0x060400` 为 PCI-to-PCI Bridge） |
+| `0x0C` | 8b | **Cache Line Size** | 缓存行大小 |
+| `0x0D` | 8b | **Latency Timer** | 传统 PCI 延迟计时器（PCIe 中保留为 0） |
+| `0x0E` | 8b | **Header Type** | **Bit 7**：`1`=多功能设备；**Bits 6:0**：`0x00`=Type 0，`0x01`=Type 1 |
+| `0x0F` | 8b | **BIST** | 内建自检（Built-In Self Test） |
 
-```
-Offset  Bits    字段名称              描述
-------  ----    ----------------      ------------------------------------
-0x00    15:0    Vendor ID             厂商标识（由 PCI-SIG 分配）
-0x02    15:0    Device ID             设备标识（厂商自定义）
-0x04    15:0    Command               命令寄存器
-0x06    15:0    Status                状态寄存器
-0x08    7:0     Revision ID           版本号
-0x09    23:0    Class Code            类代码（基类/子类/接口）
-0x0C    7:0     Cache Line Size       缓存行大小
-0x0D    7:0     Latency Timer         延迟计时器（PCIe 中保留）
-0x0E    7:0     Header Type           头部类型
-0x0F    7:0     BIST                  内建自检
-```
+> **多功能设备（Multi-Function）**：当 `Header Type` 的 **Bit 7 = 1** 时，操作系统会继续扫描同一 Device 下的 `Function 1 ~ 7`（例如一张网卡同时暴露网口 Func 0 和存储 Func 1，或支持 **ARI** 时扩展到 256 个 Function）。
 
-### Header Type 字段解析
+---
 
-```
-Bit 7: Multi-Function Device
-       0 = 单功能设备
-       1 = 多功能设备
+## 2. Type 0 Header（端点设备）
 
-Bits 6:0: Header Layout
-       0x00 = Type 0 (Endpoint)
-       0x01 = Type 1 (Bridge)
-       0x02 = CardBus Bridge（已废弃）
-```
-
-## Type 0 Header（端点设备）
-
-Type 0 头部用于所有端点设备，包括 NVMe SSD、网卡、显卡等。完整布局如下：
+所有终端功能设备（Endpoint，包括 NVMe SSD、GPU、网卡）均使用 Type 0 头部，最大特点是拥有 **6 个 BAR 槽位（`0x10–0x27`）**：
 
 ```
-+--------+--------+--------+--------+
-|   Device ID     |   Vendor ID     | 0x00
-+--------+--------+--------+--------+
-|     Status      |     Command     | 0x04
-+--------+--------+--------+--------+
-|        Class Code        | Rev ID | 0x08
-+--------+--------+--------+--------+
-| BIST   |Header T|Lat Tmr |CchLine | 0x0C
-+--------+--------+--------+--------+
-|       Base Address 0 (BAR0)       | 0x10
-+-----------------------------------+
-|       Base Address 1 (BAR1)       | 0x14
-+-----------------------------------+
-|       Base Address 2 (BAR2)       | 0x18
-+-----------------------------------+
-|       Base Address 3 (BAR3)       | 0x1C
-+-----------------------------------+
-|       Base Address 4 (BAR4)       | 0x20
-+-----------------------------------+
-|       Base Address 5 (BAR5)       | 0x24
-+-----------------------------------+
-|       CardBus CIS Pointer         | 0x28
-+--------+--------+--------+--------+
-| Subsystem Dev ID| Subsys Vend ID  | 0x2C
-+--------+--------+--------+--------+
-|   Expansion ROM Base Address      | 0x30
-+--------+--------+--------+--------+
-|     Reserved    |Capab Ptr|Reserv | 0x34
-+--------+--------+--------+--------+
-|            Reserved               | 0x38
-+--------+--------+--------+--------+
-|Max Lat |Min Gnt |Int Pin |Int Line| 0x3C
-+--------+--------+--------+--------+
+  0x00 ┌─────────────────┬─────────────────┐
+       │   Vendor ID     │    Device ID    │
+  0x04 ├─────────────────┼─────────────────┤
+       │     Command     │     Status      │
+  0x08 ├───────┬─────────┴─────────────────┤
+       │Rev ID │        Class Code         │
+  0x0C ├───────┼───────┬───────────┬───────┤
+       │CacheL │Lat Tmr│Header=0x00│ BIST  │
+  0x10 ├───────┴───────┴───────────┴───────┤
+       │              BAR 0                │
+  0x14 │              BAR 1                │  6 个 BAR（32-bit 占 1 个，
+  0x18 │              BAR 2                │  64-bit 占连续 2 个）
+  0x1C │              BAR 3                │
+  0x20 │              BAR 4                │
+  0x24 │              BAR 5                │
+  0x28 ├───────────────────────────────────┤
+       │        CardBus CIS Pointer        │
+  0x2C ├─────────────────┬─────────────────┤
+       │Subsys Vendor ID │ Subsys Device ID│  区分不同板卡 OEM 厂商
+  0x30 ├─────────────────┴─────────────────┤
+       │     Expansion ROM Base Address    │
+  0x34 ├───────┬───────────────────────────┤
+       │Cap Ptr│         Reserved          │  传统 Capability 链表入口
+  0x38 ├───────┴───────────────────────────┤
+       │             Reserved              │
+  0x3C ├───────┬───────┬─────────┬─────────┤
+       │IntLine│IntPin │ Min_Gnt │ Max_Lat │  IntPin: 0=无, 1~4=INTA~INTD
+  0x40 └───────┴───────┴─────────┴─────────┘
 ```
 
-### Type 0 关键字段详解
+- **BAR0–BAR5**：用于将设备控制寄存器或缓冲区映射到系统内存空间（详见 [BAR 详解](bars.md)）。
+- **Subsystem IDs（`0x2C`）**：同一颗主控芯片（Vendor/Device ID 相同），不同板卡厂商（如 Dell、Samsung OEM）通过 Subsystem ID 区分。
+- **Interrupt Pin（`0x3D`）**：指示设备使用哪条传统中断线（`1=INTA# ~ 4=INTD#`，`0` 表示不用 INTx）。
 
-#### Base Address Registers (BARs)
+---
 
-Type 0 提供 6 个 BAR（0x10-0x27），用于映射设备内存和 I/O 空间：
+## 3. Type 1 Header（桥接设备）
 
-**BAR 格式 - 内存空间：**
-```
-Bit 0:     0 (表示内存空间)
-Bit 2:1:   类型
-           00 = 32-bit 地址
-           10 = 64-bit 地址
-Bit 3:     Prefetchable
-           0 = Non-prefetchable
-           1 = Prefetchable
-Bits 31:4: Base Address（16-byte 对齐）
-```
-
-**BAR 格式 - I/O 空间：**
-```
-Bit 0:     1 (表示 I/O 空间)
-Bit 1:     保留
-Bits 31:2: Base Address（4-byte 对齐）
-```
-
-**64-bit BAR 示例：**
-```
-BAR0: 0xFFFFFFF0  ← 低 32 位（bit 2:1 = 10 表示 64-bit）
-BAR1: 0x00000001  ← 高 32 位
-完整地址: 0x1_FFFFFFF0
-```
-
-#### Subsystem IDs（0x2C-0x2F）
-
-子系统标识允许板卡厂商标识其产品：
-- **Subsystem Vendor ID**：板卡制造商（如 ASUS、MSI）
-- **Subsystem Device ID**：具体板卡型号
-
-例如：NVIDIA GPU 芯片相同，但不同厂商的显卡有不同的子系统 ID。
-
-#### Capabilities Pointer（0x34）
-
-指向配置空间中第一个 Capability 结构的偏移地址（见 capabilities.md）。
-
-#### Interrupt Pin/Line（0x3C-0x3D）
-
-- **Interrupt Line**：传统 PCI 使用，PCIe 中无意义
-- **Interrupt Pin**：
-  - 0x00 = 不使用 INTx 中断
-  - 0x01-0x04 = INTA/INTB/INTC/INTD
-
-## Type 1 Header（桥接设备）
-
-Type 1 头部用于 PCIe Switch、Root Port 等桥接设备，负责连接多个 PCIe 总线：
+Root Port、PCIe Switch 的上下游端口以及 PCIe-to-PCI 桥使用 Type 1 头部。它只有 2 个 BAR（`0x10–0x17`），其余空间用来管理**下游总线号**和**地址转发窗口**：
 
 ```
-+--------+--------+--------+--------+
-|   Device ID     |   Vendor ID     | 0x00
-+--------+--------+--------+--------+
-|     Status      |     Command     | 0x04
-+--------+--------+--------+--------+
-|        Class Code        | Rev ID | 0x08
-+--------+--------+--------+--------+
-| BIST   |Header T|Lat Tmr |CchLine | 0x0C
-+--------+--------+--------+--------+
-|       Base Address 0 (BAR0)       | 0x10
-+-----------------------------------+
-|       Base Address 1 (BAR1)       | 0x14
-+-----------------------------------+
-|Sec Lat |Subord# |Second# |Primary#| 0x18
-+--------+--------+--------+--------+
-|  Sec Status     |IO Limit|IO Base | 0x1C
-+--------+--------+--------+--------+
-|  Memory Limit   |   Memory Base   | 0x20
-+--------+--------+--------+--------+
-|Prefetch Mem Lim |Prefetch Mem Base| 0x24
-+--------+--------+--------+--------+
-|  Prefetch Base Upper 32 bits      | 0x28
-+-----------------------------------+
-|  Prefetch Limit Upper 32 bits     | 0x2C
-+-----------------------------------+
-| IO Limit Upper  | IO Base Upper   | 0x30
-+--------+--------+--------+--------+
-|     Reserved    |Capab Ptr|Reserv | 0x34
-+-----------------------------------+
-|   Expansion ROM Base Address      | 0x38
-+--------+--------+--------+--------+
-|  Bridge Control | Int Pin|Int Line| 0x3C
-+--------+--------+--------+--------+
+  0x00~0x0F  [通用 16 字节头部，Header Type = 0x01]
+  0x10 ├───────────────────────────────────┤
+       │              BAR 0                │  桥设备自身寄存器（可选，通常不用）
+  0x14 │              BAR 1                │
+  0x18 ├────────┬────────┬────────┬────────┤
+       │Primary │Secondry│Subordnt│Sec Lat │  总线号三元组（决定拓扑范围）
+  0x1C ├────────┼────────┼────────┴────────┤
+       │IO Base │IO Limit│   Sec Status    │  I/O 转发窗口
+  0x20 ├────────┴────────┼─────────────────┤
+       │   Memory Base   │  Memory Limit   │  32-bit 非预取内存窗口
+  0x24 ├─────────────────┼─────────────────┤
+       │Prefetch Mem Base│Prefetch Mem Lim │  64-bit 可预取内存窗口（低位）
+  0x28 ├─────────────────┴─────────────────┤
+       │    Prefetch Base Upper 32 bits    │  64-bit 可预取内存窗口（高 32 位）
+  0x2C ├───────────────────────────────────┤
+       │    Prefetch Limit Upper 32 bits   │
+  0x30 ├─────────────────┬─────────────────┤
+       │ IO Base Upper   │ IO Limit Upper  │
+  0x34 ├────────┬────────┴─────────────────┤
+       │Cap Ptr │         Reserved         │
+  0x38 ├────────┴──────────────────────────┤
+       │    Expansion ROM Base Address     │
+  0x3C ├────────┬────────┬─────────────────┤
+       │IntLine │IntPin  │ Bridge Control  │  含 Secondary Bus Reset (Bit 6)
+  0x40 └────────┴────────┴─────────────────┘
 ```
 
-### Type 1 关键字段详解
+### 3.1 总线号三元组（`0x18–0x1A`）
 
-#### 总线编号（0x18-0x1A）
+PCIe 拓扑是树形结构，每个 Type 1 桥接器用三个编号界定自己管辖的子树范围：
 
-```
-Primary Bus Number (0x18):
-    桥接器主端总线号（上游总线）
-
-Secondary Bus Number (0x19):
-    桥接器次端总线号（下游总线起始）
-
-Subordinate Bus Number (0x1A):
-    下游总线范围的最大编号
-```
-
-**总线拓扑示例：**
-```
-                  Bus 0
-                    |
-              [Root Port]
-         Primary=0, Secondary=1, Subordinate=10
-                    |
-                  Bus 1
-                    |
-               [Switch]
-         Primary=1, Secondary=2, Subordinate=10
-                /       \
-            Bus 2       Bus 5
-             |           |
-        [Endpoint]   [Endpoint]
-```
-
-#### 内存/IO 窗口
-
-桥接器使用 Base/Limit 寄存器定义地址转发范围：
-
-**内存窗口（0x20-0x23）：**
-```
-Memory Base (0x20):    起始地址 [31:20]，低 20 位为 0
-Memory Limit (0x22):   结束地址 [31:20]，低 20 位为 0xFFFFF
-
-示例：
-  Memory Base  = 0xF000  → 0xF0000000
-  Memory Limit = 0xF7FF  → 0xF7FFFFFF
-  转发范围：0xF0000000 - 0xF7FFFFFF（128MB）
-```
-
-**Prefetchable 内存窗口（0x24-0x2F）：**
-
-支持 64-bit 地址，由 4 个寄存器组成：
-- Prefetchable Memory Base (0x24)
-- Prefetchable Memory Limit (0x26)
-- Prefetchable Base Upper 32 bits (0x28)
-- Prefetchable Limit Upper 32 bits (0x2C)
-
-**I/O 窗口（0x1C, 0x30-0x33）：**
-
-PCIe 中通常不使用，但为兼容性保留。
-
-#### Bridge Control（0x3E-0x3F）
-
-桥接器控制寄存器：
+- **Primary Bus Number（`0x18`）**：桥接器上游连接的总线号。
+- **Secondary Bus Number（`0x19`）**：桥接器下游直接连出的总线号。
+- **Subordinate Bus Number（`0x1A`）**：该桥下游所有分支中**最大的总线号**（路由配置请求 TLP 时，只要目标 `Bus` 落在 `[Secondary, Subordinate]` 区间内，桥就向下游转发）。
 
 ```
-Bit 0:  Parity Error Response Enable
-Bit 1:  SERR# Enable
-Bit 2:  ISA Enable
-Bit 3:  VGA Enable - VGA 地址转发
-Bit 5:  Master Abort Mode
-Bit 6:  Secondary Bus Reset - 复位下游总线
-Bit 7:  Fast Back-to-Back Enable
-Bit 8:  Primary Discard Timer
-Bit 9:  Secondary Discard Timer
-Bit 10: Discard Timer Status
-Bit 11: Discard Timer SERR# Enable
+                Bus 0 (Root Complex)
+                  │
+            [Root Port]  Primary=0, Secondary=1, Subordinate=5
+                  │
+                Bus 1
+                  │
+             [Switch]    Primary=1, Secondary=2, Subordinate=5
+              /    \
+          Bus 2    Bus 3~5 (下游还有二级桥)
+            │
+      [NVMe SSD (Type 0)]
 ```
 
-## 使用场景与最佳实践
+### 3.2 地址转发窗口（Base / Limit）
 
-### Type 0 设备初始化流程
+当 CPU 读写下游设备的 BAR 地址时，TLP 必须穿过沿途所有 Type 1 桥接器。桥接器通过 **Base** 和 **Limit** 寄存器判断目标地址是否属于自己管辖的下游区域：
 
-```
-1. 读取 Vendor/Device ID 识别设备
-   ├─ 0xFFFF/0xFFFF 表示无设备
-   └─ 匹配驱动程序
+| 窗口类型 | 偏移 | 对齐粒度 | 说明 |
+|----------|------|----------|------|
+| **Memory Base / Limit** | `0x20–0x23` | 1 MB（高 12 位有效） | 转发 32-bit **Non-Prefetchable** 内存访问（如控制寄存器）。 |
+| **Prefetchable Memory** | `0x24–0x2F` | 1 MB + 高 32 位扩展 | 转发 **Prefetchable** 内存访问，支持 64-bit 地址空间（如大显存、CMB）。 |
+| **I/O Base / Limit** | `0x1C, 0x30` | 4 KB | 传统 I/O 端口转发（现代 PCIe 设备通常关闭，令 Base > Limit）。 |
 
-2. 检查 Class Code 确认设备类型
-   例如：0x010802 = NVMe SSD
+> **如何关闭未使用的窗口？** 规范规定当 `Base > Limit` 时该窗口关闭（例如写入 `Base = 0xFFF0, Limit = 0x0000`）。
 
-3. 扫描 BARs 确定资源需求
-   ├─ 写入全 1 读回判断大小
-   ├─ 系统分配地址空间
-   └─ 写入分配的基地址
+### 3.3 Bridge Control（`0x3E`）
 
-4. 配置 Command 寄存器
-   ├─ Bit 0: I/O Space Enable
-   ├─ Bit 1: Memory Space Enable
-   ├─ Bit 2: Bus Master Enable
-   └─ Bit 10: Interrupt Disable
+常用控制位包括 **Bit 6（Secondary Bus Reset）**：向该位写 1 再清 0，会对下游整条总线发起热复位（Hot Reset），常用于恢复卡死的下游设备。
 
-5. 设置中断机制
-   ├─ 读取 Capabilities Pointer
-   ├─ 遍历 Capability 链表
-   └─ 配置 MSI/MSI-X
+---
 
-6. 启动设备驱动程序
-```
+## 4. 枚举与资源分配流程（深度优先）
 
-### Type 1 桥接器枚举流程
+1. **深度优先编号**：固件/OS 扫描到 Type 1 桥接器时，先给它分配 `Secondary Bus`，把 `Subordinate Bus` 临时设为 `0xFF`（确保后续探测包能往下走），继续递归扫描下游所有设备，最后回填实际的 `Subordinate Bus`。
+2. **自底向上汇总 BAR**：收集下游所有 Type 0 设备的 BAR 大小需求，合并对齐后写入沿途 Type 1 桥接器的 Memory Base/Limit 窗口。
+3. **开启转发**：置位桥接器 Command 寄存器的 `Memory Space Enable` 和 `Bus Master Enable`，下游设备即可被访问。
 
-```
-1. 初始化桥接器
-   ├─ 分配次端总线号
-   ├─ 设置 Subordinate = 0xFF（临时最大值）
-   └─ 启用 Memory/IO 转发
+---
 
-2. 扫描次端总线（深度优先）
-   ├─ 探测设备 0-31
-   ├─ 对每个桥接器递归扫描
-   └─ 更新 Subordinate Bus Number
+## 5. 实用 CLI 示例
 
-3. 资源分配
-   ├─ 收集下游设备资源需求
-   ├─ 合并成连续地址范围
-   └─ 配置 Base/Limit 寄存器
+```bash
+# 1. 以树形结构查看 PCIe 总线拓扑（直观看到 Type 1 桥与 Type 0 设备）
+lspci -tv
 
-4. 最终化配置
-   ├─ 回写正确的 Subordinate Number
-   ├─ 启用桥接器控制位
-   └─ 清除 Secondary Bus Reset
+# 2. 查看 Type 1 桥接器的总线号范围与转发窗口
+lspci -vvv -s 00:1c.0 | grep -E "Bus:|Memory behind|Prefetchable"
+# 示例输出：
+#   Bus: primary=00, secondary=01, subordinate=01, sec-latency=0
+#   Memory behind bridge: f8000000-f80fffff [size=1M]
 ```
 
-### 多功能设备处理
+---
 
-当 Header Type 的 Bit 7 为 1 时，设备有多个功能（Function）：
+## 关联与引申概念
 
-```
-扫描逻辑：
-  if (Header_Type & 0x80):
-      # 多功能设备，扫描功能 0-7
-      for func in range(8):
-          check_function(bus, dev, func)
-  else:
-      # 单功能设备，只检查功能 0
-      check_function(bus, dev, 0)
-```
-
-## 寄存器编程示例
-
-### 读取设备信息（Type 0）
-
-```c
-// 读取 Vendor/Device ID
-uint16_t vendor = pci_read_config16(bus, dev, func, 0x00);
-uint16_t device = pci_read_config16(bus, dev, func, 0x02);
-
-// 读取 Class Code
-uint32_t class_rev = pci_read_config32(bus, dev, func, 0x08);
-uint8_t revision = class_rev & 0xFF;
-uint32_t class_code = class_rev >> 8;
-
-// 检查 Header Type
-uint8_t header = pci_read_config8(bus, dev, func, 0x0E);
-bool is_multifunction = (header & 0x80) != 0;
-uint8_t type = header & 0x7F;
-```
-
-### 配置 BAR（Type 0）
-
-```c
-// 探测 BAR 大小
-pci_write_config32(bus, dev, func, 0x10, 0xFFFFFFFF);
-uint32_t size_mask = pci_read_config32(bus, dev, func, 0x10);
-
-// 判断 BAR 类型
-if (size_mask & 0x01) {
-    // I/O BAR
-    uint32_t size = ~(size_mask & 0xFFFFFFFC) + 1;
-} else {
-    // Memory BAR
-    bool is_64bit = ((size_mask & 0x06) == 0x04);
-    bool prefetchable = (size_mask & 0x08) != 0;
-    
-    if (is_64bit) {
-        // 64-bit BAR 占用两个寄存器
-        uint32_t size_low = ~(size_mask & 0xFFFFFFF0) + 1;
-    }
-}
-
-// 写入分配的地址
-pci_write_config32(bus, dev, func, 0x10, allocated_address);
-```
-
-### 配置桥接器（Type 1）
-
-```c
-// 设置总线编号
-pci_write_config8(bus, dev, func, 0x18, primary_bus);
-pci_write_config8(bus, dev, func, 0x19, secondary_bus);
-pci_write_config8(bus, dev, func, 0x1A, subordinate_bus);
-
-// 配置内存窗口（128MB @ 0xF0000000）
-pci_write_config16(bus, dev, func, 0x20, 0xF000); // Base
-pci_write_config16(bus, dev, func, 0x22, 0xF7FF); // Limit
-
-// 禁用 Prefetchable 窗口
-pci_write_config16(bus, dev, func, 0x24, 0xFFF0);
-pci_write_config16(bus, dev, func, 0x26, 0x0000);
-
-// 启用内存转发
-uint16_t cmd = pci_read_config16(bus, dev, func, 0x04);
-cmd |= 0x06; // Memory Space + Bus Master
-pci_write_config16(bus, dev, func, 0x04, cmd);
-```
-
-## 相关资源
-
-- **PCI Express Base Specification**: 第 7.5 节详述配置空间布局
-- **PCI Local Bus Specification**: Type 0/1 头部的原始定义
-- **capabilities.md**: Capability 链表机制
-- **../enumeration/bus-scanning.md**: 设备枚举详细流程
-
-## 总结
-
-Type 0 和 Type 1 头部是 PCIe 配置空间的基础，分别适用于端点设备和桥接设备。理解这两种头部格式是 PCIe 系统编程和驱动开发的第一步。Type 0 侧重资源映射（BARs），Type 1 侧重拓扑管理（总线编号、地址窗口），两者协作构建完整的 PCIe 层次结构。
+| 概念 | 简要说明 | 相关文档 |
+|------|----------|----------|
+| **配置空间与 ECAM** | Type 0/1 头部占据配置空间前 64 字节，现代系统通过 ECAM（MMCFG）将其映射为内存访问。 | [配置空间详解](config-space.md) |
+| **BAR（基址寄存器）** | Type 0 设备的 6 个核心寄存器，定义设备需要多少 MMIO 地址空间。 | [BAR 详解](bars.md) |
+| **Capability Linked List** | 紧随 64 字节头部之后的扩展机制，Type 0/1 都通过 `0x34` 指针串联功能特性。 | [能力结构详解](capabilities.md) |
+| **ARI（Alternative Routing-ID）** | 扩展能力之一，打破传统“最多 8 个 Function”限制，将 Device+Function 合并为 8-bit 支持 256 个 Function。 | [扩展能力详解](extended-capabilities.md) |

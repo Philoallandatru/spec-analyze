@@ -1,45 +1,59 @@
-# Controller Ready Modes and Timeouts
+# 控制器就绪模式与超时（Controller Ready Modes and Timeouts）
 
-Controller readiness may mean either that command processing and media are both usable, or that non-media command processing is usable while namespaces and media continue initialization. `CAP.CRMS` advertises the modes, `CC.CRIME` selects between them when both are supported, and `CAP.TO` plus `CRTO` bound the waits. [PDF pp. 128-131](../_source/pages/page-128.md)
+NVMe 控制器“就绪（`CSTS.RDY=1`）”有两种契约：**Ready With Media**（命令处理、介质与挂载命名空间全部就绪）和 **Ready Independent of Media**（不依赖介质的命令先就绪，介质与命名空间稍后到位）。`CAP.CRMS` 声明支持情况，`CC.CRIME` 在使能时选择模式，`CRTO.CRIMT` 与 `CRTO.CRWMT` 限定等待上限。[PDF pp. 128-131](../_source/pages/page-128.md)
 
-## Mental model
+可以把它想成**新开的快递分拣中心**：Ready With Media 是等货架全装满再开门，顾客来了就能取件；Ready Independent of Media 是先开“客服窗口”接寄件和查单（非介质命令），后台货架（介质）在稍后规定时间内补齐。
+
+## 两种就绪模式与超时时间线
 
 ```text
 CC.EN: 0 -> 1
-      |
-      +-- Ready With Media (CC.CRIME=0)
-      |      `-- by CRTO.CRWMT: RDY=1 + commands/media ready
-      |
-      `-- Ready Independent of Media (CC.CRIME=1)
-             |-- by CRTO.CRIMT: RDY=1 + non-media commands ready
-             `-- by CRTO.CRWMT: attached namespaces/media ready
+   |
+   +-- Ready With Media (CC.CRIME = 0)
+   |      `-- CRTO.CRWMT 之前：CSTS.RDY=1，命令、介质与挂载命名空间全部就绪
+   |
+   `-- Ready Independent of Media (CC.CRIME = 1)
+          |-- CRTO.CRIMT 之前：CSTS.RDY=1，不依赖介质/命名空间的命令可处理
+          `-- CRTO.CRWMT 之前：挂载的命名空间与 Admin 所需介质就绪
 ```
 
-This explanatory timeline reconstructs the two readiness contracts and their deadlines. [PDF pp. 128-131](../_source/pages/page-128.md)
+[PDF pp. 128-131](../_source/pages/page-128.md)
 
-## Mode selection
-
-| `CAP.CRMS` | Supported behavior | `CC.CRIME` |
+| `CAP.CRMS` | 支持的就绪模式 | `CC.CRIME` 行为 |
 |---|---|---|
-| `00b` | Legacy/non-selectable; readiness bounded by `CAP.TO` | read-only `0`, host ignores |
-| `01b` | Ready With Media only | read-only `0` |
-| `11b` | Both modes | host selects before enable |
+| `00b` | 传统模式（无选择，遵循 Rev < 2.0，由 `CAP.TO` 限定） | 只读为 `0`，主机忽略 |
+| `01b` | 仅 Ready With Media | 只读为 `0` |
+| `11b` | 两种模式都支持（Rev 2.1 控制器必选） | RW；由 `CC.EN: 0→1` 时的值决定本轮模式 |
 
-Revision 2.1 controllers set Ready With Media support; `00b` remains meaningful for controllers compliant with specifications before Revision 2.0. Changing `CC.CRIME` does not change `CRTO.CRWMT` or `CRTO.CRIMT`, though it may affect `CAP.TO`. [PDF pp. 130-131](../_source/pages/page-130.md)
+- **超时单位与关系**：`CRTO.CRIMT` 与 `CRTO.CRWMT` 均以 **500 ms** 为单位，且 `CRWMT ≥ CRIMT`。[PDF p. 92](../_source/pages/page-092.md)
+- **修改 `CC.CRIME` 的影响**：切换 `CC.CRIME` 可能改变 `CAP.TO` 报告的传统超时值，但**不会**改变 `CRTO.CRIMT` 或 `CRTO.CRWMT`。[PDF pp. 130-131](../_source/pages/page-130.md)
 
-## Command availability contract
+## 命令可用性与超时违规处理
 
-In Ready With Media mode, `CSTS.RDY=1` means all attached namespaces, media needed by Admin commands, and command processing are ready. In Ready Independent of Media mode, commands not needing attached namespaces or media must work by `CRTO.CRIMT`; media-dependent Admin and I/O commands may return retryable Namespace Not Ready or Admin Command Media Not Ready until `CRTO.CRWMT`. [PDF pp. 128-131](../_source/pages/page-128.md)
+- **Ready With Media**：`CSTS.RDY=1` 即代表所有挂载的命名空间、Admin 所需介质及命令处理全部就绪。
+- **Ready Independent of Media**：
+  - 在 `CRTO.CRIMT` 之前置 `RDY=1` 后，不依赖挂载命名空间或介质的命令必须可用。
+  - 在 `CRTO.CRWMT` 之前，依赖介质/命名空间的命令可能返回**可重试**的 `Namespace Not Ready`（I/O 命令）或 `Admin Command Media Not Ready`（Admin 命令，具体适用白名单见规范 Figure 84，其中 Device Self-test 与 Get Log Page 有更窄限制）。[PDF pp. 129-130](../_source/pages/page-129.md)
+- **超时违规处理**：若 `CAP.CRMS != 0` 的控制器错过了适用的就绪截止时间，它**仍然必须**在 `CRTO.CRWMT` 之前将 `CSTS.RDY` 置 `1`；若支持 Persistent Event Log，还需记录一条 `NVM Subsystem Hardware Error` 事件（事件码：`Controller Ready Timeout Exceeded`）。[PDF pp. 131-132](../_source/pages/page-131.md)
 
-Figure 84 is an exact cross-page allowlist of Admin commands that may report Admin Command Media Not Ready, with narrower restrictions for Device Self-test and Get Log Page. The PDF table remains authoritative rather than duplicating the full list here. [PDF pp. 129-130](../_source/pages/page-129.md)
+## 概念辨析
 
-## Timeout failure
+| 容易混淆 | 实际区别 |
+|---|---|
+| `CAP.CRMS` vs `CC.CRIME` | `CRMS` 是静态能力（是否支持双模式）；`CRIME` 是启用时选择的动态模式 |
+| `CAP.TO` vs `CRTO` | `CAP.TO` 是传统单段超时（封顶 127.5 秒）；`CRTO` 是 Rev 2.1 引入的两段式超时（可超 127.5 秒） |
+| `Admin Command Media Not Ready` vs `Namespace Not Ready` | 前者针对 Admin 命令介质未就绪；后者针对 I/O 命令访问未就绪命名空间；两者均**可重试** |
 
-If a non-zero `CAP.CRMS` controller misses the applicable processing or media deadline, it must nevertheless set `CSTS.RDY=1` no later than `CRTO.CRWMT`. If the Persistent Event Log is supported, it also records an NVM Subsystem Hardware Error event whose code is Controller Ready Timeout Exceeded. [PDF pp. 131-132](../_source/pages/page-131.md)
+## 关联与引申概念
 
-## Evidence
+- **控制器启用与重置（[Controller Enable, Shutdown, and Reset](controller-enable-shutdown-reset.md)）**：`CC.EN`、`CSTS.RDY` 握手及 `CRTO` 寄存器的完整定义。
+- **控制器初始化（[Controller Initialization](controller-initialization.md)）**：控制器就绪后主机如何继续 Identify、枚举命名空间与建队列。
+- **格式化生命周期（[Format NVM Lifecycle](format-nvm-lifecycle.md)）**：Format/Sanitize 等操作期间也可能触发介质/命名空间未就绪的可重试状态。
+- **Keep Alive（[Keep Alive](keep-alive.md)）**：控制器启用与就绪过程中的心跳保活激活条件。
 
-- [Discovery initialization and ready-mode definition, PDF p. 128](../_source/pages/page-128.md)
-- [Ready-independent command restrictions and Figure 84 start, PDF p. 129](../_source/pages/page-129.md)
-- [Figure 84 continuation, mode selection, and timeout definitions, PDF p. 130](../_source/pages/page-130.md)
-- [Timeout mapping and failure handling, PDF pp. 131-132](../_source/pages/page-131.md)
+## 规范依据
+
+- [CRTO 寄存器字段定义，PDF 第 92 页](../_source/pages/page-092.md)
+- [就绪模式定义与 Discovery 初始化，PDF 第 128 页](../_source/pages/page-128.md)
+- [Ready Independent of Media 命令限制与 Figure 84，PDF 第 129-130 页](../_source/pages/page-129.md)
+- [超时映射与违规失败处理，PDF 第 131-132 页](../_source/pages/page-131.md)

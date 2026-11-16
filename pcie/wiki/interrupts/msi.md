@@ -1,646 +1,116 @@
 # MSI 中断详解
 
-## 概述
+**MSI（Message Signaled Interrupts，消息信号中断）允许 PCIe 设备通过发送一笔普通的“内存写 TLP（Memory Write）”来触发 CPU 中断**，彻底摆脱了传统 INTx 的共享轮询开销。所有支持 PCIe 的设备都必须支持 MSI 或 MSI-X。
 
-MSI (Message Signaled Interrupts) 是 PCIe 1.0 引入的中断机制，通过发送 Memory Write TLP 来触发中断，取代了传统的物理中断线。MSI 提供了比 INTx 更高的性能，并且是 PCIe 设备的必需特性。
+> **直观类比**：如果 INTx 是拉响公共警铃，那么 **MSI** 就像给 CPU 的收件箱（特定物理地址 `0xFEExxxxx`）直接投递一张写着“中断号（Message Data）”的快递单。Root Complex 看到这笔写往 `0xFEExxxxx` 的内存写请求时，不会真的去写内存条，而是立刻按快递单上的编号把对应的 CPU 叫醒。
 
-## MSI 架构
+---
 
-### 基本原理
+## 1. MSI 的工作原理与特点
 
-```
-传统 INTx:
-设备 --[物理中断线]--> 中断控制器 --> CPU
+1. **配置阶段**：OS 在配置空间的 **MSI Capability（ID = `0x05`）** 中填入目标地址（`Message Address`）和基准中断数据（`Message Data`），并置位 `MSI Enable`。
+2. **触发阶段**：当事件发生时，设备构造一笔 **Posted Memory Write TLP**（写往 `Message Address`，载荷为 `Message Data`）。
+3. **直达 CPU**：由于写往 `0xFEExxxxx`（x86 Local APIC 窗口），Root Complex 直接将它路由给目标 CPU 的 Local APIC，无需经过 IOAPIC 和共享中断链表。
 
-MSI:
-设备 --[Memory Write TLP]--> 系统内存地址 --> 中断控制器 --> CPU
+**MSI 的主要局限（与 MSI-X 对比）**：
+- **向量数量受限**：最多只支持 **32 个**向量，且必须是 2 的幂（1, 2, 4, 8, 16, 32）。
+- **必须连续且同目标**：所有向量共用同一组 `Message Address`，这意味着无法把不同向量分散到不同 CPU 核心；且 OS 必须分配连续的中断向量号。
+- **掩码可选**：Per-Vector Masking（单向量屏蔽）在 MSI 中是可选特性，而 MSI-X 中强制支持。
 
-优势：
-- 无需物理中断线
-- 无需中断共享
-- 更低延迟
-- 支持多个向量（最多32个）
-```
+---
 
-### MSI vs MSI-X 对比
+## 2. MSI Capability 结构（ID = `0x05`）
 
-| 特性 | MSI | MSI-X |
-|------|-----|-------|
-| 最大向量数 | 32 | 2048 |
-| 向量数限制 | 2的幂次 (1,2,4,8,16,32) | 任意数量 |
-| 地址/数据对 | 所有向量共享1对 | 每个向量独立 |
-| 掩码支持 | 可选（Per-Vector Masking） | 必需 |
-| 表结构 | 在配置空间中 | 在 BAR 空间中 |
-| 复杂度 | 简单 | 复杂 |
-| PCIe 要求 | 必需 (Gen 1+) | 推荐 (Gen 2+) |
-
-## MSI Capability 结构
-
-### 基本格式
+MSI Capability 位于配置空间 `0x40–0xFF` 链表中，大小随是否支持 **64 位地址** 和 **Per-Vector Masking** 从 10 字节到 24 字节不等：
 
 ```
-MSI Capability (无 Per-Vector Masking, 32-bit地址):
-+0x00: [7:0]   Capability ID = 0x05
-       [15:8]  Next Capability Pointer
-+0x02: [15:0]  Message Control
-       [0]     MSI Enable
-       [3:1]   Multiple Message Capable (MMC)
-       [6:4]   Multiple Message Enable (MME)
-       [7]     64-bit Address Capable
-       [8]     Per-Vector Masking Capable
-       [15:9]  Reserved
-+0x04: [31:0]  Message Address (32-bit)
-+0x08: [15:0]  Message Data
-+0x0A: [15:0]  Reserved
-
-总大小：10 字节
+偏移     31                            16 15            8 7             0
++0x00   ┌────────────────────────────────┬───────────────┬───────────────┐
+        │     Message Control (16b)      │   Next Ptr    │ Cap ID = 0x05 │
++0x04   ├────────────────────────────────┴───────────────┴───────────────┤
+        │                  Message Address Lower (32b)                   │
++0x08   ├────────────────────────────────────────────────────────────────┤
+        │   Message Address Upper (32b)  [仅 64-bit Capable=1 时存在]     │
++0x0C   ├────────────────────────────────┬───────────────────────────────┤
+        │          Reserved              │      Message Data (16b)       │ (32-bit 时在 +0x08)
++0x10   ├────────────────────────────────┴───────────────────────────────┤
+        │     Mask Bits (32b)            [仅 Per-Vector Masking=1 时存在] │ (32-bit 时在 +0x0C)
++0x14   ├────────────────────────────────────────────────────────────────┤
+        │     Pending Bits (32b)         [仅 Per-Vector Masking=1 时存在] │ (32-bit 时在 +0x10)
+        └────────────────────────────────────────────────────────────────┘
 ```
 
-### 64-bit 地址格式
+### Message Control 寄存器（`+0x02`，16-bit）
+
+| 位 | 名称 | 读写 | 说明 |
+|----|------|------|------|
+| `Bit 0` | **MSI Enable** | RW | `1` = 启用 MSI（同时应关闭 Command[Bit 10] 的 INTx）。 |
+| `Bits 3:1` | **MMC (Multiple Message Capable)** | RO | 硬件支持的向量数编码：`2^MMC`（`000`=1, `001`=2, ..., `101`=32）。 |
+| `Bits 6:4` | **MME (Multiple Message Enable)** | RW | OS 实际分配的向量数编码：`2^MME`（必须 $\le$ MMC）。 |
+| `Bit 7` | **64-bit Address Capable** | RO | `1` = 支持 64 位 Message Address。 |
+| `Bit 8` | **Per-Vector Masking Capable** | RO | `1` = 支持 Mask Bits / Pending Bits 寄存器。 |
+
+---
+
+## 3. x86/x64 地址、数据格式与多向量编码
+
+### 3.1 Message Address 与 Message Data（x86 示例）
 
 ```
-MSI Capability (64-bit地址):
-+0x00: [15:0]  Capability Header
-+0x02: [15:0]  Message Control
-+0x04: [31:0]  Message Address Lower 32 bits
-+0x08: [31:0]  Message Address Upper 32 bits
-+0x0C: [15:0]  Message Data
-+0x0E: [15:0]  Reserved
+Message Address (32-bit):
+31              20 19            12 11         4  3   2  1 0
+┌─────────────────┬────────────────┬────────────┬───┬───┬───┐
+│   0xFEE (固定)  │ Destination ID │  Reserved  │RH │DM │0 0│
+└─────────────────┴────────────────┴────────────┴───┴───┴───┘
+  - 0xFEE: x86 Local APIC 固定内存窗口前缀
+  - Destination ID: 目标 CPU 的 APIC ID
+  - DM (Bit 2): 0=Physical APIC ID, 1=Logical
 
-总大小：14 字节
+Message Data (16-bit):
+15   14  13 11 10       8 7                               0
+┌───┬───┬─────┬──────────┬─────────────────────────────────┐
+│Lvl│TM │Rsvd │Deliv Mode│      Interrupt Vector (0-255)   │
+└───┴───┴─────┴──────────┴─────────────────────────────────┘
+  - Vector [7:0]: CPU 中断向量号；TM=0 表示边沿触发 (Edge)
+  - Delivery Mode [10:8]: 000b=Fixed（定向投递）
 ```
 
-### Per-Vector Masking
+> **提示**：在开启 **IOMMU 中断重映射（Interrupt Remapping）** 时，Message Address/Data 中填入的不再是原始 APIC ID 和 Vector，而是经过重映射编码的句柄（详见 [中断路由详解](routing.md)）。
 
-```
-MSI Capability (带 Masking, 32-bit地址):
-+0x00-0x08: 同上
-+0x0C: [31:0]  Mask Bits
-       每位对应一个向量，1=masked, 0=unmasked
-+0x10: [31:0]  Pending Bits
-       每位指示该向量是否有pending中断
+### 3.2 多向量工作方式
 
-MSI Capability (带 Masking, 64-bit地址):
-+0x00-0x0C: 同上
-+0x10: [31:0]  Mask Bits
-+0x14: [31:0]  Pending Bits
+当 OS 分配 $N = 2^{\text{MME}}$ 个向量时，设备会根据触发的中断源，自动将 `Message Data` 的**最低 `MME` 位**替换为中断源编号（`0` 到 `N-1`）：
 
-总大小：24 字节
-```
+- 例：OS 配置 `Message Data = 0x4020`（低 2 位为 `00b`），`MME = 010b`（4 个向量）。
+- 设备发出的 4 个中断分别为：`0x4020`（向量 0）、`0x4021`（向量 1）、`0x4022`（向量 2）、`0x4023`（向量 3）。
 
-### Message Control 寄存器
+### 3.3 Per-Vector Masking 与 Pending Bits
 
-```
-Bit [0]: MSI Enable
-  0 = 禁用 MSI
-  1 = 启用 MSI
+若设备支持该特性，驱动可通过写 `Mask Bits` 的第 `i` 位为 `1` 来临时屏蔽第 `i` 个向量：屏蔽期间设备若产生中断，**不会发送 TLP**，而是将 `Pending Bits` 的第 `i` 位置 `1`；当驱动解除屏蔽（清零 Mask 位）后，硬件自动补发该中断。
 
-Bits [3:1]: Multiple Message Capable (MMC)
-  000 = 1 vector
-  001 = 2 vectors
-  010 = 4 vectors
-  011 = 8 vectors
-  100 = 16 vectors
-  101 = 32 vectors
-  (只读，设备能力)
+---
 
-Bits [6:4]: Multiple Message Enable (MME)
-  000 = 1 vector
-  001 = 2 vectors
-  010 = 4 vectors
-  011 = 8 vectors
-  100 = 16 vectors
-  101 = 32 vectors
-  (软件配置，≤ MMC)
+## 4. 驱动接入与 CLI 调试
 
-Bit [7]: 64-bit Address Capable
-  0 = 只支持32-bit地址
-  1 = 支持64-bit地址
-  (只读)
-
-Bit [8]: Per-Vector Masking Capable
-  0 = 不支持Per-Vector Masking
-  1 = 支持Per-Vector Masking
-  (只读)
-```
-
-## Message 地址和数据格式
-
-### x86/x64 架构
-
-```
-Message Address:
-+---+---+---+---+---+---+---+---+---+---+---+---+
-|31           20|19           12|11  4|3 |2 |1|0|
-+---+---+---+---+---+---+---+---+---+---+---+---+
-|    0xFEE      | Destination ID| RH |DM|xx|0|
-+---+---+---+---+---+---+---+---+---+---+---+---+
-
-固定前缀：0xFEE (APIC base address)
-Bits [19:12]: Destination ID (目标 APIC ID)
-Bit [3]: Redirection Hint
-  0 = 直接发送到指定的处理器
-  1 = 发送到最低优先级的处理器
-Bit [2]: Destination Mode
-  0 = Physical (物理 APIC ID)
-  1 = Logical (逻辑 APIC ID)
-Bits [1:0]: 保留，必须为 0
-
-Message Data:
-+---+---+---+---+---+---+---+---+---+---+---+---+
-|31  16|15|14|13|12|11 10|9  8|7            0|
-+---+---+---+---+---+---+---+---+---+---+---+---+
-| Rsvd | L| TM|Rsvd| DM  |Rsvd|   Vector     |
-+---+---+---+---+---+---+---+---+---+---+---+---+
-
-Bits [7:0]: Interrupt Vector (0-255)
-Bits [10:8]: Delivery Mode
-  000 = Fixed
-  001 = Lowest Priority
-  010 = SMI
-  011 = Reserved
-  100 = NMI
-  101 = INIT
-  110 = Reserved
-  111 = ExtINT
-Bit [14]: Trigger Mode
-  0 = Edge
-  1 = Level (MSI 通常使用 Edge)
-Bit [15]: Level
-  0 = Deassert
-  1 = Assert
-
-对于多向量 MSI，向量计算：
-Vector = Base_Vector + Interrupt_Offset
-
-其中 Interrupt_Offset 根据触发的中断源确定
-```
-
-## 软件配置
-
-### 查询和启用 MSI
-
-```c
-// 查询 MSI 能力
-static int query_msi_capability(struct pci_dev *pdev)
-{
-    int pos;
-    u16 control;
-    int nvec;
-    
-    // 查找 MSI Capability
-    pos = pci_find_capability(pdev, PCI_CAP_ID_MSI);
-    if (!pos) {
-        dev_err(&pdev->dev, "MSI not supported\n");
-        return -ENODEV;
-    }
-    
-    // 读取 Message Control
-    pci_read_config_word(pdev, pos + PCI_MSI_FLAGS, &control);
-    
-    // 检查是否支持 64-bit 地址
-    bool msi_64bit = !!(control & PCI_MSI_FLAGS_64BIT);
-    
-    // 检查是否支持 Per-Vector Masking
-    bool msi_maskable = !!(control & PCI_MSI_FLAGS_MASKBIT);
-    
-    // 读取设备支持的向量数
-    nvec = 1 << ((control & PCI_MSI_FLAGS_QSIZE) >> 1);
-    
-    dev_info(&pdev->dev, "MSI: %d vectors, %s, %s\n",
-             nvec,
-             msi_64bit ? "64-bit" : "32-bit",
-             msi_maskable ? "maskable" : "non-maskable");
-    
-    return nvec;
-}
-
-// 配置 MSI
-static int setup_msi(struct pci_dev *pdev, int nvec)
-{
-    int pos, ret;
-    u16 control;
-    u32 addr_lo, addr_hi = 0;
-    u16 data;
-    
-    pos = pci_find_capability(pdev, PCI_CAP_ID_MSI);
-    if (!pos)
-        return -EINVAL;
-    
-    // 读取 Message Control
-    pci_read_config_word(pdev, pos + PCI_MSI_FLAGS, &control);
-    
-    // 计算 MME (Multiple Message Enable)
-    int mme = ilog2(nvec);  // 0=1vec, 1=2vec, 2=4vec, ...
-    
-    // 验证请求的向量数不超过设备能力
-    int mmc = (control & PCI_MSI_FLAGS_QSIZE) >> 1;
-    if (mme > mmc) {
-        dev_warn(&pdev->dev, "Requested %d vectors but device supports %d\n",
-                 nvec, 1 << mmc);
-        mme = mmc;
-        nvec = 1 << mme;
-    }
-    
-    // 分配中断向量
-    ret = pci_alloc_irq_vectors_affinity(pdev, nvec, nvec,
-                                          PCI_IRQ_MSI, NULL);
-    if (ret < 0) {
-        dev_err(&pdev->dev, "Failed to allocate MSI vectors: %d\n", ret);
-        return ret;
-    }
-    
-    // 获取 Message Address 和 Data
-    // (内核 API 会自动设置，这里展示底层操作)
-    struct msi_desc *desc = first_pci_msi_entry(pdev);
-    struct msi_msg msg;
-    
-    get_cached_msi_msg(desc->irq, &msg);
-    addr_lo = msg.address_lo;
-    addr_hi = msg.address_hi;
-    data = msg.data;
-    
-    // 写入 Message Address
-    bool msi_64bit = !!(control & PCI_MSI_FLAGS_64BIT);
-    pci_write_config_dword(pdev, pos + PCI_MSI_ADDRESS_LO, addr_lo);
-    
-    if (msi_64bit) {
-        pci_write_config_dword(pdev, pos + PCI_MSI_ADDRESS_HI, addr_hi);
-        pci_write_config_word(pdev, pos + PCI_MSI_DATA_64, data);
-    } else {
-        pci_write_config_word(pdev, pos + PCI_MSI_DATA_32, data);
-    }
-    
-    // 设置 MME 并启用 MSI
-    control &= ~PCI_MSI_FLAGS_QMASK;
-    control |= (mme << 4);
-    control |= PCI_MSI_FLAGS_ENABLE;
-    
-    pci_write_config_word(pdev, pos + PCI_MSI_FLAGS, control);
-    
-    dev_info(&pdev->dev, "MSI enabled with %d vectors\n", nvec);
-    return nvec;
-}
-```
-
-### 使用内核 API
-
-```c
-// 现代内核推荐的方式
-static int enable_msi_modern(struct pci_dev *pdev, int min_vecs, int max_vecs)
-{
-    int nvec;
-    
-    // 请求 MSI 向量（会自动fallback到可用数量）
-    nvec = pci_alloc_irq_vectors(pdev, min_vecs, max_vecs, PCI_IRQ_MSI);
-    if (nvec < 0) {
-        dev_err(&pdev->dev, "Failed to enable MSI: %d\n", nvec);
-        return nvec;
-    }
-    
-    dev_info(&pdev->dev, "Allocated %d MSI vectors\n", nvec);
-    
-    // 注册中断处理程序
-    for (int i = 0; i < nvec; i++) {
-        int irq = pci_irq_vector(pdev, i);
-        int ret = request_irq(irq, my_msi_handler, 0,
-                              "mydriver-msi", pdev);
-        if (ret) {
-            dev_err(&pdev->dev, "Failed to request IRQ %d\n", irq);
-            goto free_irqs;
-        }
-    }
-    
-    return nvec;
-
-free_irqs:
-    while (--i >= 0)
-        free_irq(pci_irq_vector(pdev, i), pdev);
-    pci_free_irq_vectors(pdev);
-    return -EINVAL;
-}
-
-// 禁用 MSI
-static void disable_msi(struct pci_dev *pdev, int nvec)
-{
-    // 释放所有中断
-    for (int i = 0; i < nvec; i++) {
-        free_irq(pci_irq_vector(pdev, i), pdev);
-    }
-    
-    // 释放向量
-    pci_free_irq_vectors(pdev);
-}
-```
-
-## 多向量处理
-
-### 向量分配策略
-
-```c
-// 根据队列数量分配向量
-static int allocate_msi_vectors(struct pci_dev *pdev, int num_queues)
-{
-    int nvec;
-    
-    // 尝试为每个队列分配一个向量
-    nvec = pci_alloc_irq_vectors(pdev, 1, num_queues, PCI_IRQ_MSI);
-    if (nvec < 0) {
-        dev_err(&pdev->dev, "MSI allocation failed\n");
-        return nvec;
-    }
-    
-    if (nvec < num_queues) {
-        dev_warn(&pdev->dev,
-                 "Only allocated %d MSI vectors for %d queues\n",
-                 nvec, num_queues);
-        // 多个队列共享向量
-    }
-    
-    return nvec;
-}
-
-// 向量到队列的映射
-static int map_vector_to_queue(int vector, int nvec, int queue, int num_queues)
-{
-    // 简单轮询映射
-    if (nvec >= num_queues) {
-        // 一对一映射
-        return queue;
-    } else {
-        // 多个队列共享向量
-        return queue % nvec;
-    }
-}
-```
-
-### 中断处理
-
-```c
-// MSI 中断处理程序
-static irqreturn_t my_msi_handler(int irq, void *data)
-{
-    struct pci_dev *pdev = data;
-    struct my_device *mydev = pci_get_drvdata(pdev);
-    int vector;
-    
-    // 确定是哪个向量
-    vector = irq - pci_irq_vector(pdev, 0);
-    
-    // 读取设备状态寄存器
-    u32 status = ioread32(mydev->bar0 + INT_STATUS_REG);
-    
-    // 检查是否是该向量的中断
-    if (!(status & (1 << vector))) {
-        return IRQ_NONE;
-    }
-    
-    // 清除中断状态
-    iowrite32(1 << vector, mydev->bar0 + INT_CLEAR_REG);
-    
-    // 处理中断
-    handle_interrupt(mydev, vector);
-    
-    return IRQ_HANDLED;
-}
-```
-
-## Per-Vector Masking
-
-### 掩码操作
-
-```c
-// 掩码指定的向量
-static void msi_mask_vector(struct pci_dev *pdev, int vector)
-{
-    int pos;
-    u32 mask;
-    u16 control;
-    
-    pos = pdev->msi_cap;
-    if (!pos)
-        return;
-    
-    // 检查是否支持 masking
-    pci_read_config_word(pdev, pos + PCI_MSI_FLAGS, &control);
-    if (!(control & PCI_MSI_FLAGS_MASKBIT)) {
-        dev_warn(&pdev->dev, "MSI Per-Vector Masking not supported\n");
-        return;
-    }
-    
-    // 计算 Mask Bits 偏移
-    bool msi_64bit = !!(control & PCI_MSI_FLAGS_64BIT);
-    int mask_offset = msi_64bit ? PCI_MSI_MASK_64 : PCI_MSI_MASK_32;
-    
-    // 读取当前 Mask Bits
-    pci_read_config_dword(pdev, pos + mask_offset, &mask);
-    
-    // 设置对应位
-    mask |= (1 << vector);
-    
-    pci_write_config_dword(pdev, pos + mask_offset, mask);
-}
-
-// 解除掩码
-static void msi_unmask_vector(struct pci_dev *pdev, int vector)
-{
-    int pos;
-    u32 mask;
-    u16 control;
-    
-    pos = pdev->msi_cap;
-    if (!pos)
-        return;
-    
-    pci_read_config_word(pdev, pos + PCI_MSI_FLAGS, &control);
-    if (!(control & PCI_MSI_FLAGS_MASKBIT))
-        return;
-    
-    bool msi_64bit = !!(control & PCI_MSI_FLAGS_64BIT);
-    int mask_offset = msi_64bit ? PCI_MSI_MASK_64 : PCI_MSI_MASK_32;
-    
-    pci_read_config_dword(pdev, pos + mask_offset, &mask);
-    
-    // 清除对应位
-    mask &= ~(1 << vector);
-    
-    pci_write_config_dword(pdev, pos + mask_offset, mask);
-}
-
-// 检查 Pending 位
-static bool msi_is_pending(struct pci_dev *pdev, int vector)
-{
-    int pos;
-    u32 pending;
-    u16 control;
-    
-    pos = pdev->msi_cap;
-    if (!pos)
-        return false;
-    
-    pci_read_config_word(pdev, pos + PCI_MSI_FLAGS, &control);
-    if (!(control & PCI_MSI_FLAGS_MASKBIT))
-        return false;
-    
-    bool msi_64bit = !!(control & PCI_MSI_FLAGS_64BIT);
-    int pending_offset = msi_64bit ? PCI_MSI_PENDING_64 : PCI_MSI_PENDING_32;
-    
-    pci_read_config_dword(pdev, pos + pending_offset, &pending);
-    
-    return !!(pending & (1 << vector));
-}
-```
-
-## 硬件实现
-
-### Message 生成
-
-```verilog
-// MSI Message 生成模块
-module msi_generator (
-    input wire clk,
-    input wire rst_n,
-    
-    // MSI 配置
-    input wire [31:0] msi_addr_lo,
-    input wire [31:0] msi_addr_hi,
-    input wire [15:0] msi_data,
-    input wire msi_enabled,
-    input wire msi_64bit,
-    input wire [2:0] mme,  // Multiple Message Enable
-    
-    // 中断请求
-    input wire [31:0] irq_vector,  // 32个中断源
-    
-    // Masking
-    input wire [31:0] mask_bits,
-    output reg [31:0] pending_bits,
-    
-    // TLP 输出
-    output reg tlp_valid,
-    output reg [127:0] tlp_data
-);
-
-    reg [4:0] vector_to_send;
-    reg [15:0] modified_data;
-    
-    // 检测中断边沿
-    reg [31:0] irq_prev;
-    wire [31:0] irq_edge = irq_vector & ~irq_prev;
-    
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            irq_prev <= 32'h0;
-            pending_bits <= 32'h0;
-            tlp_valid <= 1'b0;
-        end else begin
-            irq_prev <= irq_vector;
-            
-            // 记录 pending 中断
-            pending_bits <= (pending_bits | irq_edge) & ~mask_bits;
-            
-            // 如果 MSI 启用且有未 masked 的中断
-            if (msi_enabled && (|pending_bits)) begin
-                // 找到最高优先级的pending中断
-                vector_to_send = find_first_set(pending_bits);
-                
-                // 修改 Message Data 的向量字段
-                modified_data = msi_data;
-                modified_data[4:0] = modified_data[4:0] + vector_to_send;
-                
-                // 构造 Memory Write TLP
-                if (msi_64bit) begin
-                    // 4DW Header
-                    tlp_data[31:0] = {8'h60, 8'h00, 16'h0001};  // Fmt/Type, Length=1DW
-                    tlp_data[63:32] = {16'h0000, 16'h0000};     // Requester ID, Tag
-                    tlp_data[95:64] = msi_addr_hi;              // Address Upper
-                    tlp_data[127:96] = msi_addr_lo;             // Address Lower
-                end else begin
-                    // 3DW Header
-                    tlp_data[31:0] = {8'h40, 8'h00, 16'h0001};  // Fmt/Type, Length=1DW
-                    tlp_data[63:32] = {16'h0000, 16'h0000};     // Requester ID, Tag
-                    tlp_data[95:64] = msi_addr_lo;              // Address
-                    tlp_data[127:96] = {modified_data, 16'h0}; // Data
-                end
-                
-                tlp_valid <= 1'b1;
-                
-                // 清除已发送的pending位
-                pending_bits[vector_to_send] <= 1'b0;
-            end else begin
-                tlp_valid <= 1'b0;
-            end
-        end
-    end
-    
-    // 找到第一个置位的bit
-    function [4:0] find_first_set;
-        input [31:0] bits;
-        integer i;
-        begin
-            find_first_set = 0;
-            for (i = 0; i < 32; i = i + 1) begin
-                if (bits[i]) begin
-                    find_first_set = i;
-                    i = 32;  // 退出循环
-                end
-            end
-        end
-    endfunction
-
-endmodule
-```
-
-## 调试技巧
-
-### 查看 MSI 配置
+在现代 Linux 内核驱动中，无需手动拼接配置空间字节，只需调用 `pci_alloc_irq_vectors(pdev, min, max, PCI_IRQ_MSI)` 分配向量，再通过 `pci_irq_vector(pdev, i)` 获取 Linux IRQ 号并调用 `request_irq()` 注册即可。
 
 ```bash
-# lspci 显示 MSI 配置
-lspci -vvv -s 01:00.0 | grep -A 10 "MSI:"
+# 1. 查看 MSI Capability 的启用状态、向量数、地址与数据
+lspci -vvv -s 01:00.0 | grep -A 3 "MSI:"
+# 示例: Capabilities: [50] MSI: Enable+ Count=8/32 Maskable+ 64bit+
+#       Address: 00000000fee00000  Data: 4022
 
-# 示例输出：
-# Capabilities: [50] MSI: Enable+ Count=8/32 Maskable+ 64bit+
-#   Address: 00000000fee00000  Data: 4022
-#   Masking: 00000000  Pending: 00000000
-
-# 使用 setpci 读取
-setpci -s 01:00.0 CAP_MSI+2.W   # Message Control
-setpci -s 01:00.0 CAP_MSI+4.L   # Message Address Lo
-setpci -s 01:00.0 CAP_MSI+8.L   # Message Address Hi (64-bit)
-setpci -s 01:00.0 CAP_MSI+C.W   # Message Data (64-bit)
+# 2. 用 setpci 读取 MSI Message Control（假设 Capability 位于 0x50）
+setpci -s 01:00.0 CAP_MSI+2.W
 ```
 
-### 内核日志
+---
 
-```bash
-# 查看 MSI 相关日志
-dmesg | grep -i msi
+## 关联与引申概念
 
-# 查看中断分配
-cat /proc/interrupts | grep mydriver
-```
-
-## 最佳实践
-
-1. **优先使用 MSI-X**：如果设备支持，MSI-X 更灵活
-2. **请求合适数量**：不要请求超过实际需要的向量
-3. **设置亲和性**：将向量绑定到特定 CPU 提高性能
-4. **错误处理**：检查所有分配和配置的返回值
-5. **清理资源**：卸载时正确释放向量和中断
-
-## 总结
-
-MSI 的关键点：
-
-1. **Message 机制**：通过 Memory Write TLP 触发中断
-2. **多向量支持**：最多 32 个向量，必须是 2 的幂次
-3. **配置简单**：在配置空间中设置地址和数据
-4. **Per-Vector Masking**：可选的向量级掩码支持
-5. **性能优势**：比 INTx 更低延迟，无共享
-
-参见：
-- [中断概述](overview.md)
-- [MSI-X 详解](msix.md)
-- [Legacy INTx](intx.md)
-- [中断实现](../implementation/interrupts.md)
+| 概念 | 简要说明 | 相关文档 |
+|------|----------|----------|
+| **MSI-X** | MSI 的全面升级版，将表搬到 BAR 空间，支持 2048 个独立路由的中断向量。 | [MSI-X 详解](msix.md) |
+| **Legacy INTx** | 传统共享电平中断的 PCIe 消息模拟，性能低于 MSI。 | [Legacy INTx 详解](intx.md) |
+| **Local APIC / 中断重映射** | MSI 的 `0xFEExxxxx` 地址直接指向 x86 Local APIC，虚拟化下由 VT-d IRTE 重映射。 | [中断路由详解](routing.md) |
+| **Capability Linked List** | MSI (`0x05`) 作为标准能力挂在配置空间 `0x40–0xFF` 链表中。 | [能力结构详解](../configuration/capabilities.md) |

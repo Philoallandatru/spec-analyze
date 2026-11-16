@@ -1,174 +1,52 @@
-# 主机元数据与管理地址
+# 主机元数据与管理地址（Host Metadata and Management Addresses）
 
-## 概述
+NVMe 定义了两类用于系统集成与带外/远程管理的 Feature：**管理地址（Management Address，FID `78h` / `79h`）**用于发布管理代理的 URI（如 BMC 或主机管理软件）；**主机元数据（Host Metadata，FID `7Dh` / `7Eh` / `7Fh`）**用于以 4 KiB 带类型描述符集合的形式存放主机平台、操作系统和命名空间注解。[PDF pp. 416-422](../_source/pages/page-416.md)
 
-本文档介绍 NVMe 规范中两类重要的管理功能：
+可以把它们想象成设备的**"名片夹 + 档案袋"**：名片夹（管理地址）写明"找系统级管家或主机级管家请连哪个 URI"；档案袋（主机元数据）则用来装操作系统版本、驱动信息、故障记录和命名空间卷标等描述性标签。
 
-1. **管理地址（Management Address）**：用于发布系统或主机提供的管理代理 URI，方便远程管理和监控
-2. **主机元数据（Host Metadata）**：用于存储带类型的主机平台和命名空间注解信息，供后续查询和检索
+## 管理地址（Management Address）
 
-这些功能让 NVMe 设备能够更好地与管理系统集成，提供更丰富的设备和主机环境信息。[PDF pp. 416-422](../_source/pages/page-416.md)
+管理地址使用 512 字节数据缓冲（前 4 字节保留，后 508 字节为符合 RFC 3986 的 URI）：[PDF pp. 416-417](../_source/pages/page-416.md)
 
-## 核心概念模型
+| Feature | FID | 来源与指向 | 访问控制（Lockdown） |
+|---|---|---|---|
+| **Embedded Management Controller Address** | `78h` | 系统/硬件提供，指向机箱或主板级管理控制器（如 BMC） | 可被命令与功能锁定（Lockdown）限制为仅允许 Admin SQ 路径访问 |
+| **Host Management Agent Address** | `79h` | 主机软件提供，指向 OS 或虚拟化层中的管理代理 | 可被 Lockdown 限制为仅允许带外管理端点（Management Endpoint）访问 |
 
-为了更好地理解这些功能，我们可以将其组织成如下层次结构：
+> 注：NVM 子系统内代理与 Fabric 接口管理器的 URI 则通过 **Management Address List 描述符**（类型 `1h` 与 `2h`）发布，而非上述两个 Feature。[PDF pp. 549-550](../_source/pages/page-549.md)
 
-```text
-NVM 子系统管理（NVM Subsystem Management）
-├── 嵌入式管理控制器地址（Embedded Management Controller Address）
-│   └── 指向系统/机箱级别的管理代理 URI
-└── 主机管理代理地址（Host Management Agent Address）
-    └── 指向主机软件中的管理代理 URI
+## 主机元数据（Host Metadata）
 
-主机元数据（Host Metadata）- 4 KiB 带类型的描述符集合
-├── 增强型控制器元数据（Enhanced Controller Metadata）
-│   └── 允许同一类型的描述符重复出现
-├── 控制器元数据（Controller Metadata）
-│   └── 每种类型最多一个描述符；用于兼容旧版管理控制器
-└── 命名空间元数据（Namespace Metadata）
-    └── 作用域：特定控制器 + 特定命名空间
-```
+三种主机元数据 Feature 均**可更改（Changeable=1）但不可保存（Saveable=0）**，每次读写传输固定 **4 KiB** 数据结构（首字节为描述符数量 `NMED`，字节 1 保留，字节 2 起为变长描述符列表；超 4 KiB 视为非法），且 Set Features 对缓冲内所有描述符**原子生效**。[PDF pp. 417-420](../_source/pages/page-417.md)
 
-**设计理念**：这个层次结构将"连接地址"与"描述性元数据"清晰分离，同时保留了各个元数据功能之间在多重性和作用域上的差异。[PDF pp. 416-422](../_source/pages/page-416.md)
+| Feature | FID | 作用域 | 同类型是否允许重复 | 典型用途 |
+|---|---|---|---|---|
+| **Enhanced Controller Metadata** | `7Dh` | 控制器 | **允许** | 现代推荐方式；适合记录多条同类条目（如多次故障记录） |
+| **Controller Metadata** | `7Eh` | 控制器 | 禁止（每类最多 1 条） | 兼容旧版管理控制器（如 OS、BIOS、CPU、驱动、固件信息）；若支持 `7Dh` 应优先用 `7Dh` |
+| **Namespace Metadata** | `7Fh` | 控制器 + 命名空间 | 禁止（每类最多 1 条） | 绑定特定控制器与 NSID 的 OS 卷标、启动管理器标签与限定符 |
 
-## 管理地址功能详解
+### 元素操作（`EA`）与默认值生成（`GDHM`）
 
-### 两种管理地址
+Set Features 通过 CDW11 bits `14:13` 的 **EA（Element Action）** 控制描述符增删改，不同 FID 的合法 `EA` 不同：[PDF pp. 418-420](../_source/pages/page-418.md)
 
-NVMe 规范定义了两种管理地址功能特性（Feature），它们都用于存储管理代理的 URI：
+| `EA` 值 | 操作含义 | `7Dh`（Enhanced） | `7Eh` / `7Fh` |
+|---|---|---|---|
+| `00b` | Add or Replace Entry（添加或替换） | **禁止**（返回 `Invalid Field in Command`） | **允许**（无则建，有则替） |
+| `01b` | Delete Entry Multiple（删除多项） | **允许**（幂等，不存在不报错） | **允许**（幂等） |
+| `10b` | Add Entry Multiple（添加多项） | **允许**（支持同类型多条） | 非设计目标 |
 
-| 功能特性 | Feature ID | 数据格式 | 来源 | 用途 |
-|---------|-----------|---------|------|------|
-| **嵌入式管理控制器地址**<br>Embedded Management Controller Address | `78h` | 508 字节 RFC 3986 URI<br>（前 4 字节保留） | 系统/硬件提供 | 指向系统级或机箱级的管理控制器 |
-| **主机管理代理地址**<br>Host Management Agent Address | `79h` | 508 字节 RFC 3986 URI<br>（前 4 字节保留） | 主机软件提供 | 指向主机软件中的管理代理 |
+- **默认值生成（`GDHM`）**：Get Features 时置 CDW11 bit 0（`GDHM=1`）可请求控制器生成实现定义的默认字符串并更新"默认"返回值；该生成的默认值在后续 `SEL=001b` 读取中保持有效，但**不跨 Controller Level Reset**。[PDF pp. 418-420](../_source/pages/page-418.md)
+- **命名空间元数据查询**：FID `7Fh` 必须通过 `NSID` 指定目标命名空间，若找不到对应 NSID 则返回 `Invalid Namespace or Format`。
 
-[PDF pp. 416-417](../_source/pages/page-416.md)
+## 规范依据
 
-### 管理地址的配置来源
+- [Embedded Mgmt Controller Address（78h）与 Host Mgmt Agent Address（79h），PDF pp. 416-417](../_source/pages/page-416.md)
+- [GDHM 默认值生成与 EA 原子操作（4 KiB 限制），PDF pp. 418-419](../_source/pages/page-418.md)
+- [Enhanced Controller（7Dh）、Controller（7Eh）与 Namespace Metadata（7Fh），PDF pp. 420-422](../_source/pages/page-420.md)
+- [Management Address List 描述符类型 1h/2h，PDF pp. 549-550](../_source/pages/page-549.md)
 
-实际部署中，管理地址可以指向多种不同类型的管理实体：
+## 关联与引申概念
 
-1. **NVM 子系统内的代理**：直接在存储设备内运行的管理功能
-2. **Fabric 接口管理器**：网络存储架构中的交换机或网关管理器
-3. **嵌入式管理控制器**：服务器主板上的 BMC（Baseboard Management Controller）等
-4. **主机软件代理**：操作系统或虚拟化层中的管理软件
-
-**发布机制**：
-- 子系统和 Fabric 管理器的 URI 通过 **Management Address List 描述符**发布（类型 `1h` 和 `2h`）
-- 嵌入式控制器和主机软件的 URI 使用各自独立的 Feature 功能发布
-
-[PDF pp. 549-550](../_source/pages/page-549.md)
-
-### 安全与访问控制
-
-当系统支持**命令与功能锁定（Command and Feature Lockdown）**时，这两个管理地址都应该可以被锁定，以防止未授权的修改。具体而言：
-
-- **嵌入式管理控制器地址**：可以限制为仅允许通过 Admin Submission Queue 路径访问
-- **主机管理代理地址**：可以限制为仅允许通过带外管理端点（out-of-band Management Endpoint）路径访问
-
-这种细粒度的访问控制确保了管理接口的安全性。[PDF pp. 416-417](../_source/pages/page-416.md)
-
-## 主机元数据功能详解
-
-### 三种元数据类型对比
-
-| 元数据类型 | Feature ID | 作用域 | 允许重复 | 主要用途 |
-|-----------|-----------|--------|---------|---------|
-| **增强型控制器元数据**<br>Enhanced Controller Metadata | `80h` | 控制器级别 | ✓ 是 | 现代推荐方式，灵活性更高 |
-| **控制器元数据**<br>Controller Metadata | `7Ah` | 控制器级别 | ✗ 否 | 兼容旧版管理控制器 |
-| **命名空间元数据**<br>Namespace Metadata | `7Bh` | 控制器 + 命名空间 | ✗ 否 | 特定命名空间的标签和限定符 |
-
-### 元数据更新机制
-
-所有三种元数据功能都具有以下共同特性：
-
-**基本属性**：
-- ✓ **可更改（Changeable）**：主机可以通过 Set Feature 命令修改
-- ✗ **不可保存（Non-saveable）**：重启后不会自动恢复，需要主机重新设置
-
-**数据结构**：
-- 主机传输一个 **4 KiB** 的数据结构
-- 结构中包含**零个或多个**变长的带类型描述符（Typed Descriptors）
-- 每次 Set Feature 操作是**原子性**的（要么全部成功，要么全部失败）
-- 数据超过 4 KiB 会被视为非法操作
-
-[PDF pp. 417-420](../_source/pages/page-417.md)
-
-### 元数据操作规则
-
-不同的元数据类型在操作规则上有所差异：
-
-| 操作 | 增强型控制器元数据 | 控制器/命名空间元数据 |
-|------|-------------------|---------------------|
-| **添加或替换指定类型** | ✗ 禁止直接替换 | ✓ 不存在则创建，存在则替换 |
-| **删除指定类型** | ✓ 允许，且幂等 | ✓ 允许，且幂等 |
-| **添加同类型的多个值** | ✓ 允许 | ✗ 禁止 |
-
-**为什么有这些差异？**
-
-- **增强型控制器元数据**：允许同类型重复，适合记录多个同类事件（如多次故障记录）
-- **控制器/命名空间元数据**：每类型仅一个值，结构更简单，适合唯一性信息（如操作系统名称）
-
-[PDF pp. 418-420](../_source/pages/page-418.md)
-
-### 默认值生成机制
-
-主机可以通过设置 `GDHM=1`（Generate Default Host Metadata）标志位，请求控制器生成实现定义的默认字符串。
-
-**默认值的生命周期**：
-- ✓ 修改后的默认值在后续的 Get Feature 读取中依然有效
-- ✗ 控制器级别重置（Controller Level Reset）后默认值会丢失
-
-这个功能对于初始配置或快速重置元数据很有用。[PDF pp. 418-420](../_source/pages/page-418.md)
-
-### 各类元数据的具体用途
-
-#### 增强型/控制器元数据
-
-这两类元数据用于描述主机和控制器的环境信息，包括：
-
-- **操作系统信息**（Operating System）：OS 名称、版本、构建号等
-- **预启动环境**（Pre-boot）：UEFI、BIOS 等固件信息
-- **处理器信息**（Processor）：CPU 型号、架构等
-- **驱动程序信息**（Driver）：NVMe 驱动版本、供应商等
-- **固件信息**（Firmware）：控制器固件版本和相关信息
-- **产品信息**（Product）：主机系统的产品型号等
-- **故障记录**（Failure Record）：历史故障和诊断信息
-
-**兼容性说明**：控制器元数据主要用于兼容早期的管理控制器。当设备同时支持增强型控制器元数据时，应优先使用增强型版本，不应再使用控制器元数据。
-
-#### 命名空间元数据
-
-命名空间元数据具有**双重作用域**：既与特定控制器绑定，也与特定命名空间绑定。
-
-**主要用途**：
-- **操作系统命名空间标签**：OS 分配给该命名空间的设备名称或卷标
-- **预启动环境标签**：启动管理器中的命名空间标识
-- **命名空间限定符**：其他特定于命名空间的描述性信息
-
-这使得管理软件能够跟踪和识别特定命名空间在不同环境中的使用情况。
-
-[PDF pp. 420-422](../_source/pages/page-420.md)
-
-## 相关概念
-
-### 命令与功能锁定
-
-[命令与功能锁定（Command and Feature Lockdown）](command-and-feature-lockdown.md)机制可以禁止对管理地址的未授权更新，确保管理配置的稳定性和安全性。[PDF pp. 416-417](../_source/pages/page-416.md)
-
-### 文本处理规范
-
-[身份、名称和列表格式（Identity, Name, and List Formats）](identity-name-and-list-formats.md)定义了文本元素使用的 UTF-8 处理边界和规范，确保元数据中的文本信息能够正确编码和解析。[PDF pp. 186-188](../_source/pages/page-186.md)
-
-## 规范引用
-
-以下是本文档涉及的 NVMe 规范页面详细引用：
-
-- [CDQ 边界与嵌入式管理控制器地址，PDF p. 416](../_source/pages/page-416.md)
-- [主机管理代理地址与元数据功能系列，PDF p. 417](../_source/pages/page-417.md)
-- [生成默认值机制，PDF p. 418](../_source/pages/page-418.md)
-- [原子元素操作与 4 KiB 上限约束，PDF p. 419](../_source/pages/page-419.md)
-- [描述符封装格式与增强型控制器元数据，PDF p. 420](../_source/pages/page-420.md)
-- [控制器元数据元素目录与兼容性说明，PDF p. 421](../_source/pages/page-421.md)
-- [命名空间元数据与相邻的主机标识符边界，PDF p. 422](../_source/pages/page-422.md)
-- [配置来源、日志描述符与路径特定的锁定机制，PDF pp. 549-550](../_source/pages/page-549.md)
+- **命令与功能锁定（Command and Feature Lockdown）**：可锁定 `78h` / `79h` 等管理 Feature，防止未授权路径篡改 URI。详见 [命令与功能锁定](command-and-feature-lockdown.md)。
+- **UTF-8 处理边界**：主机元数据中的字符串在协议层按原始二进制字节存储与比较，不做 Unicode 规范化或本地化排序。详见 [身份、名称与列表格式](identity-name-and-list-formats.md)。
+- **Namespace Admin Label（FID `1Fh`）**：另一项以命名空间为作用域、必保存的 256 字节人读标签特性，与不可保存的 `7Fh` 用途不同。详见 [特性值与作用域](feature-values-and-scope.md) 与 [通用控制器特性](common-controller-features.md)。

@@ -1,102 +1,72 @@
-# Error and Health Logs
+# 错误信息与健康日志（Error and Health Logs）
 
-The Error Information log is a controller-global, recency-ordered history of extended command and non-command errors. The SMART / Health Information log is a lifetime-oriented health snapshot available at controller scope and optionally requested per namespace, although Revision 2.1 defines identical content for those two SMART views. [PDF pp. 229-230](../_source/pages/page-229.md)
+NVMe 通过两份核心日志暴露设备的健康与异常状态：**错误信息日志（Error Information Log，`LID 01h`）** 是按时间倒序排列的控制器级“事故台账”，记录扩展的命令错误与异步错误；**SMART / 健康信息日志（SMART / Health Information Log，`LID 02h`）** 则是跨断电保留的“健康仪表盘”，提供当前告警位图与终生累计计数器。[PDF 第 229-231 页](../_source/pages/page-229.md)
 
-## Mental model
-
-```text
-command error / async error                 controller and media state
-             |                                         |
-             v                                         v
-   +---------------------+                    +---------------------+
-   | Error Information   |                    | SMART / Health      |
-   | newest entry first  |                    | current warnings +  |
-   | 64-byte records     |                    | lifetime counters   |
-   +----------+----------+                    +----------+----------+
-              \-------------- Get Log Page -------------/
-```
-
-This explanatory comparison separates event history from health state; it is not a reconstruction of a numbered figure. [PDF pp. 229-231](../_source/pages/page-229.md)
-
-## Error Information contract
-
-`M=1` in a command completion indicates that extended status is available in the Error Information log; an Error asynchronous event may also point to it. The requested number of 64-byte records returns the most recent records first. Capacity is `ELPE`-defined; when full, the controller should insert the new record and discard the oldest. [PDF p. 229](../_source/pages/page-229.md)
+## 心智模型：急诊台账 vs 体检档案
 
 ```text
-Error Information entry (64 bytes)
-+--------+------+------+------+-----+------+-----+-----+--------+
-| ECNT   | SQID | CID  | STS  | PEL | NSID | CSI | OPC | detail |
-|  0..7  | 8..9 |10..11|12..13|14..15|24..27| 30 | 31  | rest   |
-+--------+------+------+------+-----+------+-----+-----+--------+
- correlation       status + bad parameter       command identity
+命令错误 (CQE.M=1) / 异步错误 (AER)       控制器与介质运行状态
+                |                                   |
+                v                                   v
+      +--------------------+              +--------------------+
+      | Error Information  |              | SMART / Health     |
+      | 事故台账 (64B/条)  |              | 体检档案 (512B)    |
+      | 最新在前，掉电清空 |              | 瞬时告警+终生计数  |
+      +---------+----------+              +---------+----------+
+                \--------- Get Log Page ------------/
 ```
 
-This compact explanatory projection of Figure 205 intentionally omits reserved bytes and specialized detail fields; it was checked against rendered PDF pages 229-230. `SQID=CID=FFFFh` and `PEL=FFFFh` identify an error not tied to a particular command. [PDF pp. 229-230](../_source/pages/page-229.md)
+## 错误信息日志（`LID 01h`）
 
-| Field group | Meaning |
-|---|---|
-| `ECNT` | Persistent unique error counter starting at 1, wrapping from all ones to 1; zero marks an invalid/missing slot. |
-| `SQID`, `CID` | Correlate a command, or use `FFFFh` when no command applies. |
-| `STS`, `PEL` | Preserve completion status and identify the least-significant erroneous byte/bit when applicable. |
-| NSID and command detail | Associate namespace, I/O-command-set data, opcode/CSI, command-specific data, transport, and optional vendor log. |
-| `LPVER` | Revision 2.1 defines the entry version as `1h`. |
-
-These fields are the semantic groups of the rendered cross-page structure, not a substitute for its exact byte layout. [PDF pp. 229-230](../_source/pages/page-229.md)
-
-The controller should remove Error Information entries on power cycle and Controller Level Reset, even though `ECNT` itself is retained across power-off conditions. [PDF p. 229](../_source/pages/page-229.md)
-
-## SMART / Health contract
-
-SMART / Health data is retained across power cycles unless a field says otherwise. `NSID=0h` or `FFFFFFFFh` requests controller data; hosts seeking compatibility with Revision 1.4 and earlier should use `FFFFFFFFh`. If per-namespace SMART is unsupported, any other NSID fails with `Invalid Field in Command`. [PDF p. 230](../_source/pages/page-230.md)
-
-| Health signal | Interpretation |
-|---|---|
-| Critical Warning | Current bitmask for spare, temperature, reliability, all-media read-only, volatile-backup failure, and PMR read-only/unreliable conditions. |
-| Composite Temperature | Implementation-defined Kelvin value representing the controller and associated namespaces, not necessarily a physical sensor location. |
-| Available Spare / Threshold | Normalized remaining spare and its asynchronous-event threshold. |
-| Percentage Used | Vendor estimate of consumed NVM life; 100 is endurance consumed, not necessarily failure, and values may exceed 100 up to saturation at 255. |
-
-The warning and early health fields above are the portion of Figure 206 that begins in this batch and continues on later pages. They were checked against rendered PDF page 231; later counters are intentionally deferred to the batch that owns them. [PDF p. 231](../_source/pages/page-231.md)
-
-Critical-warning bits represent state when Get Log Page is processed and may differ from the state at the time of a related asynchronous notification. Configured warning classes may generate AER completions. [PDF p. 231](../_source/pages/page-231.md)
-
-## Health accounting and thermal history
+当命令完成项（CQE）中 **`M = 1`**（More）或控制器上报 Error 类型异步事件（AER）时，主机应通过 `Get Log Page` 读取 `LID 01h` 获取详细上下文。日志容量由 Identify Controller 中的 `ELPE` 字段决定，写满后自动覆盖最老条目。[PDF 第 229-230 页](../_source/pages/page-229.md)
 
 ```text
-instantaneous state              accumulated history
-warning bits + temperature  -->  data units / host commands
-spare + percentage used          busy time / power cycles / hours
-sensor temperatures              unsafe shutdowns / errors / thermal time
+错误信息条目（64 字节，简化结构）
++--------+------+------+------+-----+------+-----+-----+----------+
+| ECNT   | SQID | CID  | STS  | PEL | NSID | CSI | OPC | 详情/厂商|
+|  0..7  | 8..9 |10..11|12..13|14..15|24..27| 30 | 31  | 剩余字节 |
++--------+------+------+------+-----+------+-----+-----+----------+
 ```
 
-This explanatory split distinguishes a sampled condition from counters retained across power cycles; it is not a byte-layout reconstruction. [PDF pp. 231-234](../_source/pages/page-231.md)
-
-| Counter family | Interpretation |
+| 关键字段 | 含义与规则 |
 |---|---|
-| Data Units Read/Written | Count thousands of 512-byte units, rounded up; metadata is excluded. |
-| Host Read/Write Commands | Count completed read/write commands requested by the host. |
-| Controller Busy Time | Minutes during which the controller is busy processing I/O commands. |
-| Power history | Power cycles, power-on hours, and unsafe shutdowns; unsafe shutdown scope follows the shutdown-notification rules. |
-| Error history | Media/data-integrity errors and the lifetime number of Error Information log entries. |
-| Thermal history | Minutes above warning/critical composite thresholds plus up to eight temperature sensors and thermal-management transition counts/time. |
+| **`ECNT`** | 持久化的唯一错误计数器，从 `1` 开始单调递增（全 1 后回绕到 `1`）；**`ECNT=0` 表示槽位无效或已丢失** |
+| **`SQID` / `CID`** | 关联到出错命令；若与具体命令无关，则 `SQID=CID=FFFFh` |
+| **`STS` / `PEL`** | 保留完成状态（Status）；`PEL` 定位出错命令参数的最末位字节/位（非参数错误则为 `FFFFh`） |
+| **`NSID` / `CSI` / `OPC`** | 关联命名空间、命令集标识与操作码（受日志版本 `LPVER=1h` 约束） |
 
-The SMART counters are large lifetime-style accumulators; sensor values are Kelvin, and an unsupported temperature sensor reports zero. [PDF pp. 232-234](../_source/pages/page-232.md)
+- **清空规则**：`ECNT` 计数器本身跨断电保留，但控制器在**断电和控制器级复位（CLR）后应清空**错误信息日志条目。
 
-## Relationships
+## SMART / 健康信息日志（`LID 02h`）
 
-- [Completion Queue Entry and Status](completion-queue-entry-and-status.md) supplies the `M` hint and status copied into an Error Information record. [PDF p. 229](../_source/pages/page-229.md)
-- [Asynchronous Event Reporting](asynchronous-event-reporting.md) points hosts to error or health detail and controls which SMART warnings notify. [PDF pp. 229, 231](../_source/pages/page-229.md)
-- [Log Page Retrieval](log-page-retrieval.md) defines length, offset, event retention, and scope-selection mechanics shared by both logs. [PDF pp. 223-227](../_source/pages/page-223.md)
+SMART 数据默认跨断电保留（除非个别字段另有说明）。请求控制器级数据时可使用 `NSID=0h` 或 `FFFFFFFFh`（为兼容 1.4 及更早版本，**主机应优先使用 `FFFFFFFFh`**）；在修订版 2.1 中，即便支持按命名空间请求，其返回内容也与控制器级完全相同。[PDF 第 230-234 页](../_source/pages/page-230.md)
 
-## Edge cases
+### 1. 瞬时告警与状态
 
-- `ECNT=0` denotes an invalid entry, including lost entries or unused capacity; it is not a valid first error identifier. [PDF p. 229](../_source/pages/page-229.md)
-- `CSI`, `OPC`, and `SQID` together identify the command and command set only when the Error Information log version makes CSI/OPC valid. [PDF p. 230](../_source/pages/page-230.md)
-- Namespace-specific SMART requests in Revision 2.1 do not produce namespace-specific field values, even when the request form is supported. [PDF p. 230](../_source/pages/page-230.md)
+| 字段 | 含义 |
+|---|---|
+| **Critical Warning（关键告警）** | 位图，反映处理 `Get Log Page` 瞬间的状态：备件不足、温度异常、可靠性下降、全介质只读、易失备份失败、PMR 异常等；可配置为触发 AER |
+| **Composite Temperature（综合温度）** | 实现定义的开尔文（Kelvin）温度，代表控制器及关联命名空间 |
+| **Available Spare / Threshold** | 归一化剩余备件百分比及触发告警的阈值 |
+| **Percentage Used（已用百分比）** | 厂商估计的寿命消耗；`100` 表示设计寿命耗尽，但**不等于立即故障**，允许继续递增至饱和值 `255` |
 
-## Evidence
+### 2. 终生累计计数器
 
-- Error history behavior and first half of Figure 205: [PDF p. 229](../_source/pages/page-229.md)
-- Figure 205 continuation and SMART scope rules: [PDF p. 230](../_source/pages/page-230.md)
-- SMART warning and initial health fields: [PDF p. 231](../_source/pages/page-231.md)
-- SMART lifetime counters, shutdown/error history, and thermal sensors: [PDF pp. 232-234](../_source/pages/page-232.md)
+- **Data Units Read / Written**：以 `1000 × 512` 字节为单位向上取整计数，**不含元数据**。
+- **Host Read / Write Commands** & **Controller Busy Time**：已完成的读写命令数，以及控制器忙于处理 I/O 的累计分钟数。
+- **Power History**：上下电次数（Power Cycles）、累计通电小时数、非安全关机次数（Unsafe Shutdowns；一次非安全关机同时增加 Power Cycle 与 Unsafe Shutdown 计数）。
+- **Error & Thermal History**：介质/数据完整性错误累计、错误日志条目终生累计数、高/低温度阈值跨越分钟数、热管理转换计数，以及最多 8 个温度传感器读数（Kelvin，不支持则返回 `0`）。
+
+## 关联与引申概念
+
+- **完成队列项与状态（CQE）**：提供 `M=1` 提示位和复制进错误日志的 `STS` 字段，见 [完成队列项与状态](completion-queue-entry-and-status.md)。
+- **异步事件报告（AER）**：在发生严重错误或 Critical Warning 亮灯时主动通知主机去读日志，见 [异步事件报告](asynchronous-event-reporting.md)。
+- **日志页读取（Get Log Page）**：定义 `LID`、`RAE` 清事件等通用读取机制，见 [日志页读取](log-page-retrieval.md)。
+- **持久化事件日志 & Telemetry**：用于跨断电事件流归档与深度固件诊断，见 [持久化事件日志](persistent-event-log.md) 与 [Telemetry 捕获日志](telemetry-capture-logs.md)。
+
+## 规范依据
+
+- [Error Information 总述与 Figure 205 前半，PDF 第 229 页](../_source/pages/page-229.md)
+- [Error Information 续与 SMART 作用域规则，PDF 第 230 页](../_source/pages/page-230.md)
+- [SMART 告警与初始健康字段，PDF 第 231 页](../_source/pages/page-231.md)
+- [SMART 终生计数器、关机/错误与温度历史，PDF 第 232-234 页](../_source/pages/page-232.md)

@@ -1,709 +1,127 @@
-# PCIe 错误恢复
+# PCIe 错误恢复机制
 
-## 概述
+**PCIe 错误恢复**是系统在检测到总线或设备异常后，在不重启整台服务器的前提下，通过硬件自愈、驱动协调或局部复位让设备恢复正常工作的容错流程。就像大楼的消防应急预案：**小火由自动喷淋当场扑灭（可纠正错误），局部故障由楼层管理员断电排查后重启（非致命错误/FLR），重大火情则立即关闭防火门隔离楼层再抢修（DPC 硬件隔离 + 热复位）**。
 
-PCIe 错误恢复机制允许系统在检测到错误后尝试自动恢复，而无需重启整个系统。本文详细介绍 PCIe 的错误恢复流程、策略和实现。
+---
 
-## 错误恢复层次
+## 分层恢复决策架构
 
-```
-错误严重性                恢复策略
-───────────────────────────────────────
-可纠正错误                自动透明恢复
-(Correctable)            无需软件干预
-    ↓
-非致命错误                设备级恢复
-(Non-Fatal)              驱动参与恢复
-    ↓
-致命错误                  链路级恢复
-(Fatal)                  可能需要热复位
-    ↓
-无法恢复                  设备隔离
-                         系统降级运行
-```
-
-## 可纠正错误恢复
-
-### 自动恢复机制
+系统收到 AER 错误报告后，会根据错误严重程度和设备状态选择对应的恢复路径：
 
 ```
-1. Receiver Error (接收错误)
-   检测 --> 物理层自动重同步
-        --> 透明恢复
-        --> 记录 CE Status
-
-2. Replay Timeout (重传超时)
-   超时 --> 发送 NAK DLLP
-        --> 发送端从重试缓冲区重传
-        --> 继续正常传输
-
-3. Bad TLP/DLLP
-   检测 --> 丢弃数据包
-        --> 等待重传
-        --> 透明恢复
-
-特点：
-- 硬件自动处理
-- 软件无感知
-- 不中断数据流
-- 仅记录统计信息
+                        检测到 PCIe 错误
+                               │
+         ┌─────────────────────┼─────────────────────┐
+         ▼                     ▼                     ▼
+   Correctable           Uncorrectable         Uncorrectable
+  （可纠正错误）         Non-Fatal（非致命）      Fatal（致命错误）
+         │                     │                     │
+         ▼                     ▼                     ▼
+  硬件自动透明恢复        OS 调度驱动回调         立即冻结 I/O / DPC 隔离
+  • 重传 / 物理层重同步    • 尝试在线恢复或 FLR    • 执行 Hot Reset（热复位）
+  • 频繁出错触发链路重训练  • 失败则升级为复位      • 仍失败则永久隔离（Disconnect）
 ```
 
-### 链路重训练
+---
 
-```c
-// 可纠正错误导致的链路重训练
-void handle_correctable_error_recovery(struct pcie_port *port)
-{
-    struct error_stats *stats = &port->error_stats;
-    
-    // 增加错误计数
-    stats->correctable_errors++;
-    
-    // 如果错误率过高，触发链路重训练
-    if (stats->correctable_errors > CE_ERROR_THRESHOLD) {
-        pr_warn("High correctable error rate, retraining link\n");
-        
-        // 发起链路重训练
-        retrain_link(port);
-        
-        // 复位错误计数
-        stats->correctable_errors = 0;
-        stats->retrain_count++;
-    }
-}
+## 一、可纠正错误恢复（硬件自愈）
 
-// 链路重训练实现
-int retrain_link(struct pcie_port *port)
-{
-    u16 link_ctrl;
-    int timeout;
-    
-    // 读取 Link Control 寄存器
-    pcie_capability_read_word(port->pdev, PCI_EXP_LNKCTL, &link_ctrl);
-    
-    // 设置 Retrain Link 位
-    link_ctrl |= PCI_EXP_LNKCTL_RL;
-    pcie_capability_write_word(port->pdev, PCI_EXP_LNKCTL, link_ctrl);
-    
-    // 等待链路重训练完成
-    timeout = 1000;  // 1 秒超时
-    while (timeout--) {
-        u16 link_status;
-        
-        pcie_capability_read_word(port->pdev, PCI_EXP_LNKSTA, &link_status);
-        
-        // 检查 Link Training 位
-        if (!(link_status & PCI_EXP_LNKSTA_LT)) {
-            pr_info("Link retrain completed successfully\n");
-            return 0;
-        }
-        
-        msleep(1);
-    }
-    
-    pr_err("Link retrain timeout\n");
-    return -ETIMEDOUT;
-}
-```
+可纠正错误由物理层和数据链路层在微秒~毫秒级自动解决，**对操作系统和业务软件完全透明**：
 
-## 非致命错误恢复
+1. **Receiver Error**：物理层通过时钟数据恢复（CDR）重新锁定信号。
+2. **Bad TLP / Replay Timeout**：接收端丢弃坏包并回复 **NAK DLLP**，发送端从 **Retry Buffer** 重传未确认的 TLP。
+3. **链路重训练（Link Retrain）**：若短时间内可纠正错误计数过高（如 **REPLAY_NUM Rollover**），硬件或端口驱动会置位 Link Control 寄存器的 **Retrain Link（`RL`）** 位，令 **LTSSM（链路训练与状态机）** 重新进入 `Recovery` 状态校准均衡参数与信号质量。
 
-### 恢复流程
+---
+
+## 二、非致命错误恢复（驱动协同四步曲）
+
+当发生 **Non-Fatal** 错误（如 Completion Timeout、Poisoned TLP）时，链路本身通常仍完好，Linux 内核 AER 驱动会通过设备驱动注册的 `pci_error_handlers` 回调接口，按以下状态机协调恢复：
 
 ```
-1. 错误检测
-   设备检测到错误
-        ↓
-   设置 UCE Status[错误位]
-        ↓
-   如果未被掩码，触发 AER 中断
-
-2. 错误报告
-   Root Port 收到错误信号
-        ↓
-   Root Error Status 记录
-        ↓
-   系统中断到 AER 驱动
-
-3. 错误分析
-   AER 驱动读取错误状态
-        ↓
-   识别错误设备
-        ↓
-   收集错误信息（Header Log）
-
-4. 驱动通知
-   调用驱动的 error_detected 回调
-        ↓
-   驱动决定恢复策略
-        ↓
-   返回恢复结果
-
-5. 恢复执行
-   根据驱动返回值执行恢复
-        ↓
-   - PCI_ERS_RESULT_CAN_RECOVER: 继续
-   - PCI_ERS_RESULT_NEED_RESET: 复位
-   - PCI_ERS_RESULT_DISCONNECT: 隔离设备
-
-6. 恢复完成
-   调用驱动的 resume 回调
-        ↓
-   清除错误状态
-        ↓
-   设备恢复正常运行
+1. error_detected(dev, channel_state)
+   告知驱动错误已发生及当前通道状态：
+   • io_normal       → 通道正常，驱动返回 CAN_RECOVER
+   • io_frozen       → I/O 已冻结，驱动停止下发新请求，返回 CAN_RECOVER 或 NEED_RESET
+   • io_perm_failure → 永久损坏，返回 DISCONNECT（卸载/隔离设备）
+          │
+          ├──[返回 CAN_RECOVER]──▶ 2. mmio_enabled(dev)
+          │                           允许驱动读取 BAR 寄存器清除设备内部错误；
+          │                           若读取返回 0xFFFFFFFF（无响应），改判 NEED_RESET
+          │
+          └──[返回 NEED_RESET]───▶ 3. slot_reset(dev)
+                                      内核执行 FLR 或热复位后调用，
+                                      驱动恢复 PCIe 配置空间、重新使能 Bus Master 并重初始化硬件
+                                             │
+                                             ▼
+                                   4. resume(dev)
+                                      清除 AER 状态寄存器（RW1C），恢复正常 I/O 队列
 ```
 
-### Linux 内核实现
+| 回调返回值（`pci_ers_result_t`） | 含义与后续动作 |
+|-------------------------------|--------------|
+| `PCI_ERS_RESULT_CAN_RECOVER` | 驱动认为无需复位即可尝试恢复，进入 `mmio_enabled` |
+| `PCI_ERS_RESULT_NEED_RESET` | 必须复位硬件才能清状态，内核执行复位后调用 `slot_reset` |
+| `PCI_ERS_RESULT_RECOVERED` | 硬件状态已清理完毕，准备进入 `resume` 恢复业务 |
+| `PCI_ERS_RESULT_DISCONNECT` | 设备无法恢复，内核将其从系统隔离，防止拖垮主机 |
 
-```c
-// PCI 错误恢复回调接口
-struct pci_error_handlers {
-    pci_ers_result_t (*error_detected)(struct pci_dev *dev,
-                                        pci_channel_state_t error);
-    pci_ers_result_t (*mmio_enabled)(struct pci_dev *dev);
-    pci_ers_result_t (*slot_reset)(struct pci_dev *dev);
-    void (*resume)(struct pci_dev *dev);
-};
+---
 
-// 驱动实现错误检测回调
-static pci_ers_result_t my_error_detected(struct pci_dev *pdev,
-                                           pci_channel_state_t state)
-{
-    struct my_device *mydev = pci_get_drvdata(pdev);
-    
-    pr_info("Error detected on device %s, state=%d\n",
-            pci_name(pdev), state);
-    
-    // 根据通道状态决定恢复策略
-    switch (state) {
-    case pci_channel_io_normal:
-        // I/O 正常，可能是软件错误
-        return PCI_ERS_RESULT_CAN_RECOVER;
-        
-    case pci_channel_io_frozen:
-        // I/O 冻结，停止所有 I/O 操作
-        stop_device_io(mydev);
-        
-        // 尝试 MMIO 访问以检查设备状态
-        if (can_access_device(mydev))
-            return PCI_ERS_RESULT_CAN_RECOVER;
-        else
-            return PCI_ERS_RESULT_NEED_RESET;
-        
-    case pci_channel_io_perm_failure:
-        // 永久失败，无法恢复
-        pr_err("Permanent failure on device %s\n", pci_name(pdev));
-        return PCI_ERS_RESULT_DISCONNECT;
-    }
-    
-    return PCI_ERS_RESULT_NEED_RESET;
-}
+## 三、致命错误恢复：FLR vs Hot Reset
 
-// MMIO 启用后的回调
-static pci_ers_result_t my_mmio_enabled(struct pci_dev *pdev)
-{
-    struct my_device *mydev = pci_get_drvdata(pdev);
-    
-    // 尝试读取设备寄存器
-    u32 status = ioread32(mydev->bar0 + STATUS_REG);
-    
-    if (status == 0xFFFFFFFF) {
-        // 设备无响应，需要复位
-        pr_warn("Device not responding, need reset\n");
-        return PCI_ERS_RESULT_NEED_RESET;
-    }
-    
-    // 清除设备错误状态
-    iowrite32(0xFFFFFFFF, mydev->bar0 + ERROR_CLEAR_REG);
-    
-    // 设备可以恢复
-    return PCI_ERS_RESULT_RECOVERED;
-}
+当发生 **Fatal** 错误（如 Data Link Protocol Error、Malformed TLP）或非致命错误恢复失败时，必须对设备甚至整条链路执行复位。两种核心复位手段的对比如下：
 
-// 槽位复位回调
-static pci_ers_result_t my_slot_reset(struct pci_dev *pdev)
-{
-    struct my_device *mydev = pci_get_drvdata(pdev);
-    int err;
-    
-    pr_info("Performing slot reset on device %s\n", pci_name(pdev));
-    
-    // 重新启用设备
-    err = pci_enable_device(pdev);
-    if (err) {
-        pr_err("Failed to re-enable device: %d\n", err);
-        return PCI_ERS_RESULT_DISCONNECT;
-    }
-    
-    // 恢复配置空间
-    pci_restore_state(pdev);
-    
-    // 重新设置 Bus Master
-    pci_set_master(pdev);
-    
-    // 重新初始化设备
-    err = reinit_device_hw(mydev);
-    if (err) {
-        pr_err("Failed to reinitialize device: %d\n", err);
-        return PCI_ERS_RESULT_DISCONNECT;
-    }
-    
-    pr_info("Slot reset completed successfully\n");
-    return PCI_ERS_RESULT_RECOVERED;
-}
+| 特性 | FLR（Function Level Reset，功能级复位） | Hot Reset（热复位 / Secondary Bus Reset） |
+|-----|---------------------------------------|----------------------------------------|
+| **影响范围** | **仅复位单个 Function**（如 SR-IOV 中的单个 VF，不影响同卡其他功能） | **复位下游整条总线/链路**，所有下游设备都会重新训练 |
+| **触发方式** | 向设备 PCIe Cap 的 Device Control 寄存器写入 `Initiate FLR` 位 | 向 Root Port / Switch 下行端口的 **Bridge Control** 寄存器置位 `Secondary Bus Reset` |
+| **典型耗时** | 至少等待 **100 ms** | 保持复位脉冲至少 **100 ms**，释放后再等链路训练稳定（约 200 ms） |
+| **使用前提** | 设备 Device Capabilities 必须声明支持 FLR | 任何 PCIe 链路均支持（带内发送 TS1 热复位序列） |
 
-// 恢复完成回调
-static void my_error_resume(struct pci_dev *pdev)
-{
-    struct my_device *mydev = pci_get_drvdata(pdev);
-    
-    pr_info("Resuming normal operation on device %s\n", pci_name(pdev));
-    
-    // 重启 I/O 操作
-    restart_device_io(mydev);
-    
-    // 清除 AER 错误状态
-    pci_aer_clear_nonfatal_status(pdev);
-    pci_cleanup_aer_uncorrect_error_status(pdev);
-    
-    // 重新启用错误报告
-    pci_enable_pcie_error_reporting(pdev);
-}
+> **关键注意事项**：无论是 FLR 还是 Hot Reset，复位都会清空设备 BAR、中断（MSI-X）和 Bus Master 等配置。因此内核在复位前必须先保存配置空间（`pci_save_state`），复位完成后再恢复（`pci_restore_state`）并重新启用 AER 错误报告。
 
-// 注册错误处理回调
-static struct pci_error_handlers my_err_handlers = {
-    .error_detected = my_error_detected,
-    .mmio_enabled = my_mmio_enabled,
-    .slot_reset = my_slot_reset,
-    .resume = my_error_resume,
-};
+---
 
-static struct pci_driver my_pci_driver = {
-    .name = "my_driver",
-    .id_table = my_pci_ids,
-    .probe = my_probe,
-    .remove = my_remove,
-    .err_handler = &my_err_handlers,  // 注册错误处理
-};
-```
+## 四、DPC（Downstream Port Containment，下行端口隔离）
 
-### 恢复结果代码
+**DPC** 是 PCIe 3.1/4.0+ 广泛部署的**硬件级快速隔离机制**。在没有 DPC 之前，如果下游设备发生致命错误并继续向上游狂发损坏的 TLP，往往在操作系统 AER 中断还没来得及响应时，系统内存或 CPU 就已经被污染导致宕机（Kernel Panic / MCE）。
 
-```c
-// 错误恢复结果
-enum pci_ers_result {
-    PCI_ERS_RESULT_NONE = 1,        // 没有结果，继续下一步
-    PCI_ERS_RESULT_CAN_RECOVER,     // 设备可以恢复
-    PCI_ERS_RESULT_NEED_RESET,      // 需要复位设备
-    PCI_ERS_RESULT_DISCONNECT,      // 无法恢复，隔离设备
-    PCI_ERS_RESULT_RECOVERED,       // 已恢复
-};
-
-// 通道状态
-typedef enum {
-    pci_channel_io_normal = 0,      // I/O 正常
-    pci_channel_io_frozen = 1,      // I/O 冻结
-    pci_channel_io_perm_failure = 2 // 永久失败
-} pci_channel_state_t;
-```
-
-## 致命错误恢复
-
-### 热复位 (Hot Reset)
+DPC 就像安装在 Root Port 或 Switch 下行端口的**自动空气开关**：
 
 ```
-热复位流程：
-1. 系统检测到致命错误
-2. 冻结所有到该设备的 I/O
-3. 执行热复位
-   - 发送 TS1 训练序列
-   - 链路进入 Recovery 状态
-   - 重新训练链路
-4. 恢复配置空间
-5. 重新初始化设备
-6. 恢复 I/O 操作
-
-特点：
-- 不影响其他设备
-- 保持系统运行
-- 可能丢失未完成的事务
+下游设备发生不可纠正错误
+         │
+         ▼
+下行端口硬件立即触发 DPC（无需等软件介入）：
+  1. 强制将链路拉入隔离态，阻断所有下行 TLP
+  2. 丢弃所有上行 TLP，彻底防止“毒数据”污染主机内存
+  3. 向上游发送错误信号并触发 DPC 中断
+         │
+         ▼
+OS DPC 驱动异步介入恢复：
+  1. 读取 DPC Status 与 DPC Error Source ID 定位祸首
+  2. 对下游执行 Hot Reset 清理残局
+  3. 清除 DPC Status 释放链路，恢复下游设备配置空间与业务
 ```
 
-#### 热复位实现
+### 恢复状态检查命令
 
-```c
-// 执行热复位
-int pcie_do_hot_reset(struct pci_dev *pdev)
-{
-    struct pci_bus *bus = pdev->bus;
-    u16 bridge_ctl;
-    int ret;
-    
-    pr_info("Performing hot reset on device %s\n", pci_name(pdev));
-    
-    // 保存设备配置空间
-    pci_save_state(pdev);
-    
-    // 如果是 Root Port 或 Bridge，通过 Bridge Control 复位
-    if (pci_is_bridge(pdev)) {
-        // 读取 Bridge Control 寄存器
-        pci_read_config_word(pdev, PCI_BRIDGE_CONTROL, &bridge_ctl);
-        
-        // 设置 Secondary Bus Reset 位
-        bridge_ctl |= PCI_BRIDGE_CTL_BUS_RESET;
-        pci_write_config_word(pdev, PCI_BRIDGE_CONTROL, bridge_ctl);
-        
-        // 保持复位至少 100 ms
-        msleep(100);
-        
-        // 清除复位位
-        bridge_ctl &= ~PCI_BRIDGE_CTL_BUS_RESET;
-        pci_write_config_word(pdev, PCI_BRIDGE_CONTROL, bridge_ctl);
-        
-        // 等待链路稳定
-        msleep(200);
-    } else {
-        // Endpoint 设备，通过 FLR 或其他方法复位
-        ret = pci_try_reset_function(pdev);
-        if (ret) {
-            pr_err("Failed to reset device: %d\n", ret);
-            return ret;
-        }
-    }
-    
-    // 恢复配置空间
-    pci_restore_state(pdev);
-    
-    // 重新启用错误报告
-    pci_enable_pcie_error_reporting(pdev);
-    
-    pr_info("Hot reset completed\n");
-    return 0;
-}
-```
-
-### FLR (Function Level Reset)
-
-```c
-// 功能级复位
-int perform_flr(struct pci_dev *pdev)
-{
-    int pos;
-    u16 devctl;
-    
-    // 查找 PCIe Capability
-    pos = pci_pcie_cap(pdev);
-    if (!pos)
-        return -ENOTTY;
-    
-    // 读取 Device Control 寄存器
-    pci_read_config_word(pdev, pos + PCI_EXP_DEVCTL, &devctl);
-    
-    // 检查是否支持 FLR
-    u32 devcap;
-    pci_read_config_dword(pdev, pos + PCI_EXP_DEVCAP, &devcap);
-    if (!(devcap & PCI_EXP_DEVCAP_FLR)) {
-        pr_warn("Device does not support FLR\n");
-        return -ENOTTY;
-    }
-    
-    // 保存状态
-    pci_save_state(pdev);
-    
-    // 发起 FLR
-    devctl |= PCI_EXP_DEVCTL_BCR_FLR;
-    pci_write_config_word(pdev, pos + PCI_EXP_DEVCTL, devctl);
-    
-    // 等待复位完成（至少 100 ms）
-    msleep(100);
-    
-    // 恢复配置空间
-    pci_restore_state(pdev);
-    
-    pr_info("FLR completed on device %s\n", pci_name(pdev));
-    return 0;
-}
-```
-
-## 恢复策略
-
-### 决策流程
-
-```
-错误发生
-    ↓
-读取错误状态和严重性
-    ↓
-    ┌─────────────┬─────────────┬─────────────┐
-    ↓             ↓             ↓             ↓
-可纠正错误    非致命错误      致命错误     永久失败
-    ↓             ↓             ↓             ↓
-硬件自动恢复  驱动参与恢复   热复位/FLR   隔离设备
-    ↓             ↓             ↓             ↓
-透明恢复      恢复 I/O       重新初始化   降级运行
-```
-
-### 策略选择
-
-```c
-// 选择恢复策略
-static int select_recovery_strategy(struct pci_dev *pdev,
-                                     u32 uce_status,
-                                     u32 uce_severity)
-{
-    // 致命错误
-    if (uce_status & uce_severity) {
-        pr_warn("Fatal error detected, attempting hot reset\n");
-        return RECOVERY_HOT_RESET;
-    }
-    
-    // 非致命但严重的错误
-    if (uce_status & (PCI_ERR_UNC_POISON_TLP |
-                      PCI_ERR_UNC_COMP_TIME |
-                      PCI_ERR_UNC_MALF_TLP)) {
-        pr_info("Serious error, attempting FLR\n");
-        return RECOVERY_FLR;
-    }
-    
-    // 一般非致命错误
-    if (uce_status) {
-        pr_info("Non-fatal error, attempting driver recovery\n");
-        return RECOVERY_DRIVER;
-    }
-    
-    // 可纠正错误
-    return RECOVERY_AUTO;
-}
-```
-
-## DPC (Downstream Port Containment)
-
-### DPC 机制
-
-```
-DPC 是 PCIe 4.0+ 引入的硬件错误隔离机制：
-
-特点：
-- 硬件自动触发
-- 快速隔离错误设备
-- 防止错误传播
-- 无需软件干预
-
-触发条件：
-- 检测到不可纠正错误
-- 满足 DPC 触发条件
-- 硬件自动执行隔离
-
-隔离动作：
-1. 阻止所有下行 TLP
-2. 丢弃所有上行 TLP（除了某些类型）
-3. 向上游发送 ERR_FATAL 或 ERR_NONFATAL
-4. 等待软件恢复
-
-软件恢复：
-1. 读取 DPC 状态
-2. 识别错误源
-3. 执行热复位
-4. 清除 DPC 状态
-5. 恢复链路
-```
-
-#### DPC 配置和处理
-
-```c
-// 配置 DPC
-static int configure_dpc(struct pci_dev *pdev)
-{
-    int pos;
-    u16 cap, ctl;
-    
-    // 查找 DPC Extended Capability
-    pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_DPC);
-    if (!pos) {
-        pr_info("Device does not support DPC\n");
-        return -ENOTTY;
-    }
-    
-    // 读取 DPC Capabilities
-    pci_read_config_word(pdev, pos + PCI_EXP_DPC_CAP, &cap);
-    
-    // 配置 DPC Control
-    ctl = PCI_EXP_DPC_CTL_EN_FATAL |      // 致命错误触发
-          PCI_EXP_DPC_CTL_EN_NONFATAL;     // 非致命错误触发
-    
-    pci_write_config_word(pdev, pos + PCI_EXP_DPC_CTL, ctl);
-    
-    pr_info("DPC enabled on device %s\n", pci_name(pdev));
-    return 0;
-}
-
-// DPC 中断处理
-static irqreturn_t dpc_irq_handler(int irq, void *context)
-{
-    struct pcie_device *dev = context;
-    struct pci_dev *pdev = dev->port;
-    int pos = pdev->dpc_cap;
-    u16 status, source;
-    
-    // 读取 DPC Status
-    pci_read_config_word(pdev, pos + PCI_EXP_DPC_STATUS, &status);
-    
-    if (!(status & PCI_EXP_DPC_STATUS_TRIGGER)) {
-        return IRQ_NONE;
-    }
-    
-    pr_err("DPC triggered on port %s\n", pci_name(pdev));
-    
-    // 读取错误源
-    pci_read_config_word(pdev, pos + PCI_EXP_DPC_SOURCE_ID, &source);
-    pr_err("DPC Source: %04x\n", source);
-    
-    // 调度恢复工作
-    schedule_work(&dev->dpc_work);
-    
-    return IRQ_HANDLED;
-}
-
-// DPC 恢复工作
-static void dpc_work_func(struct work_struct *work)
-{
-    struct pcie_device *dev = container_of(work, struct pcie_device, dpc_work);
-    struct pci_dev *pdev = dev->port;
-    int pos = pdev->dpc_cap;
-    u16 ctl;
-    
-    pr_info("Starting DPC recovery\n");
-    
-    // 执行热复位
-    pcie_do_hot_reset(pdev);
-    
-    // 清除 DPC Status
-    pci_write_config_word(pdev, pos + PCI_EXP_DPC_STATUS,
-                          PCI_EXP_DPC_STATUS_TRIGGER);
-    
-    // 重新启用链路
-    pci_read_config_word(pdev, pos + PCI_EXP_DPC_CTL, &ctl);
-    ctl &= ~PCI_EXP_DPC_CTL_INT_EN;  // 暂时禁用中断
-    pci_write_config_word(pdev, pos + PCI_EXP_DPC_CTL, ctl);
-    
-    // 恢复下游设备
-    pci_walk_bus(pdev->subordinate, pci_dev_restore_state, NULL);
-    
-    // 重新启用 DPC 中断
-    ctl |= PCI_EXP_DPC_CTL_INT_EN;
-    pci_write_config_word(pdev, pos + PCI_EXP_DPC_CTL, ctl);
-    
-    pr_info("DPC recovery completed\n");
-}
-```
-
-## 恢复测试
-
-### 错误注入测试
+在 Linux 中可通过 `dmesg` 和 `lspci` 观察 AER/DPC 的隔离与恢复过程：
 
 ```bash
-# 使用 aer-inject 工具测试恢复
-cat > error.txt << EOF
-AER
-COR RCVR
-EOF
+# 查看内核 AER 与 DPC 恢复日志
+dmesg | grep -iE "aer|dpc|slot_reset|frozen"
 
-aer-inject -s 01:00.0 error.txt
-
-# 观察恢复过程
-dmesg | tail -20
+# 检查 Root Port 是否支持并启用了 DPC（Extended Cap ID 0x001D）
+lspci -vvv -s 00:01.0 | grep -A 5 "Downstream Port Containment"
 ```
 
-### 驱动恢复测试
+---
 
-```c
-// 测试驱动的错误恢复能力
-static int test_error_recovery(struct pci_dev *pdev)
-{
-    pci_ers_result_t result;
-    
-    pr_info("Testing error recovery\n");
-    
-    // 模拟错误检测
-    result = my_error_detected(pdev, pci_channel_io_frozen);
-    
-    if (result == PCI_ERS_RESULT_NEED_RESET) {
-        // 测试槽位复位
-        result = my_slot_reset(pdev);
-        
-        if (result == PCI_ERS_RESULT_RECOVERED) {
-            // 测试恢复
-            my_error_resume(pdev);
-            pr_info("Recovery test passed\n");
-            return 0;
-        }
-    }
-    
-    pr_err("Recovery test failed\n");
-    return -EIO;
-}
-```
+## 关联与引申概念
 
-## 最佳实践
-
-### 1. 实现完整的错误处理回调
-
-```c
-// 必须实现所有关键回调
-static struct pci_error_handlers my_err_handlers = {
-    .error_detected = my_error_detected,  // 必需
-    .mmio_enabled = my_mmio_enabled,       // 推荐
-    .slot_reset = my_slot_reset,           // 必需
-    .resume = my_error_resume,             // 必需
-};
-```
-
-### 2. 保存和恢复状态
-
-```c
-// 在关键点保存状态
-pci_save_state(pdev);
-
-// 复位后恢复
-pci_restore_state(pdev);
-```
-
-### 3. 清理待处理的 I/O
-
-```c
-// 错误检测时停止 I/O
-stop_device_io(mydev);
-cancel_pending_requests(mydev);
-
-// 恢复后重启 I/O
-restart_device_io(mydev);
-```
-
-### 4. 超时保护
-
-```c
-// 所有恢复操作都应有超时
-int timeout = 1000;  // 1 秒
-while (timeout-- && !recovery_complete()) {
-    msleep(1);
-}
-```
-
-## 总结
-
-PCIe 错误恢复的关键点：
-
-1. **分层恢复**：根据错误严重性选择策略
-2. **驱动参与**：非致命错误需要驱动配合
-3. **热复位**：致命错误的最后手段
-4. **DPC 隔离**：硬件自动隔离错误
-5. **状态保存**：恢复时正确恢复配置
-6. **超时保护**：防止恢复过程hang
-
-参见：
-- [错误类型](error-types.md)
-- [错误检测](detection.md)
-- [AER 详解](aer.md)
-- [AER 实现](../implementation/aer.md)
+- **[AER 高级错误报告](aer.md)**：错误恢复的触发源头，提供错误分级与 Source ID 定位。
+- **[PCIe 错误类型](error-types.md)**：区分哪些错误会触发自愈、驱动回调或致命复位。
+- **[PCIe 错误注入](error-injection.md)**：利用 `aer-inject` 在测试机上主动验证上述恢复流程是否生效。
+- **[LTSSM 状态机](../physical-layer/ltssm.md)** 与 **[链路训练](../physical-layer/link-training.md)**：理解 Hot Reset 和 Link Retrain 在物理层如何通过 `Recovery` 状态重新建链。
+- **[热插拔（Hot-Plug）](../advanced-features/hot-plug.md)** 与 **[SR-IOV](../advanced-features/sriov.md)**：了解 Surprise Down 与热拔出处理的区别，以及 FLR 在虚拟化多 VF 隔离中的关键作用。

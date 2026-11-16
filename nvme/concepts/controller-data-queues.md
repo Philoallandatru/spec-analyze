@@ -1,64 +1,72 @@
-# Controller Data Queues
+# 控制器数据队列（Controller Data Queues）
 
-A Controller Data Queue (CDQ) is a queue in host memory into which the controller posts a defined data type. The Controller Data Queue Admin command creates and deletes these queues; the Base-defined queue type is the User Data Migration Queue. [PDF pp. 206-210](../_source/pages/page-206.md)
+控制器数据队列（CDQ, Controller Data Queue）是分配在**主机内存**中、由控制器按特定格式写入数据的队列，通过 CDQ Admin 命令创建与删除；Base 规范中定义的唯一队列类型是**用户数据迁移队列（UDMQ, User Data Migration Queue）**，用于记录目标控制器在迁移期间被修改的用户数据。[PDF pp. 206-210](../_source/pages/page-206.md)
 
-## Mental model
+可以把它想成**图书馆的“借阅变更日志本”**：当 A 阅览室（目标控制器）准备搬迁装修时，管理员（处理控制器）把期间被借还修改的图书清单实时写进主机内存中的日志本（UDMQ），搬迁完成后据此补齐增量差异。
+
+## 生命周期与创建契约
 
 ```text
-Host allocates host-memory pages
+主机分配页对齐的主机内存（禁止使用 CMB 或 PMR）
+   |-- PC=1（连续）：PRP1 直接指向连续缓冲区
+   `-- PC=0（分散）：PRP1 指向 PRP List -> 多个页
         |
-        +-- contiguous: PRP1 -> one buffer
-        `-- non-contiguous: PRP1 -> stable PRP List -> pages
-        |
-Create CDQ(queue type, size, controller)
         v
-Controller ---- posts queue-type data ----> CDQ entries
+Create CDQ (SEL=0h, QT=0h[UDMQ], CDQSIZE, CNTLID) -> 返回处理控制器内唯一的 CDQID
         |
-Delete CDQ(CDQID) or controller reset
-        `-> host may release/modify mapping
+        v
+控制器持续按 QT 格式写入条目（PRP List 在生命周期内位置与值不可更改）
+        |
+        v
+Delete CDQ (SEL=1h, CDQID) 或 Controller Reset（隐式删除所有 CDQ）-> 主机释放内存
 ```
 
-This explanatory lifecycle combines rendered Figures 161-168. A PRP List used by a CDQ must remain at the same host-memory location and unchanged until deletion or reset; modifying it earlier is undefined. [PDF pp. 207-209](../_source/pages/page-207.md)
+[PDF pp. 207-209](../_source/pages/page-207.md)
 
-## Create contract
-
-| Input | Meaning |
+| 字段 | 含义与约束 |
 |---|---|
-| `SEL=0h` | create CDQ; `SEL=1h` deletes one; vendor operations occupy `C0h..FFh` |
-| `PRP1` | page-aligned host-memory buffer or PRP List; offset is zero |
-| `PC` | contiguous buffer versus PRP List |
-| `CDQSIZE` | queue size in dwords; multiple of queue-type entry size |
-| `QT` | queue data type; Base value `0h` is User Data Migration Queue |
+| `SEL` | `0h`=Create，`1h`=Delete，`C0h..FFh`=Vendor Specific |
+| `QT` | 队列数据格式类型；Base 规范仅定义 `0h`=UDMQ |
+| `PC` | `1`=PRP1 指向连续缓冲；`0`=PRP1 指向 PRP List |
+| `PRP1` | 页对齐的主机内存缓冲或 PRP List（偏移必须为 `0`）；**不可使用 CMB/PMR** |
+| `CDQSIZE` | 队列大小（单位：dword），必须是该队列类型条目大小的整数倍 |
 
-This compact reconstruction follows rendered Figures 161-165. CDQ memory must be host memory, not CMB or PMR. Per-command and subsystem-wide memory-range limits, plus per-controller and subsystem queue-count limits, gate creation. [PDF pp. 207-208](../_source/pages/page-207.md)
+**容量与数量上限**（来自 Identify Controller）：
+- `MCMR`：单条 CDQ 命令允许的最大内存范围数；`NMCMR`：整个子系统最大 CDQ 内存范围数（超限报 `Invalid Field in Command`）。
+- `MCUDMQ`：单控制器最大 UDMQ 数；`MNSUDMQ`：子系统最大 UDMQ 数（耗尽报 `Not Enough Resources`）。
+- **PRP List 不可变**：在 Delete CDQ 或控制器重置之前，PRP List 的位置和内容均不得修改，否则行为未定义。[PDF pp. 207-208](../_source/pages/page-207.md)
 
-## User Data Migration Queue
+## 用户数据迁移队列（UDMQ）与 Feature 21h
 
-A User Data Migration Queue logs user data modified while the specified controller is being migrated. Only one such queue may be associated with the same target controller, and queue-count exhaustion produces Not Enough Resources. The applicable I/O Command Set defines entry requirements and format. [PDF p. 209](../_source/pages/page-209.md)
+- **唯一性约束**：在同一个**处理控制器**下，针对同一个目标控制器（`CNTLID`）最多只能创建 **1 个 UDMQ**，重复创建返回 `Not Enough Resources`；删除不存在的 `CDQID` 返回 `Invalid Controller Data Queue`。[PDF pp. 209-210](../_source/pages/page-209.md)
+- **`CDQID` 作用域**：仅在**处理控制器**范围内唯一，不同控制器之间可能重复。
+- **UDMQ 条目格式**：由所选 I/O 命令集定义（如 NVM 命令集定义被修改的 LBA 范围）。
 
-```text
-Create UDMQ(CNTLID) -> CQE.CDQID unique within processing controller
-                              |
-                              v
-Delete CDQ(CDQID) ------------+
-```
+**队列推进与通知机制**：
+- **Controller Data Queue Feature（`21h`）**：用于推进头指针（Head）并可选配置“尾槽位到点”的一次性触发器。推进头指针时，若队列为空则报告当前头，非空则报告控制器最新发布的条目；触发器必须指向有效已发布槽位，触发后 enable 位自动清零。[PDF pp. 415-416](../_source/pages/page-415.md)
+- **防竞态建议**：Set Feature 成功会清除一个挂起的尾事件；由于旧触发槽位可能在新配置生效前已被写入，主机在收到 Set CQE 后应**再次检查队列**并按需重配触发器。
+- **一次性 AER**：异步事件可携带 `CDQID` 报告“CDQ 尾指针到点”或“队列满”。[PDF p. 202](../_source/pages/page-202.md)
 
-This explanatory identifier flow reflects Figures 166-168. `CDQID` is controller-local; deleting an identifier that does not exist on the processing controller fails with Invalid Controller Data Queue. [PDF pp. 209-210](../_source/pages/page-209.md)
+## 概念辨析
 
-## Relationships
+| 容易混淆 | 实际区别 |
+|---|---|
+| CDQ vs I/O CQ | CDQ 由控制器写入**数据日志**（如 UDMQ）；I/O CQ 存放命令**完成条目（CQE）** |
+| UDMQ vs 控制器状态镜像 | UDMQ 追踪**用户数据修改**；控制器内部状态快照由 Suspend/Set Controller State 迁移 |
+| CDQ Admin 命令 vs Feature `21h` | Admin 命令负责创建与删除 CDQ；Feature `21h` 负责推进 Head 指针与配置尾指针触发器 |
 
-Controller Data Queue Feature (`21h`) advances the host-owned head pointer and optionally arms a one-shot tail-slot trigger. A successful Set clears a pending tail event; when the trigger fires, its enable bit clears. Because the old trigger slot may be posted before reconfiguration completes, the host checks the queue after completion and rearms or disables as needed. [PDF pp. 415-416](../_source/pages/page-415.md)
+## 关联与引申概念
 
-Head movement must identify the current pointer when empty or a controller-posted entry when non-empty; the trigger must name a valid posted-entry slot. Invalid CDQ IDs have a dedicated error. [PDF p. 416](../_source/pages/page-416.md)
+- **控制器迁移（[Controller Migration](controller-migration.md)）**：实时迁移期间利用 UDMQ 捕获目标控制器上的增量用户数据写入，确保切换后数据一致。[PDF p. 209](../_source/pages/page-209.md)
+- **迁移变更追踪（[Migration Change Tracking](migration-change-tracking.md)）**：通过管理命令启停 UDMQ 日志记录；若缺队列、对同一目标重复开启或目标已挂起则会拒绝。[PDF pp. 436-437](../_source/pages/page-436.md)
+- **PRP/SGL 内存模型（[Data Pointer Layouts](data-pointer-layouts.md)）**：CDQ 复用通用 PRP/PRP List 机制描述主机内存页，但额外要求“只能放主机内存且生命周期内不可变”。[PDF pp. 173-174](../_source/pages/page-173.md)
+- **异步事件上报（[Asynchronous Event Reporting](asynchronous-event-reporting.md)）**：提供 CDQ 队列满或尾指针到点的一次性事件通知。
+- **CMB 与 PMR（[Controller Memory Windows](controller-memory-windows.md)）**：控制器侧内存窗口，注意 CDQ 明确禁止放在 CMB/PMR 中。
 
-- One-shot AERs can announce a CDQ tail-pointer post or full condition and carry the `CDQID`. [PDF p. 202](../_source/pages/page-202.md)
-- CDQ memory uses the common PRP/PRP List model but adds lifetime stability and host-memory-only constraints. [PDF pp. 173-174, 207-208](../_source/pages/page-173.md)
-- Controller migration consumes User Data Migration Queue contents; entry semantics belong to the selected I/O Command Set. [PDF p. 209](../_source/pages/page-209.md)
-- [Migration Change Tracking](migration-change-tracking.md) starts and stops User Data Migration Queue logging; it rejects missing queues, duplicate logging for the same target, and a target already suspended. [PDF pp. 436-437](../_source/pages/page-436.md)
+## 规范依据
 
-## Evidence
-
-- [Rendered Figure 161 and CDQ creation limits, PDF p. 207](../_source/pages/page-207.md)
-- [Rendered Figures 162-165, create layouts, PDF p. 208](../_source/pages/page-208.md)
-- [Rendered Figures 166-167, UDMQ and deletion, PDF p. 209](../_source/pages/page-209.md)
-- [Rendered Figures 168-169, completion identifier and status, PDF p. 210](../_source/pages/page-210.md)
+- [CDQ 创建限制与 CDW10/SEL（Figure 161），PDF 第 207 页](../_source/pages/page-207.md)
+- [Create 字段布局（Figures 162-165），PDF 第 208 页](../_source/pages/page-208.md)
+- [UDMQ 唯一性与删除行为（Figures 166-167），PDF 第 209 页](../_source/pages/page-209.md)
+- [完成 CDQID 与错误状态（Figures 168-169），PDF 第 210 页](../_source/pages/page-210.md)
+- [Controller Data Queue Feature 21h，PDF 第 415-416 页](../_source/pages/page-415.md)

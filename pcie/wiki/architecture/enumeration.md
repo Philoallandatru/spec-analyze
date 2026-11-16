@@ -1,657 +1,97 @@
 # PCIe 设备枚举
 
-## 概述
+**一句话总结**：设备枚举（Enumeration）是系统开机后由 BIOS/UEFI 或操作系统内核执行的“全网点名与资源分配”过程——通过**深度优先遍历**发现所有 PCIe 设备，为其分配 **BDF 编号**、配置 **Bridge 总线区间**、探测并分配 **BAR 内存地址**，最后激活设备使其可被驱动接管。
 
-PCIe 设备枚举是系统启动时由 BIOS/UEFI 或操作系统执行的过程，用于发现总线上的所有设备、分配资源（内存地址、I/O 地址、中断）并建立设备树结构。
+> **直观类比**：设备枚举就像新学期开学老师点名分座位：校长（Root Complex）从 0 号教室（Bus 0）开始挨个敲门；每遇到一个走廊转接口（Bridge/Switch），就给走廊后面的房间编上新教室号（Secondary Bus），记下这片区域的最大编号（Subordinate Bus）；等把所有学生（Endpoint）都登记好、发完储物柜钥匙（BAR 地址）和呼叫铃（MSI-X 中断），整栋楼就可以正式上课了。
 
-## 枚举过程概览
+---
 
-```
-系统启动
-    |
-    v
-+------------------+
-| 1. 链路训练      |  LTSSM 完成，链路进入 L0
-+------------------+
-    |
-    v
-+------------------+
-| 2. 扫描总线      |  从 Bus 0 开始递归扫描
-+------------------+
-    |
-    v
-+------------------+
-| 3. 读取配置空间  |  Vendor ID, Device ID, Class Code
-+------------------+
-    |
-    v
-+------------------+
-| 4. 分配 BDF      |  Bus:Device.Function
-+------------------+
-    |
-    v
-+------------------+
-| 5. 配置 Bridge   |  设置 Primary/Secondary/Subordinate Bus
-+------------------+
-    |
-    v
-+------------------+
-| 6. 资源分配      |  BAR, IRQ, Bus Number
-+------------------+
-    |
-    v
-+------------------+
-| 7. 启用设备      |  设置 Command Register
-+------------------+
-    |
-    v
-设备可用
-```
-
-## BDF 地址
-
-### 地址格式
+## 枚举完整流程（7 步走）
 
 ```
-+---------+---------+-----------+
-|  Bus    | Device  | Function  |
-|  8 bits |  5 bits |  3 bits   |
-+---------+---------+-----------+
-    |         |          |
-    v         v          v
-  0-255     0-31       0-7
-
-示例：01:00.0
-- Bus = 1
-- Device = 0
-- Function = 0
-
-完整地址：Domain:Bus:Device.Function
-例如：0000:01:00.0
+1. 物理层链路训练 ──▶ LTSSM 完成，链路进入 L0 状态
+       │
+2. 递归扫描总线   ──▶ 从 Bus 0 开始深度优先搜索 (DFS)
+       │
+3. 读取配置空间   ──▶ 读 Offset 0x00 的 Vendor ID（若为 0xFFFF 则无设备）
+       │
+4. 配置 Bridge    ──▶ 为下游分配 Secondary Bus，回溯更新 Subordinate Bus
+       │
+5. 探测并分配 BAR ──▶ 写全 1 测大小，为设备与 Bridge 窗口分配物理内存地址
+       │
+6. 配置中断       ──▶ 分配 MSI / MSI-X 向量或路由传统 INTx
+       │
+7. 启用设备       ──▶ 置位配置空间 Command 寄存器的 Memory/Bus Master 使能位
 ```
 
-### 配置空间访问
+---
 
-**传统 PCI 配置机制（IO 端口）**：
-```
-CONFIG_ADDRESS (0xCF8):  选择配置空间寄存器
-CONFIG_DATA (0xCFC):     读写数据
+## 配置空间是如何被访问的？
 
-CONFIG_ADDRESS 格式：
-+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-|31|30|29|28|27|26|25|24|23|22|21|20|19|18|17|16|
-+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-|En| Reserved          |  Bus Number[7:0]       |
-+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+在枚举阶段，设备还没有 BAR 地址，CPU 只能通过 **配置空间（Configuration Space）** 与其对话。有两种访问机制：
 
-+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-|15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
-+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-|Device[4:0]|Func[2:0]|  Register[7:2]  |0 0|
-+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-```
+1. **传统 I/O 端口机制（已过时，仅兼容前 256 字节）**：通过向 `0xCF8`（`CONFIG_ADDRESS`）写入目标 Bus/Dev/Func/Offset，再从 `0xCFC`（`CONFIG_DATA`）读写数据。
+2. **ECAM（Enhanced Configuration Access Mechanism，PCIe 标准）**：固件通过 ACPI `MCFG` 表向操作系统通告一段连续的物理内存基地址，将全系统所有设备的 **4096 字节扩展配置空间**平铺映射其中：
+   $$\text{配置空间物理地址} = \text{ECAM\_Base} + (\text{Bus} \ll 20) + (\text{Device} \ll 15) + (\text{Function} \ll 12) + \text{Offset}$$
+   CPU 只需执行一次普通的内存读写指令，Root Complex 就会自动将其转换为 **Configuration Read/Write TLP** 发往目标设备。
 
-**PCIe 增强配置机制（MMIO）**：
-```
-ECAM (Enhanced Configuration Access Mechanism)
+### Type 0 vs Type 1 配置请求
+- **Config Type 0**：目标设备就在当前直连总线上，直接由该总线的目标设备接收处理。
+- **Config Type 1**：目标设备在更下游的总线上，必须经过 **Bridge** 转发；当数据包到达目标总线直连的那个 Bridge 时，由它将其转换为 **Type 0** 交给最终设备。
 
-基地址：从 ACPI MCFG 表获取
-配置空间地址 = Base + (Bus << 20) + (Device << 15) + (Function << 12) + Offset
+---
 
-示例：
-Base = 0xE0000000
-访问 Bus 1, Device 0, Function 0, Offset 0x10:
-地址 = 0xE0000000 + (1 << 20) + (0 << 15) + (0 << 12) + 0x10
-     = 0xE0100010
-```
+## 深度优先扫描（DFS）与 Bridge 总线号分配
 
-## 扫描算法
-
-### 深度优先搜索
-
-```python
-def scan_bus(bus_num):
-    for device in range(32):
-        for function in range(8):
-            vendor_id = read_config(bus_num, device, function, 0x00)
-            
-            # 检查设备是否存在
-            if vendor_id == 0xFFFF:
-                if function == 0:
-                    break  # 该 device 不存在
-                continue   # 该 function 不存在
-            
-            # 读取设备信息
-            device_id = read_config(bus_num, device, function, 0x02)
-            header_type = read_config(bus_num, device, function, 0x0E)
-            
-            print(f"Found device: {bus_num:02x}:{device:02x}.{function}")
-            
-            # 如果是 Bridge，递归扫描下级总线
-            if (header_type & 0x7F) == 0x01:  # PCI-to-PCI Bridge
-                secondary_bus = allocate_bus_number()
-                configure_bridge(bus_num, device, function, secondary_bus)
-                scan_bus(secondary_bus)
-            
-            # 如果不是多功能设备，跳过其他 function
-            if function == 0 and (header_type & 0x80) == 0:
-                break
-
-def configure_bridge(bus, device, function, secondary_bus):
-    # 设置 Primary Bus Number
-    write_config(bus, device, function, 0x18, bus)
-    
-    # 设置 Secondary Bus Number
-    write_config(bus, device, function, 0x19, secondary_bus)
-    
-    # 设置 Subordinate Bus Number (临时设置为 0xFF)
-    write_config(bus, device, function, 0x1A, 0xFF)
-    
-    # 扫描完成后更新 Subordinate Bus Number
-```
-
-### 配置 Type 0 vs Type 1
-
-**Type 0 Configuration Request**：
-- 目标设备在**当前总线**上
-- 直接通过 IDSEL 信号选择设备
-
-**Type 1 Configuration Request**：
-- 目标设备在**下游总线**上
-- 通过 Bridge 转发
-- Bridge 根据 Bus Number 范围决定是否转发
+每经过一个 Bridge（包括 Root Port 和 Switch 端口），配置空间（Type 1 Header）中都维护着三个关键总线号寄存器：
+- **Primary Bus Number（`0x18`）**：Bridge 上游紧邻的总线号。
+- **Secondary Bus Number（`0x19`）**：Bridge 下游直连的总线号。
+- **Subordinate Bus Number（`0x1A`）**：该 Bridge 下游整棵子树所包含的**最大**总线号。
 
 ```
 Root Complex (Bus 0)
-    |
-    +-- Type 0 --> Device on Bus 0
-    |
-    +-- Bridge --> Type 1
-         |
-         +-- Type 0 --> Device on Bus 1
+  └─ Root Port (00:01.0) [Pri=0, Sec=1, Sub=4]
+       └─ Switch Upstream Port (01:00.0) [Pri=1, Sec=2, Sub=4]
+            ├─ Downstream Port 1 (02:00.0) [Pri=2, Sec=3, Sub=3]
+            │    └─ NVMe SSD (03:00.0)  ← Type 0 Endpoint
+            └─ Downstream Port 2 (02:01.0) [Pri=2, Sec=4, Sub=4]
+                 └─ 10GbE NIC (04:00.0) ← Type 0 Endpoint
 ```
 
-## Bridge 配置
+**扫描规则要点**：
+- 扫描每个设备的 Function 0 时，检查 `Header Type`（偏移 `0x0E`）的 Bit 7：若为 `0` 表示单功能设备，直接跳过 Function 1–7；若为 `1` 表示多功能设备，继续扫描其余 Function。
+- 进入 Bridge 时，先把 `Subordinate Bus` 临时设为 `0xFF`（确保后续所有探测请求都能穿透过去），待下游整棵子树递归扫描完毕后，再把实际的最高总线号回填到 `Subordinate Bus`。
 
-### Bridge 配置空间
+---
 
-```
-+0x00: Vendor ID / Device ID
-+0x04: Command / Status
-+0x08: Revision ID / Class Code
-+0x0C: Cache Line Size / Latency Timer / Header Type / BIST
+## 资源分配与设备激活
 
-Bridge 特有部分：
-+0x18: Primary Bus Number
-+0x19: Secondary Bus Number
-+0x1A: Subordinate Bus Number
-+0x1B: Secondary Latency Timer
+1. **自底向上统计，自顶向下分配**：系统先探测树上所有 Endpoint 的 **BAR 大小**（写 `0xFFFFFFFF` 读掩码），汇总每个 Bridge 下游所需的总内存空间（按大小对齐），配置好 Bridge 的 `Memory Base/Limit` 窗口，再把具体的物理基地址写入各设备的 BAR。
+2. **激活设备（Command Register，偏移 `0x04`）**：地址分配完毕后，内核或驱动必须开启关键使能位，设备才能真正干活：
+   - **Memory Space Enable（Bit 1）**：允许设备响应发往其 BAR 的 MMIO 访问。
+   - **Bus Master Enable（Bit 2）**：允许设备主动发起 **DMA** 读写和 **MSI/MSI-X** 中断请求（若未置位，设备发出的上游 TLP 会被 Root Complex 拦截丢弃）。
 
-+0x1C: I/O Base / I/O Limit
-+0x20: Memory Base / Memory Limit
-+0x24: Prefetchable Memory Base / Prefetchable Memory Limit
+---
 
-+0x28: Prefetchable Base Upper 32 Bits
-+0x2C: Prefetchable Limit Upper 32 Bits
+## 运行时热插拔（Hot-Plug）与 Linux 调试
 
-+0x30: I/O Base Upper 16 Bits / I/O Limit Upper 16 Bits
-+0x34: Capability Pointer
-+0x38: Expansion ROM Base Address
-+0x3C: Interrupt Line / Interrupt Pin / Bridge Control
-```
+热插拔（如服务器不停机更换 U.2 NVMe 盘）本质上是在运行时触发一次**局部枚举**：
+插槽上电 → 等待链路训练到 `L0` → 扫描该 Downstream Port 下的新设备 → 从预留资源池中分配 Bus 号与 BAR 地址 → 通知内核加载驱动。
 
-### Bus Number 分配示例
-
-```
-+----------------+
-| Root Complex  |
-| Bus 0         |
-+----------------+
-    |
-    +-- Switch (Bus 1)
-         |
-         +-- Upstream Port (01:00.0)
-         |   Primary Bus: 0
-         |   Secondary Bus: 1
-         |   Subordinate Bus: 5
-         |
-         +-- Downstream Port 1 (02:00.0)
-         |   Primary Bus: 1
-         |   Secondary Bus: 2
-         |   Subordinate Bus: 2
-         |   |
-         |   +-- Endpoint (02:00.0)
-         |
-         +-- Downstream Port 2 (02:01.0)
-             Primary Bus: 1
-             Secondary Bus: 3
-             Subordinate Bus: 5
-             |
-             +-- Bridge (03:00.0)
-                 Primary Bus: 3
-                 Secondary Bus: 4
-                 Subordinate Bus: 5
-                 |
-                 +-- Endpoint 1 (04:00.0)
-                 +-- Endpoint 2 (04:01.0)
-```
-
-## 资源分配
-
-### BAR 大小探测
-
-```c
-// 探测 BAR 大小
-uint32_t size = probe_bar_size(bus, device, function, bar_offset) {
-    uint32_t original, mask;
-    
-    // 1. 读取原始值
-    original = read_config_dword(bus, device, function, bar_offset);
-    
-    // 2. 写入全 1
-    write_config_dword(bus, device, function, bar_offset, 0xFFFFFFFF);
-    
-    // 3. 读回值
-    mask = read_config_dword(bus, device, function, bar_offset);
-    
-    // 4. 恢复原始值
-    write_config_dword(bus, device, function, bar_offset, original);
-    
-    // 5. 计算大小
-    if (mask == 0 || mask == 0xFFFFFFFF) {
-        return 0;  // BAR 未实现
-    }
-    
-    // 清除类型位
-    if (mask & 0x01) {
-        // I/O Space BAR
-        mask &= 0xFFFFFFFC;
-    } else {
-        // Memory Space BAR
-        mask &= 0xFFFFFFF0;
-    }
-    
-    // 大小 = ~mask + 1
-    return ~mask + 1;
-}
-```
-
-### 内存窗口分配
-
-```
-Root Complex
-    |
-    +-- Bridge 1 (Bus 0 -> Bus 1-3)
-    |   Memory Window: 0xF8000000 - 0xFBFFFFFF (64 MB)
-    |
-    |   +-- Device 1 (Bus 1)
-    |   |   BAR0: 0xF8000000 - 0xF8FFFFFF (16 MB)
-    |   |
-    |   +-- Device 2 (Bus 2)
-    |       BAR0: 0xF9000000 - 0xF9FFFFFF (16 MB)
-    |
-    +-- Bridge 2 (Bus 0 -> Bus 4-5)
-        Memory Window: 0xFC000000 - 0xFDFFFFFF (32 MB)
-        
-        +-- Device 3 (Bus 4)
-            BAR0: 0xFC000000 - 0xFC00FFFF (64 KB)
-            BAR1: 0xFC010000 - 0xFC01FFFF (64 KB)
-```
-
-### 资源分配算法
-
-```c
-struct resource_range {
-    uint64_t start;
-    uint64_t end;
-    uint64_t available;
-};
-
-void allocate_resources(struct pci_device *dev) {
-    struct resource_range mem_range = {
-        .start = 0xF8000000,
-        .end = 0xFBFFFFFF,
-        .available = 0xF8000000
-    };
-    
-    // 1. 探测所有 BAR
-    for (int i = 0; i < 6; i++) {
-        uint32_t bar_offset = 0x10 + i * 4;
-        uint32_t size = probe_bar_size(dev->bus, dev->device, 
-                                        dev->function, bar_offset);
-        
-        if (size == 0) continue;
-        
-        // 2. 对齐地址
-        uint64_t aligned_addr = ALIGN_UP(mem_range.available, size);
-        
-        // 3. 检查是否有足够空间
-        if (aligned_addr + size > mem_range.end) {
-            printf("ERROR: Not enough memory space!\n");
-            return;
-        }
-        
-        // 4. 分配地址
-        write_config_dword(dev->bus, dev->device, dev->function,
-                           bar_offset, aligned_addr);
-        
-        printf("BAR%d: 0x%08lx - 0x%08lx (%lu KB)\n",
-               i, aligned_addr, aligned_addr + size - 1, size / 1024);
-        
-        // 5. 更新可用地址
-        mem_range.available = aligned_addr + size;
-        
-        // 6. 如果是 64-bit BAR，跳过下一个 BAR
-        uint32_t bar = read_config_dword(dev->bus, dev->device,
-                                          dev->function, bar_offset);
-        if ((bar & 0x06) == 0x04) {
-            i++;  // 64-bit BAR 占用两个 BAR 寄存器
-        }
-    }
-}
-```
-
-## 中断路由
-
-### Legacy INTx
-
-```
-+----------+     INTA#     +--------+     IRQ 11
-| Device 1 | ------------> |        |------------>
-+----------+               |        |
-                           | Bridge |
-+----------+     INTB#     |        |     IRQ 10
-| Device 2 | ------------> |        |------------>
-+----------+               +--------+
-
-中断路由表：
-Device 1, INTA# --> Bridge INTA# --> IRQ 11
-Device 2, INTB# --> Bridge INTB# --> IRQ 10
-```
-
-### MSI/MSI-X
-
-PCIe 设备优先使用 MSI/MSI-X，无需路由表：
-- MSI/MSI-X 通过 Memory Write TLP 实现
-- 设备直接写入中断控制器的地址
-- 无需硬件中断线
-
-## FEMU 实现
-
-### 设备枚举模拟
-
-```c
-// hw/pci/pci.c
-static void pci_bus_reset(PCIBus *bus)
-{
-    PCIDevice *dev;
-    
-    // 重置总线上所有设备
-    QLIST_FOREACH(dev, &bus->children, sibling) {
-        pci_do_device_reset(dev);
-    }
-}
-
-// 设备注册
-int pci_register_device(PCIDevice *pci_dev, PCIBus *bus,
-                         const char *name, int devfn)
-{
-    // 分配 devfn (Device << 3 | Function)
-    if (devfn < 0) {
-        for (devfn = bus->devfn_min; devfn < ARRAY_SIZE(bus->devices);
-             devfn += PCI_FUNC_MAX) {
-            if (!bus->devices[devfn])
-                goto found;
-        }
-        return -ENOSPC;
-    }
-    
-found:
-    pci_dev->bus = bus;
-    pci_dev->devfn = devfn;
-    bus->devices[devfn] = pci_dev;
-    
-    return 0;
-}
-```
-
-### BAR 注册
-
-```c
-// hw/block/nvme.c
-static void nvme_realize(PCIDevice *pci_dev, Error **errp)
-{
-    NvmeCtrl *n = NVME(pci_dev);
-    
-    // 初始化 Memory Region
-    memory_region_init_io(&n->iomem, OBJECT(n), &nvme_mmio_ops, n,
-                          "nvme", n->reg_size);
-    
-    // 注册 BAR0
-    pci_register_bar(pci_dev, 0,
-                     PCI_BASE_ADDRESS_SPACE_MEMORY |
-                     PCI_BASE_ADDRESS_MEM_TYPE_64,
-                     &n->iomem);
-}
-
-void pci_register_bar(PCIDevice *pci_dev, int region_num,
-                      uint8_t type, MemoryRegion *memory)
-{
-    PCIIORegion *r = &pci_dev->io_regions[region_num];
-    uint32_t addr;
-    uint64_t wmask;
-    
-    r->addr = PCI_BAR_UNMAPPED;
-    r->size = memory_region_size(memory);
-    r->type = type;
-    r->memory = memory;
-    
-    // 设置 BAR 寄存器的可写掩码
-    wmask = ~(r->size - 1);
-    
-    if (region_num == PCI_ROM_SLOT) {
-        addr = PCI_ROM_ADDRESS;
-        wmask |= PCI_ROM_ADDRESS_ENABLE;
-    } else {
-        addr = PCI_BASE_ADDRESS_0 + region_num * 4;
-    }
-    
-    pci_set_long(pci_dev->config + addr, type);
-    pci_set_long(pci_dev->wmask + addr, wmask & 0xffffffff);
-    
-    // 64-bit BAR
-    if (type & PCI_BASE_ADDRESS_MEM_TYPE_64) {
-        pci_set_long(pci_dev->wmask + addr + 4, wmask >> 32);
-    }
-}
-```
-
-### 配置空间访问
-
-```c
-// hw/pci/pci_host.c
-uint32_t pci_host_config_read_common(PCIDevice *pci_dev,
-                                      uint32_t addr, uint32_t limit,
-                                      int len)
-{
-    uint32_t ret;
-    
-    ret = pci_read_config(pci_dev, addr, len);
-    trace_pci_cfg_read(pci_dev->name, PCI_SLOT(pci_dev->devfn),
-                       PCI_FUNC(pci_dev->devfn), addr, ret);
-    
-    return ret;
-}
-
-void pci_host_config_write_common(PCIDevice *pci_dev,
-                                   uint32_t addr, uint32_t limit,
-                                   uint32_t val, int len)
-{
-    trace_pci_cfg_write(pci_dev->name, PCI_SLOT(pci_dev->devfn),
-                        PCI_FUNC(pci_dev->devfn), addr, val);
-    
-    pci_write_config(pci_dev, addr, val, len);
-}
-```
-
-## Linux 枚举流程
-
-### 内核代码路径
-
-```c
-// drivers/pci/probe.c
-
-// 主入口
-pci_scan_root_bus()
-  |
-  +-> pci_scan_child_bus()
-       |
-       +-> pci_scan_slot()
-            |
-            +-> pci_scan_single_device()
-                 |
-                 +-> pci_scan_device()
-                 |    |
-                 |    +-> pci_bus_read_config_word()  // 读取 Vendor ID
-                 |    +-> pci_setup_device()
-                 |         |
-                 |         +-> pci_read_bases()      // 读取 BAR
-                 |
-                 +-> pci_device_add()
-                      |
-                      +-> device_add()               // 注册设备
-
-// 资源分配
-pci_assign_unassigned_resources()
-  |
-  +-> pci_assign_unassigned_bridge_resources()
-       |
-       +-> __pci_bus_assign_resources()
-            |
-            +-> pci_assign_resource()
-```
-
-### 查看枚举结果
+在 Linux 中常用以下命令观察或触发枚举：
 
 ```bash
-# 列出所有 PCIe 设备
-lspci -tv
-
-# 查看详细配置
-lspci -vv -s 01:00.0
-
-# 查看配置空间
-lspci -xxx -s 01:00.0
-
-# 查看系统资源分配
-cat /proc/iomem
-cat /proc/ioports
-
-# 查看设备树
-ls -l /sys/bus/pci/devices/
-ls -l /sys/devices/pci0000:00/
+lspci -tv                       # 查看最终枚举出的总线树与 BDF
+lspci -vv -s 01:00.0            # 查看 Bus Master 状态、BAR 地址与 MSI-X 向量数
+dmesg | grep -i pci             # 查看内核启动阶段的 PCIe 枚举与资源分配日志
+echo 1 | sudo tee /sys/bus/pci/rescan   # 手动触发全总线重新扫描
 ```
 
-## 热插拔枚举
+---
 
-### Hot-Plug 流程
+## 关联与引申概念
 
-```
-1. 检测设备插入
-    |
-    v
-2. Power On Slot
-    |
-    v
-3. 等待链路训练完成 (LTSSM -> L0)
-    |
-    v
-4. 分配 Bus Number (如果是 Bridge)
-    |
-    v
-5. 读取配置空间
-    |
-    v
-6. 分配资源 (BAR, IRQ)
-    |
-    v
-7. 加载驱动
-    |
-    v
-8. 设备可用
-```
-
-### Native PCIe Hot-Plug
-
-```c
-// drivers/pci/hotplug/pciehp_ctrl.c
-static int pciehp_enable_slot(struct slot *slot)
-{
-    struct controller *ctrl = slot->ctrl;
-    int ret;
-    
-    // 1. Power on
-    pciehp_power_on_slot(slot);
-    
-    // 2. 等待链路建立
-    pciehp_check_link_status(ctrl);
-    
-    // 3. 枚举设备
-    ret = pci_scan_slot(ctrl->pcie->port->subordinate, 
-                        PCI_DEVFN(0, 0));
-    
-    // 4. 分配资源
-    pci_assign_unassigned_bridge_resources(ctrl->pcie->port);
-    
-    // 5. 启动设备
-    pci_bus_add_devices(ctrl->pcie->port->subordinate);
-    
-    return 0;
-}
-```
-
-## 调试技巧
-
-### BIOS/UEFI 日志
-
-```
-POST Code: Enumerating PCI devices...
-Bus 0, Device 0, Function 0: 8086:1910 (Host Bridge)
-Bus 0, Device 28, Function 0: 8086:A110 (PCIe Root Port)
-  Assigning Bus 1
-  Bus 1, Device 0, Function 0: 144D:A802 (NVMe Controller)
-    BAR0: 64-bit, size=16KB
-    Assigned: 0xF8000000-0xF8003FFF
-    MSI-X: 8 vectors
-```
-
-### 内核参数
-
-```bash
-# 详细 PCI 调试信息
-pci=debug
-
-# 禁用资源重分配
-pci=nocrs
-
-# 使用传统配置机制
-pci=conf1
-```
-
-## 总结
-
-PCIe 设备枚举的关键步骤：
-
-1. **链路训练**：LTSSM 完成，链路进入 L0 状态
-2. **总线扫描**：深度优先搜索，递归扫描所有总线
-3. **BDF 分配**：为每个设备分配唯一的 Bus:Device.Function
-4. **Bridge 配置**：设置 Primary/Secondary/Subordinate Bus Number
-5. **资源分配**：探测 BAR 大小，分配内存/IO 地址
-6. **中断配置**：设置 MSI/MSI-X 或路由 Legacy INTx
-7. **启用设备**：设置 Command Register，设备开始工作
-
-参见：
-- [PCIe 拓扑结构](../introduction/topology.md)
-- [配置空间](../configuration/config-space.md)
-- [BAR 寄存器](../configuration/bars.md)
-- [热插拔](../advanced-features/hot-plug.md)
+- **[地址空间管理](address-space.md)**：深入了解 BAR 探测、64 位 BAR 编码、Bridge 内存窗口与 IOMMU 地址映射细节。
+- **[拓扑结构](../introduction/topology.md)**：理解 Root Port、Switch 端口与 Endpoint 在枚举树中的角色分工。
+- **[数据包类型](packet-types.md)**：查看枚举阶段使用的 `Config Read/Write Type 0` 与 `Type 1` TLP 格式。
+- **[三层协议模型](layering.md)**：理解枚举开始前物理层 `LTSSM` 如何完成链路训练并进入 `L0` 状态。

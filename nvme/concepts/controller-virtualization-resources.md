@@ -1,193 +1,75 @@
 # 控制器虚拟化资源（Controller Virtualization Resources）
 
-控制器虚拟化资源是一种由主控制器（Primary Controller）统一管理的资源分配机制，用于为自身及其关联的从控制器（Secondary Controller）提供灵活可调的虚拟队列（Virtual Queue, VQ）和虚拟中断（Virtual Interrupt, VI）容量。[PDF pp. 366-368](../_source/pages/page-366.md)
+控制器虚拟化资源是**主控制器（Primary Controller）**统一管理的资源池，用于在自身与最多 **127 个从控制器（Secondary Controller）**（如 PCIe SR-IOV VF）之间动态调配**虚拟队列（VQ, Virtual Queue）**和**虚拟中断（VI, Virtual Interrupt）**容量。[PDF pp. 366-368](../_source/pages/page-366.md)
 
-## 核心概念
+可以把它想成**公寓楼的总配电箱**：主控制器是物业，拥有总容量池（VQ/VI 灵活资源）和物业自用电表（私有资源，租户不可用）；从控制器是租户，物业必须先让某户搬出（Offline）、调好电表配额，再让其入住（Online）。
 
-虚拟化资源管理遵循"资源池 + 分配机制"的设计模式，主控制器作为资源的所有者和分配者，可以动态地将资源分配给从控制器使用。
-
-### 资源分类
-
-资源按照所有权和使用方式分为两大类：
-
-- **私有资源（Private Resources）**：专属于主控制器，不参与灵活分配，始终保留给主控制器使用
-- **灵活资源（Flexible Resources）**：可以在主控制器、从控制器和未分配池之间动态移动和重新分配
-
-### 资源池结构
+## 资源池模型与类型
 
 ```text
-主控制器资源池
-├── VQ 灵活资源总量
-│   ├── 已分配给从控制器
-│   ├── 已分配给主控制器自身
-│   └── 未分配池
-├── VQ 私有资源总量（仅主控制器使用）
-├── VI 灵活资源总量
-│   ├── 已分配给从控制器
-│   ├── 已分配给主控制器自身
-│   └── 未分配池
-└── VI 私有资源总量（仅主控制器使用）
+主控制器资源池（通过 Identify CNS=14h 查询 Primary Controller Capabilities）
+├── VQ 灵活资源总量 (VQFRT)  ──> 已分配给从控制器 (VQRFA) + 主控制器保留 (VQRFAP) + 未分配池
+├── VQ 私有资源总量 (VQPRT)  ──> 仅主控制器专用，不可分配给从控制器
+├── VI 灵活资源总量 (VIFRT)  ──> 已分配给从控制器 (VIRFA) + 主控制器保留 (VIRFAP) + 未分配池
+└── VI 私有资源总量 (VIPRT)  ──> 仅主控制器专用，不可分配给从控制器
 ```
 
-这个结构清晰地展示了 VQ/VI 资源池以及灵活/私有两种所有权类别的划分关系。详细的字段布局参见规范图 330。[PDF pp. 366-367](../_source/pages/page-366.md)
+[PDF pp. 366-367](../_source/pages/page-366.md)
 
-## 资源类型说明
+| 资源类型 | 资源单位与标识符 | 独立性与继承约束 |
+|---|---|---|
+| **VQ（虚拟队列）** | **1 个 SQ + 1 个 CQ 配对**；VQ ID = Queue ID | VQ 与 VI 相互独立；不支持的类型全部视为私有资源 |
+| **VI（虚拟中断）** | **1 个中断向量**（NVMe 2.1 仅支持 MSI-X）；VI ID = 中断向量号 | **能力继承**：主控制器支持的资源类型（`CRT.VQRS`/`VIRS`），所有从控制器**必须**同样支持 [PDF pp. 624-625](../_source/pages/page-624.md) |
 
-### 虚拟队列资源（VQ Resources）
+- **上限与粒度**：每个从控制器受单控制器灵活资源上限（`VQFRSM`/`VIFRSM`）约束，并有首选分配粒度（`VQGRAN`/`VIGRAN`）以减少碎片浪费。
+- **主控制器自身调整**：主控制器的灵活资源分配可通过虚拟化管理命令修改，并在下一次适用的 Controller Level Reset 后生效。[PDF p. 367](../_source/pages/page-367.md)
 
-每个 VQ 资源代表一个提交队列（SQ）和完成队列（CQ）的配对组合。
+## 从控制器列表与生命周期状态机
 
-- **资源标识符**：VQ 资源 ID 等同于队列 ID（Queue ID）
-- **资源单位**：一个 SQ/CQ 对为一个资源单位
-
-### 虚拟中断资源（VI Resources）
-
-每个 VI 资源代表一个中断向量（如 MSI-X 向量）。
-
-- **资源标识符**：VI 资源 ID 等同于中断向量编号（Interrupt Vector Number）
-- **资源单位**：一个中断向量为一个资源单位
-- **版本限制**：NVMe 2.1 修订版中，MSI-X 是唯一支持的 VI 资源类型
-
-需要注意的是，VQ 和 VI 的支持是相互独立的。如果某个资源类型不受支持，则该类型的所有资源都被视为私有资源。[PDF pp. 624-625](../_source/pages/page-624.md)
-
-## 资源分配规则
-
-### 基本约束
-
-| 约束项 | 说明 |
-|---|---|
-| **资源支持继承** | 如果主控制器支持 VQ 或 VI 资源，则其所有关联的从控制器都必须支持相同的资源类型 |
-| **灵活资源总量与分配** | 灵活资源池容量在主控制器及其从控制器之间共享，可查询已分配给从控制器的部分 |
-| **主控制器资源组成** | 主控制器当前保留的灵活资源分配 + 主控制器专用的私有资源总量 |
-| **从控制器上限与粒度** | 每个从控制器都有资源数量上限，以及能够最小化实现资源浪费的首选分配粒度 |
-
-主控制器的灵活资源分配可以在适用的控制器级复位（Controller Level Reset）之后改变（当虚拟化管理命令设置了新值时）。灵活资源的默认分配值由具体实现决定。[PDF p. 367](../_source/pages/page-367.md)
-
-## 从控制器列表
-
-使用 `CNS=15h` 的 Identify 命令可以获取从控制器列表，该命令返回与发起请求的主控制器关联的最多 127 个从控制器信息。
-
-### 查询参数
-
-- **起始位置**：从大于或等于 `CNTID`（Controller Identifier）的控制器 ID 开始返回
-- **包含范围**：包括处于离线状态的从控制器，以及被配置禁用的 SR-IOV VF（Virtual Function）
-
-### 列表条目内容
-
-每个从控制器条目包含以下关键信息：
-
-- 从控制器的控制器 ID（Controller ID）
-- 关联的主控制器 ID
-- 当前状态（在线/离线）
-- SR-IOV VF 编号（如果适用）
-- 当前分配的灵活 VQ 资源数量
-- 当前分配的灵活 VI 资源数量
-
-**特殊说明**：非 SR-IOV VF 类型的从控制器会将 VF 编号字段报告为 0。
-
-[PDF pp. 367-368](../_source/pages/page-367.md)
-
-## 虚拟化管理生命周期
-
-### 状态转换
+通过 Identify `CNS=15h` 可从指定 `CNTID` 起查询最多 **127 个**关联从控制器（包含 Offline 状态和被禁用的 SR-IOV VF），返回其 Controller ID、主控制器 ID、在线/离线状态、SR-IOV VF 编号（非 VF 类型报 0）以及当前分配的 VQ/VI 数量。[PDF pp. 367-368](../_source/pages/page-367.md)
 
 ```text
-┌─────────────────┐
-│ 从控制器在线状态 │
-└────────┬────────┘
-         │
-         │ Offline 操作
-         ▼
-┌─────────────────────────────────┐
-│ 从控制器离线状态                  │
-│ （所有灵活 VQ/VI 资源已移除）     │
-└────────┬────────────────────────┘
-         │
-         ├─► 分配 VQ 资源
-         ├─► 分配 VI 资源
-         │
-         │ Online 操作
-         │ （需要满足：配置完成 + 主控制器已使能）
-         ▼
-┌─────────────────┐
-│ 从控制器在线状态 │
-└─────────────────┘
+[从控制器：Online 在线]
+       |  Virtualization Management: Offline
+       v
+[从控制器：Offline 离线]（所有灵活 VQ/VI 资源被移除）
+       |-- Virtualization Management: Assign VQ 资源（指定 CNTLID, NR）
+       |-- Virtualization Management: Assign VI 资源（指定 CNTLID, NR）
+       |  Virtualization Management: Online（要求配置完成且主控制器已使能）
+       v
+[从控制器：Online 在线]
 ```
 
-这个状态机保留了"先离线再分配"的规则，以及在线/离线操作的幂等性特征。[PDF pp. 446-447](../_source/pages/page-446.md)
+[PDF pp. 446-447](../_source/pages/page-446.md)
 
-## 虚拟化管理命令
+## 虚拟化管理命令与排错
 
-虚拟化管理（Virtualization Management）命令只能由具备相应能力的主控制器发出。
+仅具备 Virtualization Enhancements 能力的主控制器可执行该命令，核心参数包括 `Resource Type`（VQ/VI）、目标 `CNTLID` 和请求数量 `NR`：[PDF pp. 446-448](../_source/pages/page-446.md)
 
-### 命令能力
+- **完成结果（`NRM`）**：对主控制器调整或从控制器分配操作，CQE DW0 返回实际被修改的资源数 `NRM`（根据实现，可能小于、等于或大于请求的 `NR`）。
+- **门控与常见报错**：
+  - 资源分配要求目标从控制器处于 **Offline** 状态；Online 要求配置完成且主控制器已使能。
+  - 请求不存在、属于私有资源或超出剩余可用灵活池，会返回 `Invalid Resource Identifier`（若超单从控制器上限 `VQFRSM`/`VIFRSM` 或总量耗尽也会被拒）。
+  - 排错顺序：**先查总量（`VQFRT`/`VIFRT`）剩余 → 再查单从控制器上限（`VQFRSM`/`VIFRSM`）→ 最后确认未误请求私有资源**。
 
-该命令可以执行以下操作：
+## 概念辨析
 
-1. **主控制器自身的灵活资源调整**
-   - 持久地改变主控制器的灵活资源分配
-   - 变更在下一次适用的控制器级复位后生效
-
-2. **从控制器的资源管理**
-   - 将从控制器设为离线状态（Offline）
-   - 在离线期间分配/调整 VQ/VI 灵活资源
-   - 将从控制器设为在线状态（Online）
-
-### 操作约束
-
-对不存在、属于私有资源或当前不可用的资源范围的请求会被拒绝。[PDF pp. 446-447](../_source/pages/page-446.md)
-
-### 命令参数
-
-| 参数 | 说明 |
+| 容易混淆 | 实际区别 |
 |---|---|
-| **Resource Type（资源类型）** | 指定操作的资源类型：VQ 或 VI |
-| **Controller ID（控制器 ID）** | 主控制器操作：指定发起命令的主控制器 ID<br>从控制器操作：指定目标从控制器 ID |
-| **NR（Number of Resources）** | 请求分配或重新分配的资源数量 |
+| VQ 灵活资源 vs I/O 队列 | VQ 是允许创建的队列**配额上限**；I/O 队列是实际创建的 SQ/CQ 实例 |
+| `NR` vs `NRM` | `NR` 是主机请求的分配数量；`NRM` 是 CQE 返回的实际修改数量 |
+| `CRT.VQRS` vs `VQFRT` | `CRT.VQRS=1` 表示支持 VQ 资源；`VQFRT` 表示灵活资源池的具体总量 |
 
-**状态要求**：
-- 资源分配操作要求从控制器处于离线状态
-- 在线操作要求配置完成且主控制器已使能
+## 关联与引申概念
 
-[PDF p. 447](../_source/pages/page-447.md)
+- **控制器模型（[Controller](controller.md)）**：定义主控制器（Primary）与从控制器（Secondary）的角色维度。[PDF pp. 34-35](../_source/pages/page-034.md)
+- **Identify 命令模型（[Identify Command Model](identify-command-model.md)）**：提供 `CNS=14h`（主控制器能力）与 `CNS=15h`（从控制器列表）查询封装。[PDF pp. 317-320](../_source/pages/page-317.md)
+- **队列对（[Queue Pair](queue-pair.md)）**：每个 VQ 资源对应的底层 SQ/CQ 队列对机制。
+- **SR-IOV（Single Root I/O Virtualization）**：PCIe 硬件虚拟化标准，将单个物理功能（PF，对应主控制器）虚拟出多个虚拟功能（VF，对应从控制器）直接分配给虚拟机使用。
 
-### 命令完成结果
+## 规范依据
 
-对于以下两种操作：
-- 主控制器灵活资源分配调整（Primary Controller Flexible Allocation）
-- 从控制器资源分配（Secondary Controller Assign）
-
-命令完成后，完成队列条目的 Dword 0 会报告实际被修改的资源数量（NRM，Number of Resources Modified）。
-
-**重要特性**：
-- NRM 可能小于、等于或大于请求的资源数量 NR
-- 这允许实现根据实际情况进行资源分配调整
-
-### 错误码分类
-
-命令失败时，不同的状态码会区分不同的失败原因：
-
-- 非法的控制器标识符
-- 非法的控制器状态
-- 非法的请求资源数量
-- 不可用或非法的资源标识符
-
-[PDF pp. 447-448](../_source/pages/page-447.md)
-
-## 与其他概念的关系
-
-### Controller（控制器）
-控制器概念定义了主控制器（Primary）和从控制器（Secondary）作为控制器分类的一个可组合维度。详见 [Controller](controller.md)。[PDF pp. 34-35](../_source/pages/page-034.md)
-
-### Identify Command Model（Identify 命令模型）
-Identify 命令模型提供了用于主控制器能力查询和从控制器列表查询的 `CNS` 选择器封装。详见 [Identify Command Model](identify-command-model.md)。[PDF pp. 317-320](../_source/pages/page-317.md)
-
-## 规范参考
-
-本文档内容基于以下规范章节：
-
-- [主控制器能力结构的字段定义，PDF p. 366](../_source/pages/page-366.md)
-- [VQ/VI 资源池与从控制器列表的约束规则，PDF p. 367](../_source/pages/page-367.md)
-- [从控制器条目的数据布局，PDF p. 368](../_source/pages/page-368.md)
-- [虚拟化管理命令的资源门控与状态操作，PDF pp. 446-447](../_source/pages/page-446.md)
-- [虚拟化管理命令的完成结果与状态码分类，PDF pp. 447-448](../_source/pages/page-447.md)
+- [Primary Controller Capabilities 结构（Figure 330），PDF 第 366 页](../_source/pages/page-366.md)
+- [VQ/VI 资源池约束与从控制器列表（Figure 331），PDF 第 367-368 页](../_source/pages/page-367.md)
+- [虚拟化管理命令与门控（5.2.6），PDF 第 446-448 页](../_source/pages/page-446.md)
+- [VQ/VI 资源定义与独立性，PDF 第 624-625 页](../_source/pages/page-624.md)
