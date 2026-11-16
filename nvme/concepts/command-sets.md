@@ -27,7 +27,7 @@ NVMe 命令集分类
 
 ---
 
-## 命名空间与 I/O 命令集的绑定
+> 排错提示：`Invalid Field in Command` 多半是 `CC.CSS` 和 profile 索引冲突；先 `id-ctrl` 看 `CAP.CSS` 位图。
 
 命名空间（Namespace）在**创建时**就必须绑定到唯一一个 I/O 命令集，且该绑定关系在命名空间的**整个生命周期内不可更改**（只有删除重建才能更换）：[PDF p. 52](../_source/pages/page-052.md)
 

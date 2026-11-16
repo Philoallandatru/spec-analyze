@@ -38,7 +38,22 @@ NVMe 默认把提交队列（SQ）中的每条命令视为**相互独立**：SQ 
 - **WRR + Urgent（可选）**：由 `CAP.AMC` 位图宣告支持；创建 SQ 时通过 `QPRIO` 指定优先级（`00b` Urgent、`01b` High、`10b` Medium、`11b` Low）。权重与突发上限（Arbitration Burst）可通过 `Set Features (FID=01h)` 配置。**注意饥饿风险**：Urgent SQ 与 WRR 之间没有公平协议，持续的 Urgent 流量可能饿死 High/Medium/Low 队列。[PDF pp. 122-123](../_source/pages/page-122.md)
 - **依赖排序由主机负责**：控制器不检查跨命令的 LBA 重叠；若主机先后对同一 LBA 发出两条写命令，必须在主机软件层加屏障等待第一条完成，或使用原子操作，否则可能因乱序完成导致读回旧数据。
 
----
+| 规则 | 要点 |
+|------|------|
+| 默认命令独立 | SQ 内 / 跨 SQ 命令默认无序，控制器不检查 LBA 重叠或依赖 |
+| 主机负责排序 | 有依赖的命令由主机软件在控制器之上强制 |
+| 原子操作例外 | 仅"融合操作"和"命令集定义的原子操作"被强制原子 |
+| 融合对位置 | 必须占同一 SQ 相邻条目；允许环绕到 0 |
+| 融合对提交 | 内存模型：一次尾门铃提交；Fabrics：两个 capsule 之间无其他 capsule |
+| 融合对完成 | 每条命令各产生一条 CQ 条目 |
+| FUSE 字段 | 命令双字 0 第 8-9 位；`00b`=普通；`01b`=融合第一条；`10b`=融合第二条 |
+| 仲裁必支持 | Round Robin 仲裁（所有控制器必须实现） |
+| 仲裁可选 | WRR + Urgent Priority Class（控制器可选；不支持时 SQ 优先级被忽略） |
+| Admin 优先级 | Admin SQ 在 WRR 模式中属"最高严格优先级" |
+| Urgent 风险 | 紧急 SQ 与 WRR 之间无公平协议，可能饿死 WRR 三级 |
+| 仲裁突发 | Identify Controller 暴露 `Recommended Arbitration Burst`（特性 `01h`）可配 |
+| 完成后可见 | 一条命令的 CQ 条目发布后，对该命令的修改对后续提交命令全局可见 |
+| 中止融合对 | 主机需为每条命令各发一条 Abort 命令 |
 
 ## 融合操作（Fused Operation）
 

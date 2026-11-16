@@ -14,12 +14,15 @@
 - [命名空间标识符](concepts/namespace-identifiers.md) - 有效性、分配、控制器挂载、广播、身份
 - [命名空间访问模型](concepts/namespace-access-models.md) - 私有/共享/分散命名空间、多路径 I/O、非对称访问
 - [命名空间拓扑与变更日志](concepts/namespace-topology-and-change-logs.md) - 分散参与者、可达性组/关联、变更追踪
+- [分散命名空间生命周期](concepts/dispersed-namespace-lifecycle.md) - 跨多 NVM 子系统的命名空间分配/挂载/释放
 - [命名空间管理生命周期](concepts/namespace-management-lifecycle.md) - 创建/删除分配、持久化控制器挂载
 - [命名空间写保护](concepts/namespace-write-protection.md) - 保护状态、转换限制、缓存提交屏障
 - [传输模型](concepts/transport-models.md) - 端口、网络接口、胶囊、SGL/数据放置
 - [关联与命令生命周期](concepts/association-and-command-lifecycle.md) - 连接建立与命令执行
 - [Fabrics 发现与认证](concepts/fabrics-discovery-and-authentication.md) - 过滤器协商、一致性快照、推荐、安全门控
 - [Fabric 分区数据传输](concepts/fabric-zoning-data-transfer.md) - 查询、密钥/事务上下文、分片收发、错误共享
+- [Fabric 分区模型](concepts/fabric-zoning-model.md) - 分区粒度、分配方式、独立共享语义
+- [通信丢失与命令重试](concepts/communication-loss-and-command-retry.md) - 连接断开后的命令结果回收与重试策略
 
 ## 通信机制
 
@@ -37,6 +40,8 @@
 - [特性值与作用域](concepts/feature-values-and-scope.md) - 默认/当前/保存值、重置恢复、作用域选择器
 - [通用控制器特性](concepts/common-controller-features.md) - 仲裁、电源、温度阈值、滞后、易失性缓存
 - [安全协议交换](concepts/security-protocol-exchange.md) - Security Send/Receive 信封、发现、NVMe RPMB 选择
+- [每 I/O 密钥](concepts/key-per-io.md) - 加密上下文与每条 I/O 的密钥派生
+- [重放保护内存块](concepts/replay-protected-memory-block.md) - RPMB 计数、签名与读/写/读计数器流程
 - [身份、名称与列表格式](concepts/identity-name-and-list-formats.md) - EUI64/NGUID/UUID、NQN、有序列表、UTF-8 处理
 - [主机元数据与管理地址](concepts/host-metadata-and-management-addresses.md) - 代理 URI、类型化的控制器/命名空间注解
 - [主机内存缓冲区](concepts/host-memory-buffer.md) - 主机内存所有权、描述符列表、禁用屏障、电源状态限制
@@ -109,6 +114,7 @@
 - [保活机制](concepts/keep-alive.md) - 配置、激活、命令/流量看门狗模式、超时清理
 - [固件更新生命周期](concepts/firmware-update-lifecycle.md) - 下载、提交、激活、重置、串行化
 - [格式化 NVM 生命周期](concepts/format-nvm-lifecycle.md) - 格式化作用域、安全擦除、并发、拒绝
+- [掉电信号](concepts/power-loss-signaling.md) - 主机与控制器之间的掉电准备与通知握手
 - 电源状态
 - [清理操作状态](concepts/sanitize-operation-status.md)
 - [错误与健康日志](concepts/error-and-health-logs.md)

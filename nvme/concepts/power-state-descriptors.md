@@ -47,9 +47,14 @@
 
 [PDF pp. 350-353](../_source/pages/page-350.md) | [PDF p. 396](../_source/pages/page-396.md)
 
----
+- [Identify Controller PSD 数组 Figures 312-313，PDF 第 350 页](../_source/pages/page-350.md)
+- [PSD 字段 Figure 313 续，PDF 第 351 页](../_source/pages/page-351.md)
+- [Active Power / Idle Power / 相对性能，PDF 第 352 页](../_source/pages/page-352.md)
+- [Max Power + Time Scale Figure 314，PDF 第 353 页](../_source/pages/page-353.md)
+- [Power Management Feature 02h，PDF 第 396 页](../_source/pages/page-396.md)
+- [APST 与 PSD ITPS 关系，PDF 第 400-401 页](../_source/pages/page-400.md)
 
-## 断电时序（可选特性）
+## 相关阅读
 
 仅当 `Identify Controller` 的断电信号能力（Power Loss Signaling Information：`PLSEPF` / `PLSFQ`）受支持时，PSD 才报告对应的断电保护时序；否则相关字段清零。[PDF pp. 350-353](../_source/pages/page-350.md)
 

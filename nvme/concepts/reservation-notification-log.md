@@ -39,7 +39,7 @@
 3. 由于 `NALP` 在 255 处饱和，主机应循环读取直至读到 `NALP=0` 或空页（`LPC=0h`）。
 4. 主机比对连续两条记录的 `LPC` 差值：例如前一条 `LPC=102`、下一条 `LPC=110`，说明队列曾溢出并丢失了中间 7 个事件。
 
----
+## 初学者案例
 
 ## 相关特性配置（Mask 与 Persistence）
 
@@ -53,7 +53,11 @@
 - **控制器本地作用域**：日志按控制器独立维护，跨控制器看不到对方的预留通知事件。
 - **跨断电补全**：预留通知日志在控制器重置后 `LPC` 会清零；若需跨断电审计预留事件时间线，需结合 **Persistent Event Log（持久事件日志）**。
 
----
+- [Reservation Notification 队列创建、破坏性读取与溢出 LPC 计数，PDF 第 301 页](../_source/pages/page-301.md)
+- [Figure 290 字段布局（LPC/RNLPT/NALP/NSID）与回绕，PDF 第 302 页](../_source/pages/page-302.md)
+- [Reservation Notification Mask 特性（Feature `82h`），PDF 第 424 页](../_source/pages/page-424.md)
+- [Reservation Persistence 特性（Feature `83h`），PDF 第 424 页](../_source/pages/page-424.md)
+- [Persistent Event Log 事件类型定义，PDF 第 301 页](../_source/pages/page-301.md)
 
 ## 关联与引申概念
 

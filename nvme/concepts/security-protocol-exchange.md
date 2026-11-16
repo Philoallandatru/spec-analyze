@@ -39,7 +39,31 @@ NVMe 本身不重新发明安全协议，而是通过 **`Security Send`**（主�
 
 ---
 
-## 协议发现与 NVMe 专用协议
+- **CDW10 位定义**（规范 Figures 376/380）：
+  - `31:24` SECP（按 SPC-5 定义）
+  - `23:16` SPSP1（SPSP bit 15:08）
+  - `15:08` SPSP0（SPSP bit 07:00）
+  - `07:00` NSSF（仅 SECP=EAh 有定义；其余协议保留）
+- **CDW11**：
+  - Receive：`AL` Allocation Length
+  - Send：`TL` Transfer Length
+  - 均与 SPC-5 的 `INC_512=0h` 情形一致
+- **协议 `00h` 行为**（规范 5.1.23.2）：返回控制器支持的协议列表；用作发现过程，不需要对应 Send。
+- **协议 `EAh` 子协议**（Figure 378）：
+  - `SPSP=0001h` → Replay Protected Memory Block；`NSSF` = RPMB Target
+  - `SPSP=0002h..FFFFh` → 保留
+- **命令字段使用**：仅 DPTR + CDW10 + CDW11，其他命令特定字段保留。
+- **错误码**：
+  - `Invalid Field in Command`（保留/不支持 SECP、SPSP 非法、NSSF 在非 EAh 协议下非零等）
+- **强制支持触发条件**：控制器在 Identify Controller 中报告非零 RPMB Target 数时，必须实现 Security Send 和 Security Receive。
+- **协议规范引用**：
+  - SPC-5（SCSI Primary Commands - 5）：定义大多数协议的请求/响应格式
+  - ACS-4（ATA Command Set - 4）：定义 `EAh` 协议的 NVMe 用途
+  - NVMe Base 仅作"信封"，不重定义协议细节
+- **典型使用场景**：
+  1. 启动时 `SECP=00h` Receive 做协议发现
+  2. RPMB 访问 `SECP=EAh` + `SPSP=0001h`
+  3. TCG Opal / 其它加密协议使用其他 SECP 值
 
 1. **安全协议发现（`SECP = 00h`）**：主机通过发送 `SECP=00h` 的 `Security Receive` 命令获取控制器支持的安全协议列表。这是一次独立的查询，**不需要先发送 `Security Send`**。[PDF p. 391](../_source/pages/page-391.md)
 2. **NVMe 专用协议（`SECP = EAh`）**：由 ACS-4 分配给 NVMe 接口使用：

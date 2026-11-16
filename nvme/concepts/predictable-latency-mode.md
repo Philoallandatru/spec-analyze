@@ -46,7 +46,7 @@ PLM 状态机（规范 8.1.18.1）包含 **Disabled**、**DTWIN** 和 **NDWIN** 
 - **读预算**：按 **4 KiB 随机读**计数（不是通用 IOPS）。
 - **写预算**：按该 NVM Set 的 **Optimal Write Size**（最优写入大小）计数。
 
-### 聚合日志（Aggregate Log）
+## 进阶细节
 
 为了避免主机轮询所有 NVM Set，NVMe 提供了按升序排列的非零 NVM Set ID 聚合日志：[PDF pp. 249-250](../_source/pages/page-249.md)
 

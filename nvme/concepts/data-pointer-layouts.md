@@ -22,12 +22,12 @@ command.DPTR                               command.DPTR
 
 每个 PRP 条目占 8 字节（64 位），dword 对齐，其中 `CC.MPS` 决定页大小及页内偏移（Offset）的位宽（`n = log2(MPS)`）：[PDF 第 173-174 页](../_source/pages/page-173.md)
 
-```text
-63                         n+1 n                         0
-+-----------------------------+--------------------------+
-| Page Base Address           | offset within CC.MPS page|
-+-----------------------------+--------------------------+
-```
+1. 主机源缓冲布局：4KB 缓冲 + 2KB 缓冲 + 2KB 缓冲 + 5KB 缓冲，跨多个不连续页。
+2. 用 PRP 几乎不可能描述（PRP 假设页对齐且按页走）。
+3. 改用 SGL：建一个 SGL 段，含 4 个 Data Block 描述符，每块长度与偏移严格对应。
+4. 如果单段 16KB 装不下，再加一个 Segment 描述符链到下一段；最后一段用 Last Segment 收尾。
+5. 如果某段希望"控制器跳过 2KB 不写盘"，用 Bit Bucket 描述符（subtype=0h Address），长度为 2KB。
+6. 提交后控制器按描述符顺序搬运；总长度必须等于命令指定传输长度，否则回 `SGL Data Block Count Mismatch` / `SGL Data Length Mismatch` / `SGL Descriptor Invalid`。
 
 | PRP 位置 | 页内偏移规则 | 作用 |
 |---|---|---|
