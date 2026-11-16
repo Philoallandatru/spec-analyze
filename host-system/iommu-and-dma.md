@@ -56,3 +56,4 @@ ls -la /sys/bus/pci/devices/0000:01:00.0/iommu_group/devices/
 - **NVMe 数据指针**：流式 DMA 生成的分散物理页如何通过 PRP/SGL 交给控制器，详见 [数据指针布局](../nvme/concepts/data-pointer-layouts.md)。
 - **ACS 访问控制**：防止点对点（P2P）TLP 绕过 IOMMU 检查的关键开关，详见 [ACS 访问控制服务](../pcie/wiki/advanced-features/acs.md)。
 - **虚拟机直通**：如何利用 IOMMU Group 把设备安全交给虚拟机或 SPDK，详见 [中断重映射、VFIO 与 SR-IOV 虚拟化](interrupt-remapping-and-vfio.md)。
+- **硬件架构深潜**：Intel VT-d / AMD-Vi / ARM SMMUv3 页表与 `IORT` 细节，详见 [IOMMU 硬件架构深潜](iommu-vtd-smmuv3-deep-dive.md)。

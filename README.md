@@ -50,7 +50,7 @@ PCIe（PCI Express）是现代计算机系统中最重要的高速互连总线�
 
 ### 🟠 主机驱动与系统架构（Host System）
 
-串联固件、Linux 内核驱动、IOMMU 硬件隔离与虚拟化直通，打通从上电枚举到高并发 I/O 的主机侧完整链路。
+串联固件、Linux 内核驱动、IOMMU 硬件隔离、虚拟化直通与 CXL 互连，打通从上电枚举到高并发 I/O 的主机侧完整链路。
 
 **快速入口：** [主机系统目录](host-system/README.md)
 
@@ -60,6 +60,20 @@ PCIe（PCI Express）是现代计算机系统中最重要的高速互连总线�
 3. [IOMMU、DMA 重映射与地址翻译](host-system/iommu-and-dma.md) - IOVA、一致性/流式 DMA 与 `ATS`/`PRI`/`PASID`
 4. [中断重映射、VFIO 与 SR-IOV 虚拟化](host-system/interrupt-remapping-and-vfio.md) - IRTE、Posted Interrupts 与设备直通
 5. [主机侧性能调优与排错 SOP](host-system/host-debug-and-tuning.md) - MPS/MRRS、`iommu=pt` 与掉盘超时定位
+6. [IOMMU 硬件架构深潜：Intel VT-d / AMD-Vi / ARM SMMUv3](host-system/iommu-vtd-smmuv3-deep-dive.md) - `DMAR`/`IVRS`/`IORT` 与两阶段页表
+7. [ACPI 6.5 与 UEFI 2.10：固件到操作系统的 PCIe/NVMe 交接](host-system/acpi-uefi-pcie-deep-dive.md) - `_OSC`、`_HPP` 与 UEFI PassThru
+8. [CXL 3.x 架构与协议复用](host-system/cxl-architecture-overview.md) - `CXL.io`/`CXL.cache`/`CXL.mem` 与 HDM 内存池化
+
+---
+
+### 🟣 NVMe / PCIe 配套规范族（Companion Specs）
+
+对与 NVMe Base 2.1、PCIe 5.0/6.0 同级的配套工业规范进行 20/80 裁剪与实战化拆解：
+
+- **[NVMe PCIe 传输规范](nvme-pcie-transport/README.md)** - BAR0 寄存器、`CAP.DSTRD` 门铃步长、PRP/SGL 对齐、MSI-X 绑定与 FLR/L1.2 交互
+- **[NVMe NVM 命令集与 ZNS](nvme-nvm-cmdset/README.md)** - Read/Write/DSM/Copy、LBA Format（DIF/DIX/PI）与 ZNS 顺序写状态机
+- **[NVMe-MI 带外管理与 MCTP](nvme-mi/README.md)** - MCTP over PCIe VDM (`0x1AB4`) / SMBus、NMIMT 消息类型与 BMC 排错
+- **[PCIe 机械形态与边带信号](pcie-form-factors/README.md)** - PCIe CEM 供电上限、EDSFF（E1.S/E3.S 1C/2C）与 M.2 Key M 引脚时序
 
 ---
 
@@ -113,13 +127,20 @@ spec-repo/
 │   ├── _meta/                   # 元数据
 │   ├── _source/                 # 源规范引用
 │   └── _review/                 # 审阅材料
-├── host-system/                 # 主机驱动与系统架构（6 篇核心文档）
+├── host-system/                 # 主机驱动与系统架构（9 篇文档：枚举/驱动/IOMMU/ACPI/CXL）
 │   ├── README.md
 │   ├── boot-and-enumeration.md
 │   ├── linux-pci-nvme-driver.md
 │   ├── iommu-and-dma.md
 │   ├── interrupt-remapping-and-vfio.md
-│   └── host-debug-and-tuning.md
+│   ├── host-debug-and-tuning.md
+│   ├── iommu-vtd-smmuv3-deep-dive.md
+│   ├── acpi-uefi-pcie-deep-dive.md
+│   └── cxl-architecture-overview.md
+├── nvme-pcie-transport/         # NVMe over PCIe 传输规范（BAR0 / Doorbell / PRP / MSI-X / FLR）
+├── nvme-nvm-cmdset/             # NVMe NVM 命令集与 ZNS 规范（I/O / DIF-DIX / ZNS）
+├── nvme-mi/                     # NVMe-MI 带外管理与 MCTP 传输（VDM / SMBus / 健康轮询）
+├── pcie-form-factors/           # PCIe 机械形态与边带信号（CEM / EDSFF / M.2）
 └── pcie/                        # PCIe 5.0 规范
     ├── README.md                # PCIe 项目介绍
     ├── QUICKSTART.md            # 快速开始

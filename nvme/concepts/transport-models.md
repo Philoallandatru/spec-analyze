@@ -76,6 +76,7 @@ NVMe 将主机与 NVM 子系统之间的通信抽象为**基于内存的传输�
   - [关联与命令生命周期](association-and-command-lifecycle.md) — 传输类型如何决定控制器关联建立方式
   - [Fabrics 发现与认证](fabrics-discovery-and-authentication.md) — Fabrics 传输下的端口发现与安全认证
   - [规范族与适用范围](specification-family-and-scope.md) — 传输规范在 NVMe 规范族中的协作定位
+  - [NVMe PCIe 传输规范（BAR0 / Doorbell / PRP / MSI-X）](../../nvme-pcie-transport/README.md) — PCIe 物理绑定与寄存器细节
 
 ## 规范依据
 

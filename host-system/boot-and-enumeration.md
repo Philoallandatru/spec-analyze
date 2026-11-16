@@ -60,5 +60,6 @@ dmesg | grep -iE "ACPI: MCFG|pci 0000:" | head -n 15
 
 - **设备枚举与 BDF 编址**：DFS 遍历算法与 Type 0/1 配置头细节，详见 [PCIe 设备枚举](../pcie/wiki/architecture/enumeration.md)。
 - **BAR 地址探测**：写全 `1` 回读探测空间大小的原理，详见 [BARs 详解](../pcie/wiki/configuration/bars.md)。
-- **PERST# 复位时序**：上电稳定性与电气边带信号规范，详见 [PCIe 电气规范](../pcie/wiki/physical-layer/electrical-spec.md)。
+- **PERST# 复位时序**：上电稳定性与电气边带信号规范，详见 [PCIe 电气规范](../pcie/wiki/physical-layer/electrical-spec.md) 与 [PCIe CEM 插槽供电与边带信号时序](../pcie-form-factors/pcie-cem-and-sideband.md)。
+- **ACPI 与 UEFI 交接细节**：`_OSC` 权限谈判、`IORT` 与 UEFI NVMe 协议栈，详见 [ACPI 6.5 与 UEFI 2.10：固件到操作系统的 PCIe/NVMe 交接](acpi-uefi-pcie-deep-dive.md)。
 - **控制器初始化**：OS 拿到 BAR0 地址后如何按 NVMe 协议启动控制器，详见 [控制器初始化](../nvme/concepts/controller-initialization.md)。
