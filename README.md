@@ -74,6 +74,7 @@ PCIe（PCI Express）是现代计算机系统中最重要的高速互连总线�
 - **[NVMe NVM 命令集与 ZNS](nvme-nvm-cmdset/README.md)** - Read/Write/DSM/Copy、LBA Format（DIF/DIX/PI）与 ZNS 顺序写状态机
 - **[NVMe-MI 带外管理与 MCTP](nvme-mi/README.md)** - MCTP over PCIe VDM (`0x1AB4`) / SMBus、NMIMT 消息类型与 BMC 排错
 - **[PCIe 机械形态与边带信号](pcie-form-factors/README.md)** - PCIe CEM 供电上限、EDSFF（E1.S/E3.S 1C/2C）与 M.2 Key M 引脚时序
+- **[安全认证、自加密与合规测试](security-and-compliance/README.md)** - SPDM/CMA/DOE/IDE、TCG Opal 2.0 与 UNH-IOL / PCI-SIG 合规测试
 
 ---
 
@@ -141,6 +142,7 @@ spec-repo/
 ├── nvme-nvm-cmdset/             # NVMe NVM 命令集与 ZNS 规范（I/O / DIF-DIX / ZNS）
 ├── nvme-mi/                     # NVMe-MI 带外管理与 MCTP 传输（VDM / SMBus / 健康轮询）
 ├── pcie-form-factors/           # PCIe 机械形态与边带信号（CEM / EDSFF / M.2）
+├── security-and-compliance/     # 安全认证、自加密与合规测试（SPDM / IDE / Opal / IOL）
 └── pcie/                        # PCIe 5.0 规范
     ├── README.md                # PCIe 项目介绍
     ├── QUICKSTART.md            # 快速开始

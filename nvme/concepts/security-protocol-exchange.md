@@ -85,6 +85,7 @@ NVMe 本身不重新发明安全协议，而是通过 **`Security Send`**（主�
   - [通用命令格式](common-command-format.md) — Security 命令的 64 字节 SQE 布局
   - [数据指针布局](data-pointer-layouts.md) — `DPTR` 指向协议数据缓冲区的规则
   - [Key Per I/O](key-per-io.md) — 同属 NVMe 数据安全加密体系
+  - [自加密盘（SED）与 TCG Opal 2.0](../../security-and-compliance/tcg-opal-and-sed.md) — Admin SP / Locking SP 与 PSID Revert 详解
 
 ## 规范依据
 
