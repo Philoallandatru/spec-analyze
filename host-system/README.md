@@ -24,6 +24,10 @@
    - 基于 PCIe 5.0/6.0 PHY 的 `CXL.io` / `CXL.cache` / `CXL.mem` 三协议复用、Type 1/2/3 设备与 HDM 内存池化。
 9. **[UCIe 芯粒互连概览](ucie-die-to-die-overview.md)**
    - 先进封装内 Die-to-Die 互连如何复用 PCIe 6.0 / CXL 3.x 协议栈与 256B Flit。
+10. **[PCIe 热插拔、DPC 错误隔离与 EDR 恢复机制](pcie-hotplug-dpc-edr.md)**
+   - `pciehp` 意外热拔、`DPC` 微秒级断链隔离与 `EDR` / ACPI `_OST` 固件协同恢复。
+11. **[高性能 I/O 路径对比：`blk-mq` vs `io_uring` Passthru vs SPDK](linux-io-uring-and-spdk.md)**
+   - 对比内核块层、`/dev/ngXnY` 零转换直通与 `vfio-pci` 用户态全轮询栈的延迟与 IOPS 边界。
 
 ---
 

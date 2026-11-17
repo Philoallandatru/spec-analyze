@@ -14,6 +14,8 @@
    - `CM REQ` 建立 RC QP、`IBV_WR_SEND` 控制面与 `RDMA Read`/`Write` 数据面、`R_Key` 授权与 RoCEv2 PFC/ECN 无损网络。
 3. **[NVMe/FC 光纤通道传输规范（FC-NVMe-2）](nvme-fc-transport.md)**
    - 传统 SAN 架构平滑演进：`PRLI` 协商、`NVMe_IU` 帧映射与原生多路径（ANA）。
+4. **[NVMe-oF 自动化发现（CDC / mDNS）与端到端安全（TLS / CHAP）](nvme-of-discovery-and-security.md)**
+   - `mDNS/DNS-SD` 零配置发现、中央发现控制器（CDC）、`TLS 1.3 PSK (kTLS)` 与 `DH-HMAC-CHAP` 双向认证。
 
 ---
 

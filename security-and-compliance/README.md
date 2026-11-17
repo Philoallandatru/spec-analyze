@@ -14,6 +14,8 @@
    - NVMe `Security Send (81h)` / `Receive (82h)` 隧道、`Admin SP` / `Locking SP` 分区锁定与 `PSID Revert` 密码学擦除。
 3. **[合规与互操作测试：UNH-IOL NVMe & PCI-SIG Compliance](conformance-and-compliance-testing.md)**
    - PCI-SIG 电气/链路均衡（Link Eq）合规测试、UNH-IOL NVMe Conformance（Integrator's List）与跨平台 Interop 排错。
+4. **[PCIe TDISP：机密计算下的设备直通安全协议](tdisp-confidential-computing.md)**
+   - 结合 `SPDM` + `IDE`，在 Intel TDX / AMD SEV-SNP 下安全锁定并直通 SR-IOV VF，消除 Hypervisor 窃听面。
 
 ---
 

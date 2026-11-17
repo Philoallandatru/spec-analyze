@@ -14,6 +14,8 @@
    - 512B vs 4KB 扇区（`FLBAS`）、Extended LBA（DIF）vs Separate Metadata（DIX）、8 字节 PI（Guard/AppTag/RefTag）与 Type 1/2/3 检查规则。
 3. **[ZNS（Zoned Namespaces）命令集与 Zone 状态机](zns-command-set.md)**
    - Zone 7 种状态转换、`Zone Append (7Dh)` 解决并发写入的原理、`Zone Management Send/Receive (79h/7Ah)` 与 `MAR`/`MOR` 资源限制。
+4. **[FDP（Flexible Data Placement）实战指南：零改造降写放大](fdp-flexible-data-placement.md)**
+   - 对比 ZNS/Streams，保留随机写接口的同时用 `Placement Handle` 将冷热数据物理隔离进独立 Reclaim Unit。
 
 ---
 

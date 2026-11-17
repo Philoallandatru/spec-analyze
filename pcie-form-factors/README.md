@@ -14,6 +14,8 @@
    - SFF-TA-1002 1C/2C/4C 引脚扩展、12V 主供电（25W–80W+）+ `3.3Vaux`、Dual-Port 双活、热插拔与 LED 指示。
 3. **[M.2 Key M（NVMe）引脚、3.3V 单轨与 L1.2 功耗](m2-key-m-and-power.md)**
    - M.2 Key M（PCIe x4）引脚定义、`3.3V` 单轨限制、`PEDET`/`SUSCLK`/`PLN#` 与 `CLKREQ#` 控制的 L1.2 省电陷阱。
+4. **[U.2 / U.3 三模背板、MCIO 线缆与 PCIe Retimer](u2-u3-mcio-and-retimer.md)**
+   - `SFF-8639` vs `SFF-TA-1001` 互插兼容规则、MCIO 高密铜缆与 Gen5/6 Retimer 信号重定时。
 
 ---
 

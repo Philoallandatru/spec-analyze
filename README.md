@@ -64,6 +64,8 @@ PCIe（PCI Express）是现代计算机系统中最重要的高速互连总线�
 7. [ACPI 6.5 与 UEFI 2.10：固件到操作系统的 PCIe/NVMe 交接](host-system/acpi-uefi-pcie-deep-dive.md) - `_OSC`、`_HPP` 与 UEFI PassThru
 8. [CXL 3.x 架构与协议复用](host-system/cxl-architecture-overview.md) - `CXL.io`/`CXL.cache`/`CXL.mem` 与 HDM 内存池化
 9. [UCIe 芯粒互连概览](host-system/ucie-die-to-die-overview.md) - Die-to-Die 封装内复用 PCIe/CXL 协议与 Flit
+10. [PCIe 热插拔、DPC 错误隔离与 EDR 恢复](host-system/pcie-hotplug-dpc-edr.md) - `pciehp`、`DPC` 与 ACPI `_OST` 协同恢复
+11. [高性能 I/O 路径：`blk-mq` vs `io_uring` vs SPDK](host-system/linux-io-uring-and-spdk.md) - `/dev/ngXnY` 直通与用户态轮询对比
 
 ---
 
