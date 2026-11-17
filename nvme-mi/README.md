@@ -14,6 +14,8 @@
    - Out-of-Band（BMC）vs In-Band（Admin `1Dh`/`1Eh`）、`NMIMT` 五大消息族、Control Primitive 复位与 VPD/FRU 读取。
 3. **[健康状态轮询、Admin 隧道与 BMC 排错](nvme-mi-health-and-telemetry.md)**
    - `NVM Subsystem Health Status Poll`、MI Admin Tunneling（带外执行 `Identify`/`Get Log Page`）以及常见分片/校验/时钟拉伸坑。
+4. **[PLDM 固件升级与 Redfish 存储管理](pldm-and-redfish-storage.md)**
+   - MCTP 之上的 `PLDM Type 2/5 (DSP0267)` 统一固件升级、`RDE (DSP0218)` 与 Redfish `Drive`/`Volume` 模型。
 
 ---
 

@@ -66,6 +66,7 @@ NVMe 不是一本孤立的文档，而是一个由**基础规范、I/O 命令集
   - [命令集](command-sets.md) — I/O 命令集作为规范族独立成员的扩展方式
   - [传输模型](transport-models.md) — 传输规范如何将核心协议绑定到内存或消息传输
   - [NVMe PCIe 传输规范](../../nvme-pcie-transport/README.md) / [NVM 命令集与 ZNS](../../nvme-nvm-cmdset/README.md) / [NVMe-MI 带外管理](../../nvme-mi/README.md) — 同级配套规范拆解
+  - [NVMe-oF 传输规范族](../../nvme-of-transports/README.md) / [NVMe 扩展规范（KV / 计算存储 / Boot NBFT）](../../nvme-extended-specs/README.md) — 跨网络存储与扩展命令集拆解
 
 ## 规范依据
 

@@ -77,6 +77,7 @@ NVMe 将主机与 NVM 子系统之间的通信抽象为**基于内存的传输�
   - [Fabrics 发现与认证](fabrics-discovery-and-authentication.md) — Fabrics 传输下的端口发现与安全认证
   - [规范族与适用范围](specification-family-and-scope.md) — 传输规范在 NVMe 规范族中的协作定位
   - [NVMe PCIe 传输规范（BAR0 / Doorbell / PRP / MSI-X）](../../nvme-pcie-transport/README.md) — PCIe 物理绑定与寄存器细节
+  - [NVMe-oF 传输规范族（TCP / RDMA / FC）](../../nvme-of-transports/README.md) — 三种网络 Fabrics 传输的 PDU、零拷贝与流控细节
 
 ## 规范依据
 

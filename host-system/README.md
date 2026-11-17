@@ -22,6 +22,8 @@
    - `_OSC` 原生热插拔/AER 权限谈判、`_HPP`/`_HPX`、`IORT` 以及 UEFI 启动期 NVMe 协议栈。
 8. **[CXL 3.x 架构与协议复用](cxl-architecture-overview.md)**
    - 基于 PCIe 5.0/6.0 PHY 的 `CXL.io` / `CXL.cache` / `CXL.mem` 三协议复用、Type 1/2/3 设备与 HDM 内存池化。
+9. **[UCIe 芯粒互连概览](ucie-die-to-die-overview.md)**
+   - 先进封装内 Die-to-Die 互连如何复用 PCIe 6.0 / CXL 3.x 协议栈与 256B Flit。
 
 ---
 
